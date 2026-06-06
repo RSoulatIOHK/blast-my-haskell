@@ -126,7 +126,7 @@ The producer (the `ghc-dump-core` shim, or a bespoke plugin if it later replaces
 
 ## Step 2: Lean 4 AST (the target types)
 
-Place in `GHCCore/AST.lean`.
+Place in `GhcCoreToLean/AST.lean` (the transpiler's in-process copy). The same source is also emitted verbatim to `output/GHCCore/AST.lean` so Blaster, when reading generated files, sees the same inductives under `namespace GHCCore`. Step 7 lists how these stay in sync.
 
 ```lean
 namespace GHCCore
@@ -209,7 +209,7 @@ end GHCCore
 
 ## Step 3: JSON Parser
 
-Place in `GHCCore/Parse.lean`. Parse the JSON produced in Step 1 into `GHCCore.CoreProgram` using `Lean.Json`.
+Place in `GhcCoreToLean/Parse.lean`. Parse the JSON produced in Step 1 into `GHCCore.CoreProgram` using `Lean.Json`.
 
 The parser is a set of `fromJson?`-style functions returning `Except String α`. It must handle:
 - All `Expr` tags
@@ -223,7 +223,7 @@ The parser is a set of `fromJson?`-style functions returning `Except String α`.
 
 ## Step 4: Lowering (Core → Lean-friendly Core)
 
-Place in `GHCCore/Lower.lean`. **This is the load-bearing step** — the gap between Core's explicitly-typed, dictionary-passing style and Lean's surface syntax lives here, and it must run before emission. It is a `CoreProgram → CoreProgram` (plus a name-resolution side table) transformation.
+Place in `GhcCoreToLean/Lower.lean`. **This is the load-bearing step** — the gap between Core's explicitly-typed, dictionary-passing style and Lean's surface syntax lives here, and it must run before emission. It is a `CoreProgram → CoreProgram` (plus a name-resolution side table) transformation.
 
 ### 4a. Erase type abstraction and application
 
@@ -242,7 +242,7 @@ Typeclass dictionaries also appear as ordinary value arguments and lambdas in Co
 
 ### 4c. Resolve known names
 
-Maintain extensible mapping tables (a separate `GHCCore/Maps.lean`, easy to grow):
+Maintain extensible mapping tables (a separate `GhcCoreToLean/Maps.lean`, easy to grow):
 
 - **Value/operator map** — GHC global Ids and class methods → Lean terms. e.g. `GHC.Num.+` / `+` → `· + ·`, `GHC.Num.-` → `· - ·`, `==` → `· == ·`, `GHC.Base.id` → `id`. Unmapped global Ids fall back to `GHCCore.ghcPrimOp "<name>"`.
 - **Type constructor map** — see Step 5 table (`Maybe`→`Option`, etc.).
@@ -254,7 +254,7 @@ After lowering, every `var` node either resolves to a known Lean name or to a sa
 
 ## Step 5: Lean 4 Code Emitter
 
-Place in `GHCCore/Emit.lean`. Consumes the lowered program and produces `.lean` source text (`String`). Operates on already-lowered terms, so it no longer sees type/dict lambdas or type arguments.
+Place in `GhcCoreToLean/Emit.lean`. Consumes the lowered program and produces `.lean` source text (`String`). Operates on already-lowered terms, so it no longer sees type/dict lambdas or type arguments.
 
 ### Top-level program
 
@@ -372,7 +372,7 @@ GHC names can contain characters illegal in Lean 4 identifiers. Apply:
 
 ## Step 6: Support Definitions
 
-Place in `GHCCore/Prelude.lean`. These are axioms and stubs the emitted code may reference. `Prelude.lean` imports `AST.lean` (it refers to `GHCType`).
+Emitted to `output/GHCCore/Prelude.lean` — this is a target-side artifact, not a transpiler module. These are axioms and stubs the emitted code may reference. Inside the output project, `Prelude.lean` imports `GHCCore.AST` (it refers to `GHCType`).
 
 ```lean
 import GHCCore.AST
@@ -406,6 +406,7 @@ Notes (verified against v4.24.0): the `{α : Type} [Inhabited α]` constraints a
 
 ```
 GhcCoreToLean/          -- the transpiler itself (Lean source, already scaffolded)
+  AST.lean              -- GHCCore inductive types (Step 2); also emitted to output/
   Parse.lean            -- Lean.Json → GHCCore.CoreProgram
   Lower.lean            -- type/dict erasure + name resolution
   Maps.lean             -- extensible GHC → Lean name/type/ctor tables
