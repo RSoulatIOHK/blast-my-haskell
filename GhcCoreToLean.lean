@@ -2,5 +2,9 @@
 -- Import modules here that should be built as part of the library.
 import GhcCoreToLean.AST
 import GhcCoreToLean.Parse
+import GhcCoreToLean.Maps
+import GhcCoreToLean.Lower
+import GhcCoreToLean.Emit
 import GhcCoreToLean.Basic
 import GhcCoreToLean.Spike.Fib
+import GhcCoreToLean.Spike.FibEmitted
