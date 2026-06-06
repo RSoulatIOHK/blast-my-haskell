@@ -1,0 +1,14 @@
+name = "GhcCoreToLean"
+version = "0.1.0"
+defaultTargets = ["ghccoretolean"]
+
+[[lean_lib]]
+name = "GhcCoreToLean"
+
+[[lean_exe]]
+name = "ghccoretolean"
+root = "Main"
+
+[[require]]
+name = "Blaster"
+git = "https://github.com/input-output-hk/Lean-blaster"
