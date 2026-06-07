@@ -235,14 +235,15 @@ async function verify(): Promise<void> {
     }
   }
 
-  // Build decoration options per block — span the *content* of the
-  // `{- @lean ... -}` comment, i.e. everything between the opener and closer
-  // lines, so the squiggle covers the full theorem text.
+  // Build decoration options per block — span the *entire* `{- @lean ... -}`
+  // comment block including the opener and closer lines, so the squiggle
+  // covers everything the user can see as one annotation.
   const successRanges: vscode.DecorationOptions[] = [];
   const failureRanges: vscode.DecorationOptions[] = [];
   for (const [key, outcome] of blockOutcomes) {
-    const startLine = Math.max(0, outcome.block.hs[0]);     // line after `{- @lean`
-    const endLine   = Math.max(startLine, outcome.block.hs[1] - 2); // line before `-}`
+    // block.hs is 1-based; VS Code Range is 0-based.
+    const startLine = Math.max(0, outcome.block.hs[0] - 1);
+    const endLine   = Math.max(startLine, outcome.block.hs[1] - 1);
     const range = new vscode.Range(startLine, 0, endLine, Number.MAX_SAFE_INTEGER);
     const hover = new vscode.MarkdownString();
     hover.appendCodeblock((rich.get(key) ?? '').trim(), 'lean');
