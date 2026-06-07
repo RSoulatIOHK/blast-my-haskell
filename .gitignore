@@ -1,3 +1,4 @@
 /.lake
 .vscode/
 shim/dist-newstyle/
+.transpile-sandbox/
