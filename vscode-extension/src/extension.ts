@@ -18,6 +18,52 @@ const diagCol = vscode.languages.createDiagnosticCollection('ghccoretolean');
 // (incl. counterexamples) even when the inline diagnostic shows a short label.
 const richMessages = new Map<string, Map<string, string>>();
 
+// Green outline for blocks where Blaster reports ✅ Valid on every theorem;
+// red for ❌ Falsified. Theme-aware via ThemeColor so dark/light both work.
+const successDecoration = vscode.window.createTextEditorDecorationType({
+  backgroundColor: 'rgba(46, 204, 113, 0.10)',
+  border: '1px solid',
+  borderColor: 'rgba(46, 204, 113, 0.65)',
+  borderRadius: '3px',
+  isWholeLine: false,
+  overviewRulerColor: 'rgba(46, 204, 113, 0.7)',
+  overviewRulerLane: vscode.OverviewRulerLane.Right,
+});
+
+const failureDecoration = vscode.window.createTextEditorDecorationType({
+  backgroundColor: 'rgba(231, 76, 60, 0.10)',
+  border: '1px solid',
+  borderColor: 'rgba(231, 76, 60, 0.65)',
+  borderRadius: '3px',
+  isWholeLine: false,
+  overviewRulerColor: 'rgba(231, 76, 60, 0.7)',
+  overviewRulerLane: vscode.OverviewRulerLane.Right,
+});
+
+interface BlockDecorations {
+  success: vscode.DecorationOptions[];
+  failure: vscode.DecorationOptions[];
+}
+
+// Per-.hs-URI decoration state, so we can re-apply when the user switches
+// back to the editor (decorations are editor-scoped, not document-scoped).
+const decorationsByUri = new Map<string, BlockDecorations>();
+
+function classify(msg: string): 'success' | 'failure' | 'other' {
+  if (msg.includes('✅ Valid')) return 'success';
+  if (msg.includes('❌ Falsified') || msg.toLowerCase().includes('falsified')) return 'failure';
+  return 'other';
+}
+
+function applyDecorations(uri: vscode.Uri): void {
+  const state = decorationsByUri.get(uri.toString());
+  for (const editor of vscode.window.visibleTextEditors) {
+    if (editor.document.uri.toString() !== uri.toString()) continue;
+    editor.setDecorations(successDecoration, state?.success ?? []);
+    editor.setDecorations(failureDecoration, state?.failure ?? []);
+  }
+}
+
 function getScriptPath(): string {
   const cfg = vscode.workspace.getConfiguration('ghcCoreLean');
   const configured = cfg.get<string>('scriptPath') ?? 'transpile.sh';
@@ -149,6 +195,9 @@ async function verify(): Promise<void> {
 
   const hsDiags: vscode.Diagnostic[] = [];
   const rich = new Map<string, string>();
+  // Per-block outcome: any failure in the block flips it to failure;
+  // a block with only ✅ Valid diagnostics is success.
+  const blockOutcomes = new Map<string, { kind: 'success' | 'failure'; range: vscode.Range }>();
 
   for (const d of leanDiags) {
     const leanLine = d.range.start.line + 1; // VS Code 0-based → 1-based
@@ -165,21 +214,59 @@ async function verify(): Promise<void> {
       Number.MAX_SAFE_INTEGER,
     );
 
+    const klass = classify(d.message);
     const tag = severityLabel(d.severity);
     const message = `${tag}${d.message}`;
-    const diag = new vscode.Diagnostic(hsRange, message, d.severity);
-    diag.source = 'lean';
-    hsDiags.push(diag);
 
     const key = `${block.hs[0]}-${block.hs[1]}`;
+
+    if (klass === 'success') {
+      // Lower-bound the outcome to success unless an earlier diagnostic
+      // in this same block already flagged a failure.
+      if (!blockOutcomes.has(key)) {
+        blockOutcomes.set(key, { kind: 'success', range: hsRange });
+      }
+    } else if (klass === 'failure') {
+      blockOutcomes.set(key, { kind: 'failure', range: hsRange });
+      // Surface the counterexample as a normal Diagnostic.
+      const diag = new vscode.Diagnostic(hsRange, message, vscode.DiagnosticSeverity.Error);
+      diag.source = 'lean';
+      hsDiags.push(diag);
+    } else {
+      // Compilation errors, unsupported sort types, etc.: keep as diagnostic.
+      const diag = new vscode.Diagnostic(hsRange, message, d.severity);
+      diag.source = 'lean';
+      hsDiags.push(diag);
+    }
+
     rich.set(key, (rich.get(key) ?? '') + message + '\n\n');
+  }
+
+  // Translate per-block outcomes into decoration options.
+  const successRanges: vscode.DecorationOptions[] = [];
+  const failureRanges: vscode.DecorationOptions[] = [];
+  for (const [key, outcome] of blockOutcomes) {
+    const hover = new vscode.MarkdownString();
+    hover.appendMarkdown(
+      outcome.kind === 'success'
+        ? '**✅ Blaster: Valid**\n\n'
+        : '**❌ Blaster: Falsified**\n\n',
+    );
+    hover.appendCodeblock((rich.get(key) ?? '').trim(), 'lean');
+    const opt: vscode.DecorationOptions = { range: outcome.range, hoverMessage: hover };
+    if (outcome.kind === 'success') successRanges.push(opt);
+    else failureRanges.push(opt);
   }
 
   diagCol.set(doc.uri, hsDiags);
   richMessages.set(doc.uri.toString(), rich);
+  decorationsByUri.set(doc.uri.toString(), { success: successRanges, failure: failureRanges });
+  applyDecorations(doc.uri);
 
-  channel.appendLine(`Posted ${hsDiags.length} diagnostic(s) onto ${path.basename(doc.fileName)}.`);
-  if (hsDiags.length === 0) {
+  channel.appendLine(
+    `Posted ${hsDiags.length} diagnostic(s) and ${successRanges.length}/${failureRanges.length} success/failure outlines onto ${path.basename(doc.fileName)}.`,
+  );
+  if (hsDiags.length === 0 && successRanges.length === 0 && failureRanges.length === 0) {
     vscode.window.showInformationMessage(
       'No Lean diagnostics matched any @lean block — make sure the Lean4 extension is installed and Blaster is configured.',
     );
@@ -223,15 +310,35 @@ class AnnotationHoverProvider implements vscode.HoverProvider {
 function clearDiagnostics(): void {
   diagCol.clear();
   richMessages.clear();
-  channel.appendLine('Cleared all GHC Core → Lean diagnostics.');
+  // Clear all editor decorations too.
+  for (const [uriStr] of decorationsByUri) {
+    const uri = vscode.Uri.parse(uriStr);
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (editor.document.uri.toString() === uriStr) {
+        editor.setDecorations(successDecoration, []);
+        editor.setDecorations(failureDecoration, []);
+      }
+    }
+    decorationsByUri.delete(uriStr);
+    void uri;
+  }
+  channel.appendLine('Cleared all GHC Core → Lean diagnostics and decorations.');
 }
 
 export function activate(ctx: vscode.ExtensionContext): void {
-  ctx.subscriptions.push(diagCol, channel);
+  ctx.subscriptions.push(diagCol, channel, successDecoration, failureDecoration);
   ctx.subscriptions.push(
     vscode.commands.registerCommand('ghcCoreLean.verify', verify),
     vscode.commands.registerCommand('ghcCoreLean.clearDiagnostics', clearDiagnostics),
     vscode.languages.registerHoverProvider('haskell', new AnnotationHoverProvider()),
+    // Decorations are editor-scoped, not document-scoped. Re-apply when the
+    // user switches back to a .hs editor that has cached decorations.
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) applyDecorations(editor.document.uri);
+    }),
+    vscode.window.onDidChangeVisibleTextEditors((editors) => {
+      for (const e of editors) applyDecorations(e.document.uri);
+    }),
   );
 }
 
