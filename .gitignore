@@ -2,6 +2,7 @@
 /.vscode/
 shim/dist-newstyle/
 .transpile-sandbox/
+GhcCoreToLean/Generated/
 vscode-extension/node_modules/
 vscode-extension/out/
 vscode-extension/*.vsix

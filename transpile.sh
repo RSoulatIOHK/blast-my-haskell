@@ -40,7 +40,12 @@ if [[ -z "$MODNAME" ]]; then
   exit 1
 fi
 MODLOWER="$(echo "$MODNAME" | tr '[:upper:]' '[:lower:]')"
-OUT="${2:-/tmp/${MODLOWER}_out.lean}"
+
+# Default the output under the GhcCoreToLean library so it inherits the lake
+# project's `import Blaster` resolution. Files outside any declared lean_lib
+# are not given the project's deps by the Lean LSP.
+mkdir -p "${REPO}/GhcCoreToLean/Generated"
+OUT="${2:-${REPO}/GhcCoreToLean/Generated/${MODNAME}.lean}"
 
 SANDBOX="${REPO}/.transpile-sandbox"
 mkdir -p "$SANDBOX"
