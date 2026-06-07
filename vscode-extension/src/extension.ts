@@ -189,8 +189,11 @@ async function verify(): Promise<void> {
 
   const hsDiags: vscode.Diagnostic[] = [];
   const rich = new Map<string, string>();
-  const successRanges: vscode.DecorationOptions[] = [];
-  const failureRanges: vscode.DecorationOptions[] = [];
+  // Per-block outcome aggregation. A block flips to 'failure' as soon as any
+  // diagnostic inside it is classified as failure; otherwise, if at least one
+  // success-classified diagnostic landed in it, the block is 'success'.
+  type Outcome = { kind: 'success' | 'failure'; block: Block };
+  const blockOutcomes = new Map<string, Outcome>();
 
   for (const d of leanDiags) {
     const leanLine = d.range.start.line + 1; // VS Code 0-based → 1-based
@@ -199,41 +202,53 @@ async function verify(): Promise<void> {
     );
     if (!block) continue;
 
-    // The @lean block in the .hs is `{- @lean\n<content>\n-}`. The shim
-    // appends `<content>` to the .lean preceded by a blank line, with the
-    // content's line layout preserved. So a Lean diagnostic on line L
-    // maps back onto the .hs line whose offset within the comment block
-    // matches L - block.lean[0]; the +1 accounts for the `{- @lean` opener.
-    const offsetInBlock = leanLine - block.lean[0];
-    const hsLine = block.hs[0] + 1 + offsetInBlock;
-    const lineIdx = Math.max(0, hsLine - 1);
-    const range = new vscode.Range(lineIdx, 0, lineIdx, Number.MAX_SAFE_INTEGER);
-
     const klass = classify(d.message);
     const tag = severityLabel(d.severity);
     const message = `${tag}${d.message}`;
-
     const key = `${block.hs[0]}-${block.hs[1]}`;
     rich.set(key, (rich.get(key) ?? '') + message + '\n\n');
 
-    const hover = new vscode.MarkdownString();
-    hover.appendCodeblock(d.message.trim(), 'lean');
-
     if (klass === 'success') {
-      // No Diagnostic posted — the green squiggle is the sole signal.
-      successRanges.push({ range, hoverMessage: hover });
+      if (!blockOutcomes.has(key)) {
+        blockOutcomes.set(key, { kind: 'success', block });
+      }
     } else if (klass === 'failure') {
-      failureRanges.push({ range, hoverMessage: hover });
-      // Surface the counterexample as an Error so it shows in Problems.
-      const diag = new vscode.Diagnostic(range, message, vscode.DiagnosticSeverity.Error);
-      diag.source = 'lean';
-      hsDiags.push(diag);
-    } else {
-      // Compilation errors, unsupported sort types, etc.: keep as diagnostic.
-      const diag = new vscode.Diagnostic(range, message, d.severity);
+      blockOutcomes.set(key, { kind: 'failure', block });
+    }
+
+    // Non-Blaster diagnostics still flow to the Problems pane on the block's
+    // content range so the user can jump to them. Skip ✅ Valid since the
+    // green squiggle is the only signal we want for success.
+    if (klass !== 'success') {
+      // Map the specific Lean line back to the .hs line for the diagnostic
+      // anchor (Problems-pane jumping should land precisely, even though
+      // the squiggle covers the whole declaration).
+      const offsetInBlock = leanLine - block.lean[0];
+      const hsLine = block.hs[0] + 1 + offsetInBlock;
+      const lineIdx = Math.max(0, hsLine - 1);
+      const range = new vscode.Range(lineIdx, 0, lineIdx, Number.MAX_SAFE_INTEGER);
+
+      const sev = klass === 'failure' ? vscode.DiagnosticSeverity.Error : d.severity;
+      const diag = new vscode.Diagnostic(range, message, sev);
       diag.source = 'lean';
       hsDiags.push(diag);
     }
+  }
+
+  // Build decoration options per block — span the *content* of the
+  // `{- @lean ... -}` comment, i.e. everything between the opener and closer
+  // lines, so the squiggle covers the full theorem text.
+  const successRanges: vscode.DecorationOptions[] = [];
+  const failureRanges: vscode.DecorationOptions[] = [];
+  for (const [key, outcome] of blockOutcomes) {
+    const startLine = Math.max(0, outcome.block.hs[0]);     // line after `{- @lean`
+    const endLine   = Math.max(startLine, outcome.block.hs[1] - 2); // line before `-}`
+    const range = new vscode.Range(startLine, 0, endLine, Number.MAX_SAFE_INTEGER);
+    const hover = new vscode.MarkdownString();
+    hover.appendCodeblock((rich.get(key) ?? '').trim(), 'lean');
+    const opt: vscode.DecorationOptions = { range, hoverMessage: hover };
+    if (outcome.kind === 'success') successRanges.push(opt);
+    else failureRanges.push(opt);
   }
 
   diagCol.set(doc.uri, hsDiags);
