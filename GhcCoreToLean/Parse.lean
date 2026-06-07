@@ -182,4 +182,56 @@ def parseCoreProgramFromString (s : String) : Except String CoreProgram := do
   let j ← Lean.Json.parse s
   parseCoreProgram j
 
+/-! ## Type & instance declarations (from the decl-plugin sidecar) -/
+
+private def parseDataField (j : Lean.Json) : Except String DataField := do
+  let name ← j.getObjValAs? String "name"
+  let ty   ← parseGHCType (← getField j "type")
+  .ok { name, ty }
+
+private def parseDataConSpec (j : Lean.Json) : Except String DataConSpec := do
+  let name    ← j.getObjValAs? String "name"
+  let fieldsA ← (← getField j "fields").getArr?
+  let fields  ← fieldsA.toList.mapM parseDataField
+  .ok { name, fields }
+
+def parseDataDecl (j : Lean.Json) : Except String DataDecl := do
+  let name   ← j.getObjValAs? String "name"
+  let kind   ← j.getObjValAs? String "kind"
+  let ctorsA ← (← getField j "constructors").getArr?
+  let ctors  ← ctorsA.toList.mapM parseDataConSpec
+  .ok { name, kind, ctors }
+
+def parseInstance (j : Lean.Json) : Except String Instance := do
+  let className  ← j.getObjValAs? String "className"
+  let headA      ← (← getField j "headTypes").getArr?
+  let headTypes  ← headA.toList.mapM parseGHCType
+  let dfunName   ← j.getObjValAs? String "dfunName"
+  let dfunUnique ← j.getObjValAs? Nat    "dfunUnique"
+  .ok { className, headTypes, dfunName, dfunUnique }
+
+/-- Parse either the legacy `{ binds: ... }` or the extended
+    `{ binds, typeDecls, instances }` shape. -/
+def parseProgram (j : Lean.Json) : Except String Program := do
+  let binds      ← parseCoreProgram j
+  let typeDecls  ← match j.getObjVal? "typeDecls" with
+    | .ok td => match td with
+      | .null => .ok []
+      | _ => do
+        let arr ← td.getArr?
+        arr.toList.mapM parseDataDecl
+    | .error _ => .ok []
+  let instances  ← match j.getObjVal? "instances" with
+    | .ok ins => match ins with
+      | .null => .ok []
+      | _ => do
+        let arr ← ins.getArr?
+        arr.toList.mapM parseInstance
+    | .error _ => .ok []
+  .ok { binds, typeDecls, instances }
+
+def parseProgramFromString (s : String) : Except String Program := do
+  let j ← Lean.Json.parse s
+  parseProgram j
+
 end GHCCore

@@ -60,6 +60,10 @@ fi
 
 # 1b. Write a fresh cabal file scoped to just this module. Always overwrite
 # so MODNAME stays in sync with whichever source the user passed in.
+# Two plugins are injected via ghc-options so user .hs files don't need any
+# pragma:
+#   * GhcDump.Plugin     — value bindings, dumps CBOR
+#   * GhcDeclDump        — type & instance shapes (our plugin), dumps JSON
 cat >"${SANDBOX}/transpile-sandbox.cabal" <<EOF
 cabal-version:      2.4
 name:               transpile-sandbox
@@ -67,16 +71,22 @@ version:            0.1.0.0
 
 library
     exposed-modules:    ${MODNAME}
-    build-depends:      base, ghc-dump-core
+    build-depends:      base, ghc-dump-core, decl-plugin
     default-language:   Haskell2010
     hs-source-dirs:     .
+    ghc-options:        -fplugin GhcDump.Plugin -fplugin GhcDeclDump
 EOF
 
-cat >"${SANDBOX}/cabal.project" <<'EOF'
+cat >"${SANDBOX}/cabal.project" <<EOF
 with-compiler: ghc-9.2.7
 
-packages: .
+packages:
+    .
+    ${REPO}/shim/decl-plugin
 EOF
+
+mkdir -p "${SANDBOX}/.decls"
+export GHC_DECL_DUMP_DIR="${SANDBOX}/.decls"
 
 # 2. cabal build (runs the ghc-dump-core plugin as a side effect).
 echo "→ cabal build (GHC 9.2.7)"
@@ -110,8 +120,13 @@ if [[ ! -x "$TRANSPILER" ]]; then
 fi
 
 JSON="/tmp/${MODLOWER}.json"
+DECLS_JSON="${SANDBOX}/.decls/${MODNAME}.decls.json"
 echo "→ shim         ${CBOR##*/}  →  ${JSON}"
-"$SHIM" "$CBOR" >"$JSON"
+if [[ -f "$DECLS_JSON" ]]; then
+  "$SHIM" "$CBOR" --decls "$DECLS_JSON" >"$JSON"
+else
+  "$SHIM" "$CBOR" >"$JSON"
+fi
 
 echo "→ transpiler   ${JSON##*/}  →  ${OUT}"
 "$TRANSPILER" "$JSON" "$OUT" >/dev/null

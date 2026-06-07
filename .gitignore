@@ -1,6 +1,7 @@
 /.lake
 /.vscode/
 shim/dist-newstyle/
+shim/decl-plugin/dist-newstyle/
 .transpile-sandbox/
 GhcCoreToLean/Generated/
 vscode-extension/node_modules/

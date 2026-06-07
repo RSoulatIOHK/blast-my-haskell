@@ -4,8 +4,10 @@ module Main (main) where
 
 import qualified Data.ByteString.Lazy        as BSL
 import qualified Data.ByteString.Lazy.Char8  as BSLC
+import qualified Data.Aeson                  as A
 import           Data.Aeson                  (Value, object, (.=))
 import qualified Data.Aeson.Encode.Pretty    as AP
+import qualified Data.Aeson.KeyMap           as AKM
 import qualified Data.Map.Strict             as Map
 import           Data.Map.Strict             (Map)
 import qualified Data.Text                   as T
@@ -26,12 +28,40 @@ main :: IO ()
 main = do
   args <- getArgs
   case args of
-    [path] -> do
-      m <- readSModuleFile path
-      let env = collectBinders m
-          modName = getModuleName (moduleName m)
-      BSLC.putStrLn (AP.encodePretty (convertModule env modName m))
-    _ -> die "usage: ghc-core-shim <path/to/Module.passNNNN.cbor>"
+    [cborPath] -> emit cborPath Nothing
+    [cborPath, "--decls", declsPath] -> emit cborPath (Just declsPath)
+    _ -> die "usage: ghc-core-shim <Module.passNNNN.cbor> [--decls <Module.decls.json>]"
+
+-- | Read the Core dump, optionally splice in the type/instance decl shapes
+-- from the decl-plugin, and emit the unified JSON to stdout.
+emit :: FilePath -> Maybe FilePath -> IO ()
+emit cborPath mDeclsPath = do
+  m <- readSModuleFile cborPath
+  let env     = collectBinders m
+      modName = getModuleName (moduleName m)
+      coreVal = convertModule env modName m
+  decls <- case mDeclsPath of
+    Nothing -> pure A.Null
+    Just p  -> do
+      bs <- BSL.readFile p
+      case A.decode bs :: Maybe A.Value of
+        Just v  -> pure v
+        Nothing -> die ("could not parse " <> p)
+  let merged = mergeDecls coreVal decls
+  BSLC.putStrLn (AP.encodePretty merged)
+
+-- | Splice `typeDecls` and `instances` from the decl-plugin's JSON into the
+-- core-side JSON. If decls is Null (no plugin output), pass core through.
+mergeDecls :: A.Value -> A.Value -> A.Value
+mergeDecls core decls =
+  case (core, decls) of
+    (A.Object cobj, A.Object dobj) ->
+      let pick k = maybe A.Null id (AKM.lookup k dobj)
+          coreWith = AKM.insert "typeDecls" (pick "typeDecls")
+                   $ AKM.insert "instances" (pick "instances")
+                   $ cobj
+      in A.Object coreWith
+    _ -> core
 
 ------------------------------------------------------------------------
 -- Env: BinderId → SBinder

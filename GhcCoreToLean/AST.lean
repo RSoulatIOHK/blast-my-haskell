@@ -68,4 +68,38 @@ end
 
 abbrev CoreProgram := List Bind
 
+/-! ## Type and instance declarations
+
+    These come from the `decl-plugin` JSON sidecar (not from Core itself).
+    Together with `CoreProgram` they form the full `Program`. -/
+
+structure DataField where
+  name : Name
+  ty   : GHCType
+deriving Repr, Inhabited
+
+structure DataConSpec where
+  name   : Name
+  fields : List DataField
+deriving Repr, Inhabited
+
+structure DataDecl where
+  name  : Name
+  kind  : String           -- "data" or "newtype"
+  ctors : List DataConSpec
+deriving Repr, Inhabited
+
+structure Instance where
+  className  : Name
+  headTypes  : List GHCType
+  dfunName   : Name
+  dfunUnique : Nat
+deriving Repr, Inhabited
+
+structure Program where
+  binds     : CoreProgram
+  typeDecls : List DataDecl
+  instances : List Instance
+deriving Inhabited
+
 end GHCCore

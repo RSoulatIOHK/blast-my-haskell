@@ -17,6 +17,16 @@ private def sanitizeChar : Char → String
   | '$' => "_dollar_"
   | '#' => "_hash_"
   | '.' => "_dot_"
+  | '=' => "_eq_"
+  | '/' => "_slash_"
+  | '+' => "_plus_"
+  | '-' => "_minus_"
+  | '*' => "_star_"
+  | '<' => "_lt_"
+  | '>' => "_gt_"
+  | '!' => "_bang_"
+  | '?' => "_q_"
+  | '\'' => "'"
   | c   => if isLeanIdChar c then String.singleton c else "_"
 
 def sanitize (s : String) : String :=
@@ -221,5 +231,94 @@ def emitProgram (p : CoreProgram) : String :=
   let top      := collectTopNames p
   let bindStrs := p.map (emitBind top)
   String.intercalate "\n\n" bindStrs
+
+/-! ## Data type declarations and instances -/
+
+/-- Emit a Haskell `data T = …` declaration as a Lean `inductive`. Using
+    `inductive` (not `structure`) means GHC-emitted case patterns
+    `case x of T a b -> …` work as-is; the GHC-auto-generated field
+    selectors are also emitted alongside as regular defs. -/
+def emitDataDecl (d : DataDecl) : String :=
+  let leanName := sanitize d.name
+  let ctorLines := d.ctors.map fun c =>
+    let argTys := c.fields.map (emitType ·.ty)
+    let arrows := argTys.foldr (init := leanName) fun a acc => s!"{a} → {acc}"
+    s!"  | {sanitize c.name} : {arrows}"
+  let body := String.intercalate "\n" ctorLines
+  s!"inductive {leanName} where\n{body}\nderiving Repr"
+
+/-- Look up a method binding (e.g. `$c==`) by its Haskell-side name in the
+    top-level program. Returns the sanitized Lean name if found. -/
+private def findMethodBinding (binds : CoreProgram) (haskellName : Name) : Option String :=
+  binds.findSome? fun b => match b with
+    | .nonRec v _ => if v.name == haskellName then some (sanitize v.name) else none
+    | .rec_ pairs => (pairs.find? (·.1.name == haskellName)).map (fun (v, _) => sanitize v.name)
+
+/-- Emit a Lean `instance` block. Only `Eq` → Lean `BEq` is wired for now.
+    Returns `none` for classes we don't model (Show, Read, etc.) so the
+    caller can skip them entirely. -/
+def emitInstance (binds : CoreProgram) (i : Instance) : Option String :=
+  let tyStr := i.headTypes.map emitType |> String.intercalate " "
+  match i.className with
+  | "Eq" =>
+    let methodRef := (findMethodBinding binds "$c==").getD (sanitize "$c==")
+    some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
+  | _ => none
+
+/-- Build a user-data-constructor-name map from the typeDecls. This lets
+    the Lean emitter rewrite `case x of CustomRatio …` patterns to use the
+    Lean structure's `.mk` (or anonymous) form. -/
+def userDataConMap (decls : List DataDecl) : Name → Option String := fun n =>
+  decls.findSome? fun d =>
+    d.ctors.findSome? fun c =>
+      if c.name == n then
+        if d.ctors.length == 1 && c.fields.all (·.name != "_") then
+          -- Single-ctor structure → use .mk
+          some s!"{sanitize d.name}.mk"
+        else
+          some (sanitize c.name)
+      else none
+
+/-- Rewrite occurrences of `(GHCCore.tyConOpaque "X")` to the bare name `X`
+    for every user-declared type. The Core dump types user types as opaque
+    (since the shim doesn't know the lakefile's type-ctor map); after the
+    transpiler emits `inductive X where …`, opaque references should resolve
+    to that inductive directly. -/
+private def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
+  decls.foldl (init := src) fun s d =>
+    let needle := s!"(GHCCore.tyConOpaque \"{d.name}\")"
+    let replacement := sanitize d.name
+    s.replace needle replacement
+
+/-- Qualify user-defined data constructors in alt-patterns. Lean's
+    `inductive CustomRatio where | CustomRatio : ...` puts the constructor
+    under the type's namespace, so `| CustomRatio a b =>` must become
+    `| CustomRatio.CustomRatio a b =>`. -/
+private def resolveUserCtorsInPatterns (decls : List DataDecl) (src : String) : String :=
+  decls.foldl (init := src) fun s d =>
+    d.ctors.foldl (init := s) fun s c =>
+      let bareCtor := sanitize c.name
+      let qualCtor := s!"{sanitize d.name}.{bareCtor}"
+      let needle := s!"| {bareCtor} "
+      let replacement := s!"| {qualCtor} "
+      s.replace needle replacement
+
+/-- Top-level entry: emit a full Program (data decls, value defs, instances).
+    The user-type and user-ctor post-passes are applied only to the
+    value-binding / instance sections; the data declarations themselves
+    must keep their original names. -/
+def emitFullProgram (p : Program) : String :=
+  let datas := p.typeDecls.map emitDataDecl
+  let binds := emitProgram p.binds
+  let insts := p.instances.filterMap (emitInstance p.binds)
+  let bodyRaw :=
+    (if binds.isEmpty then "" else binds)
+      ++ (if insts.isEmpty then "" else "\n\n" ++ String.intercalate "\n\n" insts)
+  let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
+                    |> resolveUserCtorsInPatterns p.typeDecls
+  let dataBlock :=
+    if datas.isEmpty then "" else String.intercalate "\n\n" datas
+  let sections := List.filter (· != "") [dataBlock, bodyResolved]
+  String.intercalate "\n\n" sections
 
 end GHCCore.Emit

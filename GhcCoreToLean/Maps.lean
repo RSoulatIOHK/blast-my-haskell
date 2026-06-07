@@ -19,6 +19,10 @@ def valueMap : String → Option String
   | "GHC.Classes.>=" | ">=" => some "(fun a b => decide (a ≥ b))"
   | "GHC.Base.id"          => some "id"
   | "GHC.Base.."           => some "Function.comp"
+  -- GHC's True/False are data constructors used in value positions. Map them
+  -- to Lean's Bool literals so dict-method bodies like `$c/=` compile.
+  | "GHC.Types.True"       => some "true"
+  | "GHC.Types.False"      => some "false"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,

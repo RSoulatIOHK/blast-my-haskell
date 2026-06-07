@@ -1,0 +1,17 @@
+cabal-version:      2.4
+name:               decl-plugin
+version:            0.1.0.0
+synopsis:           GHC plugin that dumps type/instance declaration shapes to JSON
+                    so the ghcCoreToLean transpiler can emit Lean
+                    `structure` / `instance` blocks.
+
+library
+    exposed-modules:    GhcDeclDump
+    build-depends:      base       >=4.16 && <5,
+                        bytestring,
+                        text,
+                        aeson,
+                        filepath,
+                        ghc        >=9.2 && <9.3
+    default-language:   Haskell2010
+    ghc-options:        -Wall -Wno-unused-imports
