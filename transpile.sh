@@ -111,6 +111,22 @@ echo "→ shim         ${CBOR##*/}  →  ${JSON}"
 echo "→ transpiler   ${JSON##*/}  →  ${OUT}"
 "$TRANSPILER" "$JSON" "$OUT" >/dev/null
 
+# Extract `{- @lean ... -}` annotation blocks from the original source and
+# append them verbatim to the emitted .lean file. Use perl for reliable
+# multi-line matching (BSD sed/awk on macOS don't make this easy).
+ANNO="$(perl -0777 -ne '
+  my $n = 0;
+  while (/\{-\s*\@lean\s*(.*?)\s*-\}/sg) {
+    print "\n", $1, "\n";
+    $n++;
+  }
+  print STDERR "extracted $n \@lean block(s)\n" if $n > 0;
+' "$SRC")"
+
+if [[ -n "$ANNO" ]]; then
+  printf '%s\n' "$ANNO" >>"$OUT"
+fi
+
 echo
 echo "✓ wrote $OUT"
 echo "  next: wrap in a \`namespace ${MODNAME}\` block,"
