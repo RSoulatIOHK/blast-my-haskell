@@ -111,21 +111,81 @@ echo "→ shim         ${CBOR##*/}  →  ${JSON}"
 echo "→ transpiler   ${JSON##*/}  →  ${OUT}"
 "$TRANSPILER" "$JSON" "$OUT" >/dev/null
 
-# Extract `{- @lean ... -}` annotation blocks from the original source and
-# append them verbatim to the emitted .lean file. Use perl for reliable
-# multi-line matching (BSD sed/awk on macOS don't make this easy).
-ANNO="$(perl -0777 -ne '
-  my $n = 0;
-  while (/\{-\s*\@lean\s*(.*?)\s*-\}/sg) {
-    print "\n", $1, "\n";
-    $n++;
-  }
-  print STDERR "extracted $n \@lean block(s)\n" if $n > 0;
-' "$SRC")"
+# Extract `{- @lean ... -}` annotation blocks from the original source,
+# append them verbatim to the emitted .lean file, and emit a source map
+# sidecar (${OUT}.map.json) listing each block's line range in both files.
+# The map is what the VS Code extension uses to forward Lean diagnostics
+# back onto the original Haskell annotation.
+perl - "$SRC" "$OUT" <<'PERL_EOF'
+use strict;
+use warnings;
+use JSON::PP;
 
-if [[ -n "$ANNO" ]]; then
-  printf '%s\n' "$ANNO" >>"$OUT"
-fi
+my ($src_path, $out_path) = @ARGV;
+my $map_path = "$out_path.map.json";
+
+my $hs;
+{
+  local $/;  # slurp mode, scoped so the next file read stays line-oriented
+  open(my $sfh, "<", $src_path) or die "open $src_path: $!";
+  $hs = <$sfh>;
+  close $sfh;
+}
+
+# Count existing lines in the .lean output (transpiler-produced part).
+my $existing_lines = 0;
+if (-e $out_path) {
+  open(my $efh, "<", $out_path) or die "open $out_path: $!";
+  while (<$efh>) { $existing_lines++ }
+  close $efh;
+}
+
+my @blocks;
+my $appended_lines = 0;
+
+open(my $afh, ">>", $out_path) or die "append $out_path: $!";
+
+while ($hs =~ /\{-\s*\@lean\s*(.*?)\s*-\}/sg) {
+  my $match_start = $-[0];
+  my $match_end   = $+[0];
+  my $content     = $1;
+
+  # Strip leading/trailing whitespace so the surrounding `{- @lean ... -}`
+  # newlines don't pad the block.
+  $content =~ s/\A\s+//;
+  $content =~ s/\s+\z//;
+
+  my $hs_start_line = 1 + (substr($hs, 0, $match_start) =~ tr/\n//);
+  my $hs_end_line   = 1 + (substr($hs, 0, $match_end)   =~ tr/\n//);
+
+  my $content_lines = 1 + ($content =~ tr/\n//);
+
+  # Layout: one blank separator line, then content, then a terminator newline.
+  print $afh "\n", $content, "\n";
+
+  my $lean_start = $existing_lines + $appended_lines + 2;
+  my $lean_end   = $lean_start + $content_lines - 1;
+
+  push @blocks, {
+    hs   => [$hs_start_line + 0, $hs_end_line + 0],
+    lean => [$lean_start    + 0, $lean_end    + 0],
+  };
+
+  $appended_lines += 1 + $content_lines;
+}
+close $afh;
+
+open(my $mfh, ">", $map_path) or die "write $map_path: $!";
+print $mfh JSON::PP->new->canonical->pretty->encode({
+  haskellPath => $src_path,
+  leanPath    => $out_path,
+  blocks      => \@blocks,
+});
+close $mfh;
+
+my $n = scalar(@blocks);
+print STDERR "extracted $n \@lean block(s); map: $map_path\n" if $n > 0;
+PERL_EOF
 
 echo
 echo "✓ wrote $OUT"

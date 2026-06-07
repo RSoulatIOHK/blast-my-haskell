@@ -1,0 +1,61 @@
+{
+  "name": "ghccoretolean-vscode",
+  "displayName": "GHC Core → Lean Verifier",
+  "description": "Runs the GHC→Lean spike pipeline on Haskell files and surfaces Blaster's verdicts as inline diagnostics + hover on the {- @lean ... -} annotation.",
+  "version": "0.1.0",
+  "publisher": "iohk-spike",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:haskell"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "ghcCoreLean.verify",
+        "title": "Verify @lean annotations via Blaster",
+        "category": "GHC Core → Lean"
+      },
+      {
+        "command": "ghcCoreLean.clearDiagnostics",
+        "title": "Clear Lean diagnostics",
+        "category": "GHC Core → Lean"
+      }
+    ],
+    "configuration": {
+      "title": "GHC Core → Lean",
+      "properties": {
+        "ghcCoreLean.scriptPath": {
+          "type": "string",
+          "default": "transpile.sh",
+          "description": "Path to transpile.sh, absolute or relative to the workspace root."
+        },
+        "ghcCoreLean.leanDiagnosticQuietMs": {
+          "type": "number",
+          "default": 2000,
+          "description": "Milliseconds of silence from the Lean LSP before considering the diagnostic stream stable."
+        },
+        "ghcCoreLean.leanDiagnosticTimeoutMs": {
+          "type": "number",
+          "default": 60000,
+          "description": "Maximum total wait time for Lean LSP diagnostics."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

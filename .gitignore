@@ -1,4 +1,7 @@
 /.lake
-.vscode/
+/.vscode/
 shim/dist-newstyle/
 .transpile-sandbox/
+vscode-extension/node_modules/
+vscode-extension/out/
+vscode-extension/*.vsix
