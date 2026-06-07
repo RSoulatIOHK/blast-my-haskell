@@ -8,3 +8,4 @@ import GhcCoreToLean.Emit
 import GhcCoreToLean.Basic
 import GhcCoreToLean.Spike.Fib
 import GhcCoreToLean.Spike.FibEmitted
+import GhcCoreToLean.Spike.FibFromShim

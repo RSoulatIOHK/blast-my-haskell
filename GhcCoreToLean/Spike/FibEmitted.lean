@@ -1,6 +1,8 @@
 import Lean
 import Blaster
 
+namespace Spike.FibEmitted
+
 def fib (ds : Int) : Int :=
   (let ds_inner := ds
 (match ds_inner with
@@ -10,3 +12,5 @@ def fib (ds : Int) : Int :=
 decreasing_by all_goals sorry
 
 #blaster [ fib 0 = 1 ]
+
+end Spike.FibEmitted

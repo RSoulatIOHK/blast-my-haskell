@@ -19,14 +19,22 @@ private def sanitizeChar : Char → String
   | '.' => "_dot_"
   | c   => if isLeanIdChar c then String.singleton c else "_"
 
-/-- Lean-safe identifier from a GHC name. Wraps in `«…»` if the result is a keyword. -/
 def sanitize (s : String) : String :=
   let mapped := s.foldl (fun acc c => acc ++ sanitizeChar c) ""
   if leanKeywords.contains mapped then s!"«{mapped}»" else mapped
 
-/-- Disambiguating identifier — append the unique to the sanitized name. -/
-def sanitizeWithUnique (v : Var) : String :=
+/-- A local binder is emitted as `<sanitize>_<unique>` so multiple GHC
+    binders that happen to share a name (e.g. `ds` rebound by nested
+    case-alts) get distinct Lean identifiers. -/
+def localId (v : Var) : String :=
   s!"{sanitize v.name}_{v.unique}"
+
+/-- For a Var reference: bare name if it's a known top-level binding,
+    `<name>_<unique>` otherwise. Top-level names are resolved against
+    a set of names collected from the program. -/
+def refId (topNames : List Name) (v : Var) : String :=
+  if topNames.contains v.name then sanitize v.name
+  else localId v
 
 /-! ## Recursion detection -/
 
@@ -77,7 +85,6 @@ def emitLiteral : Literal → String
   | .litChar c   => s!"'{c}'"
   | .litLabel l  => s!"GHCCore.foreignLabel \"{l}\""
 
-/-- Literal as a Lean pattern (for `LitAlt`). -/
 def emitLiteralPattern : Literal → String
   | .litInt n    => toString n
   | .litWord n   => toString n
@@ -85,16 +92,18 @@ def emitLiteralPattern : Literal → String
   | .litDouble f => toString f
   | .litString s => s!"\"{s}\""
   | .litChar c   => s!"'{c}'"
-  | .litLabel _  => "_"   -- foreign labels not meaningful as patterns
+  | .litLabel _  => "_"
 
-/-! ## Var emission (locals vs. mapped global ids) -/
+/-! ## Var emission -/
 
-def emitVar (v : Var) : String :=
+/-- Map a Var reference. Mapped value-map hits short-circuit; top-level
+    refs use bare names; locals get unique-suffixed. -/
+def emitVar (topNames : List Name) (v : Var) : String :=
   match valueMap v.name with
   | some lean => lean
-  | none      => sanitize v.name
+  | none      => refId topNames v
 
-/-! ## Expr emission -/
+/-! ## Alts -/
 
 /-- DEFAULT alt must come last in a Lean `match`. -/
 def reorderAlts (alts : List Alt) : List Alt :=
@@ -111,40 +120,40 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
     let resolved := (dataConMap name).getD (sanitize name)
     if bndrs.isEmpty then resolved
     else
-      let bs := String.intercalate " " (bndrs.map (sanitize ·.name))
+      let bs := String.intercalate " " (bndrs.map localId)
       s!"{resolved} {bs}"
 
+/-! ## Expr emission -/
+
 mutual
-  partial def emitExpr : Expr → String
-    | .var v   => emitVar v
+  partial def emitExpr (top : List Name) : Expr → String
+    | .var v   => emitVar top v
     | .lit l   => emitLiteral l
-    | .app f a => s!"({emitExpr f}) ({emitExpr a})"
+    | .app f a => s!"({emitExpr top f}) ({emitExpr top a})"
     | .lam v body =>
-      s!"(fun {sanitize v.name} => {emitExpr body})"
+      s!"(fun {localId v} => {emitExpr top body})"
     | .let_ b body =>
-      s!"({emitLet b}\n{emitExpr body})"
+      s!"({emitLet top b}\n{emitExpr top body})"
     | .case_ scr _cb _ty alts =>
       let alts'   := reorderAlts alts
-      let altsStr := alts'.map emitAlt
-      let header  := s!"(match {emitExpr scr} with"
+      let altsStr := alts'.map (emitAlt top)
+      let header  := s!"(match {emitExpr top scr} with"
       let body    := String.intercalate "\n" altsStr
       s!"{header}\n{body})"
-    | .cast e  => emitExpr e
-    | .tick e  => emitExpr e
+    | .cast e  => emitExpr top e
+    | .tick e  => emitExpr top e
     | .type_ _ => "(GHCCore.typeArg : GHCCore.GHCType)"
 
-  /-- Render a single Alt arm. -/
-  partial def emitAlt : Alt → String
+  partial def emitAlt (top : List Name) : Alt → String
     | .mk con bndrs rhs =>
-      s!"| {emitAltPattern con bndrs} => {emitExpr rhs}"
+      s!"| {emitAltPattern con bndrs} => {emitExpr top rhs}"
 
-  /-- Render a Let. Returns the let-binding line(s) without the body. -/
-  partial def emitLet : Bind → String
+  partial def emitLet (top : List Name) : Bind → String
     | .nonRec v e =>
-      s!"let {sanitize v.name} := {emitExpr e}"
+      s!"let {localId v} := {emitExpr top e}"
     | .rec_ pairs =>
       let lines := pairs.map fun (v, e) =>
-        s!"  {sanitize v.name} := {emitExpr e}"
+        s!"  {localId v} := {emitExpr top e}"
       let body := String.intercalate "\n" lines
       s!"-- TODO: local Rec let unsupported, emitted as opaque\n{body}"
 end
@@ -163,12 +172,13 @@ private partial def stripFunTys : Nat → GHCType → GHCType
   | n+1, .forAll _ body => stripFunTys (n+1) body
   | _,     t            => t
 
-private def emitDefHeader (v : Var) (args : List Var) (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
+private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
+                          (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
   let name     := sanitize v.name
-  let argStrs  := args.map (fun a => s!"({sanitize a.name} : {emitType a.ty})")
+  let argStrs  := args.map (fun a => s!"({localId a} : {emitType a.ty})")
   let argStr   := String.intercalate " " argStrs
   let resStr   := emitType resTy
-  let body     := emitExpr rhsBody
+  let body     := emitExpr top rhsBody
   let head     :=
     if argStrs.isEmpty then s!"def {name} : {resStr} :="
     else s!"def {name} {argStr} : {resStr} :="
@@ -177,34 +187,39 @@ private def emitDefHeader (v : Var) (args : List Var) (resTy : GHCType) (rhsBody
     else ""
   s!"{head}\n  {body}{term}"
 
-/-! ## Top-level bind emission -/
+/-! ## Top-level binds -/
 
-def emitBind (b : Bind) : String :=
+private def emitBind (top : List Name) (b : Bind) : String :=
   match b with
   | .nonRec v e =>
     let (args, body) := peelLams e
     let resTy        := stripFunTys args.length v.ty
     let rec?         := occursInExpr v.name e
-    emitDefHeader v args resTy body rec?
+    emitDefHeader top v args resTy body rec?
   | .rec_ pairs =>
-    -- Treat a singleton Rec as a stand-alone recursive def (no `mutual` wrapper).
-    -- Multi-element Rec wraps in mutual.
     match pairs with
     | [(v, e)] =>
       let (args, body) := peelLams e
       let resTy        := stripFunTys args.length v.ty
       let rec?         := occursInExpr v.name e
-      emitDefHeader v args resTy body rec?
+      emitDefHeader top v args resTy body rec?
     | _        =>
       let defs := pairs.map fun (v, e) =>
         let (args, body) := peelLams e
         let resTy        := stripFunTys args.length v.ty
-        emitDefHeader v args resTy body true
+        emitDefHeader top v args resTy body true
       let body := String.intercalate "\n" defs
       s!"mutual\n{body}\nend"
 
+/-- Collect the names of every top-level binder in a program. -/
+private def collectTopNames (p : CoreProgram) : List Name :=
+  p.foldl (init := []) fun acc b => match b with
+    | .nonRec v _ => v.name :: acc
+    | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc
+
 def emitProgram (p : CoreProgram) : String :=
-  let bindStrs := p.map emitBind
+  let top      := collectTopNames p
+  let bindStrs := p.map (emitBind top)
   String.intercalate "\n\n" bindStrs
 
 end GHCCore.Emit

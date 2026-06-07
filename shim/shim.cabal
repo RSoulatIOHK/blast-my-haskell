@@ -1,0 +1,18 @@
+cabal-version:      2.4
+name:               ghc-core-shim
+version:            0.1.0.0
+synopsis:           Translate ghc-dump-core dumps into the GhcCoreToLean JSON schema.
+
+executable ghc-core-shim
+    main-is:            Main.hs
+    hs-source-dirs:     .
+    build-depends:      base,
+                        bytestring,
+                        containers,
+                        text,
+                        aeson,
+                        aeson-pretty,
+                        serialise,
+                        ghc-dump-core
+    default-language:   Haskell2010
+    ghc-options:        -Wall
