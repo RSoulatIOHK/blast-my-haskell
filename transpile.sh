@@ -131,6 +131,8 @@ fi
 echo "→ transpiler   ${JSON##*/}  →  ${OUT}"
 "$TRANSPILER" "$JSON" "$OUT" >/dev/null
 
+export DECLS_JSON_PATH="$DECLS_JSON"
+
 # Extract `{- @lean ... -}` annotation blocks from the original source,
 # append them verbatim to the emitted .lean file, and emit a source map
 # sidecar (${OUT}.map.json) listing each block's line range in both files.
@@ -206,6 +208,65 @@ close $mfh;
 my $n = scalar(@blocks);
 print STDERR "extracted $n \@lean block(s); map: $map_path\n" if $n > 0;
 PERL_EOF
+
+# Final pass: rewrite Haskell-style ctor references (`Ctor`, used in user
+# `@lean` annotations) to Lean-qualified form (`Type.Ctor`). The Lean
+# transpiler already does this for code it emits; this catches the user's
+# annotation text, which was appended *after* the transpiler ran. Rules are
+# the same set as in Emit.lean's `resolveUserCtors` and are idempotent
+# under non-overlapping `String.replace` semantics, so re-applying to the
+# already-rewritten body produces no further changes.
+if [[ -f "$DECLS_JSON" ]]; then
+  perl - "$OUT" "$DECLS_JSON" <<'PERL_EOF'
+use strict;
+use warnings;
+use JSON::PP;
+
+my ($out_path, $decls_path) = @ARGV;
+
+my $decls;
+{
+  local $/;
+  open(my $df, "<", $decls_path) or die "open $decls_path: $!";
+  $decls = decode_json(<$df>);
+  close $df;
+}
+
+my @pairs;
+for my $t (@{$decls->{typeDecls} || []}) {
+  my $tn = $t->{name};
+  for my $c (@{$t->{constructors} || []}) {
+    push @pairs, [$tn, $c->{name}];
+  }
+}
+
+exit 0 unless @pairs;
+
+my $content;
+{
+  local $/;
+  open(my $lf, "<", $out_path) or die "open $out_path: $!";
+  $content = <$lf>;
+  close $lf;
+}
+
+for my $p (@pairs) {
+  my ($t, $c) = @$p;
+  my $q = "$t.$c";
+  # Match the rule set from Emit.lean's resolveUserCtors.
+  # The pattern rule uses a negative lookahead so it does not match the
+  # `| Ctor : <type>` ctor *declaration* inside the inductive block.
+  $content =~ s/\Q| $c \E(?!:)/| $q /g;
+  $content =~ s/\Q($c)\E/($q)/g;
+  $content =~ s/ \Q$c\E \(/ $q (/g;
+  $content =~ s/\(\Q$c\E \(/($q (/g;
+}
+
+open(my $wf, ">", $out_path) or die "write $out_path: $!";
+print $wf $content;
+close $wf;
+PERL_EOF
+fi
 
 echo
 echo "✓ wrote $OUT"

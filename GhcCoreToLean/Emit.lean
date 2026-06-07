@@ -232,12 +232,23 @@ def emitProgram (p : CoreProgram) : String :=
   let bindStrs := p.map (emitBind top)
   String.intercalate "\n\n" bindStrs
 
+/-- Like `emitProgram`, but extends the "top-level names" set with extra
+    names that should NOT get a `_unique` suffix when emitted as Var refs.
+    The intended use is to splice in user-declared data constructors so
+    `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
+def emitProgramWith (p : CoreProgram) (extraTopNames : List Name) : String :=
+  let top      := extraTopNames ++ collectTopNames p
+  let bindStrs := p.map (emitBind top)
+  String.intercalate "\n\n" bindStrs
+
 /-! ## Data type declarations and instances -/
 
-/-- Emit a Haskell `data T = …` declaration as a Lean `inductive`. Using
-    `inductive` (not `structure`) means GHC-emitted case patterns
-    `case x of T a b -> …` work as-is; the GHC-auto-generated field
-    selectors are also emitted alongside as regular defs. -/
+/-- Emit a Haskell `data T = …` declaration as a Lean `inductive`. Bare
+    constructor uses are *not* brought into scope via `open T` — that makes
+    `T` ambiguous between the type and the ctor in Lean's elaborator. The
+    body post-passes rewrite Haskell-style refs to the qualified `T.C` form.
+    Field selectors GHC auto-generates are emitted alongside as regular
+    defs. -/
 def emitDataDecl (d : DataDecl) : String :=
   let leanName := sanitize d.name
   let ctorLines := d.ctors.map fun c =>
@@ -290,32 +301,45 @@ private def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
     let replacement := sanitize d.name
     s.replace needle replacement
 
-/-- Qualify user-defined data constructors in alt-patterns. Lean's
-    `inductive CustomRatio where | CustomRatio : ...` puts the constructor
-    under the type's namespace, so `| CustomRatio a b =>` must become
-    `| CustomRatio.CustomRatio a b =>`. -/
-private def resolveUserCtorsInPatterns (decls : List DataDecl) (src : String) : String :=
+/-- Qualify user-defined data constructors in any position where Lean's
+    elaborator would otherwise be ambiguous (type vs. ctor under the same
+    name). Three call-shapes are recognised:
+
+      *  `| Ctor `                              ← alt-pattern
+      *  `(Ctor)`                               ← App in transpiler-emitted style
+      *  `Ctor (` (preceded by whitespace)      ← App in user `@lean` annotation
+
+    Type annotations like `(x : T)` or `→ T →` don't match any of these
+    needles, so they remain `T` and resolve to the type. -/
+private def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     d.ctors.foldl (init := s) fun s c =>
       let bareCtor := sanitize c.name
       let qualCtor := s!"{sanitize d.name}.{bareCtor}"
-      let needle := s!"| {bareCtor} "
-      let replacement := s!"| {qualCtor} "
-      s.replace needle replacement
+      let rules : List (String × String) :=
+        [ (s!"| {bareCtor} ",  s!"| {qualCtor} ")
+        , (s!"({bareCtor})",   s!"({qualCtor})")
+        , (s!" {bareCtor} (",  s!" {qualCtor} (")
+        , (s!"({bareCtor} (",  s!"({qualCtor} (") ]
+      rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
 
 /-- Top-level entry: emit a full Program (data decls, value defs, instances).
     The user-type and user-ctor post-passes are applied only to the
     value-binding / instance sections; the data declarations themselves
     must keep their original names. -/
 def emitFullProgram (p : Program) : String :=
+  -- User-declared ctors (e.g. `CustomRatio`) participate in the top-name
+  -- set so App-position refs to them emit bare, not as `Name_<unique>`.
+  let ctorNames : List Name :=
+    p.typeDecls.flatMap fun d => d.ctors.map (·.name)
   let datas := p.typeDecls.map emitDataDecl
-  let binds := emitProgram p.binds
+  let binds := emitProgramWith p.binds ctorNames
   let insts := p.instances.filterMap (emitInstance p.binds)
   let bodyRaw :=
     (if binds.isEmpty then "" else binds)
       ++ (if insts.isEmpty then "" else "\n\n" ++ String.intercalate "\n\n" insts)
   let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
-                    |> resolveUserCtorsInPatterns p.typeDecls
+                    |> resolveUserCtors p.typeDecls
   let dataBlock :=
     if datas.isEmpty then "" else String.intercalate "\n\n" datas
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
