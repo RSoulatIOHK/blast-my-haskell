@@ -22,3 +22,13 @@ fib n
                 in 2 * prev2 + prev3
   where
     standardFib k = fib (k - 1) + fib (k - 2)
+
+{- @lean
+#blaster [ fib 0 = 1 ]
+#blaster [ fib 6 = 13 ]
+
+theorem correct_fib : ∀ (n : Int), n > 0 →
+    fib n = if n ≤ 1 then 1 else fib (n - 2) + fib (n - 1) := by
+  intro n
+  induction n <;> blaster (timeout: 10)
+-}
