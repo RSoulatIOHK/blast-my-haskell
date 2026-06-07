@@ -5,7 +5,7 @@ import GhcCoreToLean.Parse
 import GhcCoreToLean.Maps
 import GhcCoreToLean.Lower
 import GhcCoreToLean.Emit
-import GhcCoreToLean.Basic
 import GhcCoreToLean.Spike.Fib
 import GhcCoreToLean.Spike.FibEmitted
 import GhcCoreToLean.Spike.FibFromShim
+import GhcCoreToLean.Spike.FibComplexFromShim

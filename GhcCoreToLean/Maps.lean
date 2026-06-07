@@ -8,12 +8,15 @@ def valueMap : String → Option String
   | "GHC.Num.+"     | "+"  => some "(· + ·)"
   | "GHC.Num.-"     | "-"  => some "(· - ·)"
   | "GHC.Num.*"     | "*"  => some "(· * ·)"
+  -- Haskell's comparison operators return `Bool`. Lean 4's `≤`/`<`/etc. return
+  -- `Prop`, so we wrap them in `decide` to get Bool back. `==` is already Bool
+  -- via the `BEq` instance, so it does not need wrapping.
   | "GHC.Classes.=="| "==" => some "(· == ·)"
-  | "GHC.Classes./="| "/=" => some "(fun a b => a != b)"
-  | "GHC.Classes.<" | "<"  => some "(· < ·)"
-  | "GHC.Classes.<=" | "<=" => some "(· ≤ ·)"
-  | "GHC.Classes.>" | ">"  => some "(· > ·)"
-  | "GHC.Classes.>=" | ">=" => some "(· ≥ ·)"
+  | "GHC.Classes./="| "/=" => some "(fun a b => !(a == b))"
+  | "GHC.Classes.<" | "<"  => some "(fun a b => decide (a < b))"
+  | "GHC.Classes.<=" | "<=" => some "(fun a b => decide (a ≤ b))"
+  | "GHC.Classes.>" | ">"  => some "(fun a b => decide (a > b))"
+  | "GHC.Classes.>=" | ">=" => some "(fun a b => decide (a ≥ b))"
   | "GHC.Base.id"          => some "id"
   | "GHC.Base.."           => some "Function.comp"
   | _                      => none
