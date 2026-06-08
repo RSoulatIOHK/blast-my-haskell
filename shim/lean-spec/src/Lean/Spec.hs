@@ -2,9 +2,15 @@
 
 -- | A declaration quasi-quoter for embedding Lean property text in Haskell.
 -- Usage (top level): @[lean| theorem foo : … := by blaster |]@.
--- At compile time it records the raw text to @$LEAN_SPEC_DIR/<Module>/<line>.lean@
--- and expands to no declarations. Outside the transpile sandbox (no
--- @LEAN_SPEC_DIR@) it is a no-op.
+-- At compile time it records the raw text to
+-- @$LEAN_SPEC_DIR/<Module>/<start>-<end>.lean@ and expands to no declarations.
+-- Outside the transpile sandbox (no @LEAN_SPEC_DIR@) it is a no-op.
+--
+-- Path contract: @<Module>@ is the dotted module name used verbatim as a
+-- single (flat) directory component — @Data.Foo.Bar@ → one dir literally named
+-- @"Data.Foo.Bar"@, NOT nested. The transpiler reads the same flat layout.
+-- @<start>@/@<end>@ are the source lines of the @[lean|@ opener and @|]@ closer,
+-- so the filename uniquely identifies the block and carries its full span.
 module Lean.Spec (lean) where
 
 import Language.Haskell.TH (Dec, Loc (..), Q, location, runIO)
