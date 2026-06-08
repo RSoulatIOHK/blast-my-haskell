@@ -129,7 +129,10 @@ else
 fi
 
 echo "→ transpiler   ${JSON##*/}  →  ${OUT}"
-"$TRANSPILER" "$JSON" "$OUT" >/dev/null
+# Pass MODNAME so the transpiler opens a `namespace <module>` around the
+# emitted defs; the matching `end <module>` is appended below, after the
+# `@lean` blocks, so the theorems sit inside the namespace too.
+"$TRANSPILER" "$JSON" "$OUT" "$MODNAME" >/dev/null
 
 export DECLS_JSON_PATH="$DECLS_JSON"
 
@@ -268,8 +271,12 @@ close $wf;
 PERL_EOF
 fi
 
+# Close the `namespace <module>` the transpiler opened. Appended last, after
+# the `@lean` blocks, so every emitted def and theorem is inside the namespace
+# (this does not shift any line range the .map.json already recorded).
+printf '\nend %s\n' "$MODNAME" >>"$OUT"
+
 echo
 echo "✓ wrote $OUT"
-echo "  next: wrap in a \`namespace ${MODNAME}\` block,"
-echo "        add a \`#blaster [ … ]\`, drop under GhcCoreToLean/Spike/,"
+echo "  next: add a \`#blaster [ … ]\`, drop under GhcCoreToLean/Spike/,"
 echo "        and \`lake build\`."

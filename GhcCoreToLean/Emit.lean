@@ -33,6 +33,15 @@ def sanitize (s : String) : String :=
   let mapped := s.foldl (fun acc c => acc ++ sanitizeChar c) ""
   if leanKeywords.contains mapped then s!"«{mapped}»" else mapped
 
+/-- Type-variable identifier. GHC names bound type-variable *occurrences* with
+    synthetic names like `_v3537` (the readable forall binder name `b` is on the
+    `ForAll` node, not the occurrences). We emit occurrences and their implicit
+    binders through this single function so both sides match, and we avoid a
+    leading underscore so the result is an ordinary identifier. -/
+def tyVarId (n : String) : String :=
+  let s := sanitize n
+  if s.startsWith "_" then "t" ++ s else s
+
 /-- A local binder is emitted as `<sanitize>_<unique>` so multiple GHC
     binders that happen to share a name (e.g. `ds` rebound by nested
     case-alts) get distinct Lean identifiers. -/
@@ -69,7 +78,7 @@ end
 /-! ## Type emission -/
 
 partial def emitType : GHCType → String
-  | .tyVar n         => n
+  | .tyVar n         => tyVarId n
   | .tyFun a r       => s!"({emitType a} → {emitType r})"
   | .tyApp f x       => s!"({emitType f} {emitType x})"
   | .forAll v b      => s!"(∀ ({v} : Type), {emitType b})"
@@ -111,7 +120,12 @@ def emitLiteralPattern : Literal → String
 def emitVar (topNames : List Name) (v : Var) : String :=
   match valueMap v.name with
   | some lean => lean
-  | none      => refId topNames v
+  | none      =>
+    -- A data constructor can appear in value position (e.g. `Just x`), not
+    -- just in a pattern; resolve those through dataConMap as well.
+    match dataConMap v.name with
+    | some lean => lean
+    | none      => refId topNames v
 
 /-! ## Alts -/
 
@@ -133,13 +147,61 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
       let bs := String.intercalate " " (bndrs.map localId)
       s!"{resolved} {bs}"
 
+/-! ## Bottoms (error / undefined) -/
+
+/-- Haskell `error`/`undefined` are bottoms. GHC expands them with their
+    `HasCallStack` machinery (`pushCallStack`, `SrcLoc`, `unpackCString#`, …),
+    which has no Lean image. We collapse any application whose spine head is
+    one of these to `default` — a *total, sound* bottom: unlike `sorry` it
+    reduces to a concrete value, so it does not taint proofs that reduce
+    through it. This needs `Inhabited` of the result type; data decls derive
+    it, and `emitDefHeader` adds an `[Inhabited t]` binder when a body has a
+    bottom whose type is a free type variable. -/
+private def isBottomName : Name → Bool
+  | "GHC.Err.error" | "error"
+  | "GHC.Err.errorWithoutStackTrace" | "errorWithoutStackTrace"
+  | "GHC.Err.undefined" | "undefined" => true
+  | _ => false
+
+private partial def appHeadName : Expr → Option Name
+  | .var v   => some v.name
+  | .app f _ => appHeadName f
+  | .cast e  => appHeadName e
+  | .tick e  => appHeadName e
+  | _        => none
+
+/-- Does any subexpression apply a bottom (`error`/`undefined`)? Used to decide
+    whether a def's polymorphic result needs an `[Inhabited t]` binder so the
+    emitted `default` elaborates. -/
+private partial def exprHasBottom : Expr → Bool
+  | .var _   => false
+  | .lit _   => false
+  | .app f a =>
+    (match appHeadName f with | some n => isBottomName n | none => false)
+      || exprHasBottom f || exprHasBottom a
+  | .lam _ b => exprHasBottom b
+  | .let_ b body =>
+    (match b with
+     | .nonRec _ e => exprHasBottom e
+     | .rec_ ps    => ps.any (fun p => exprHasBottom p.2))
+      || exprHasBottom body
+  | .case_ scr _ _ alts =>
+    exprHasBottom scr || alts.any (fun al => match al with | .mk _ _ r => exprHasBottom r)
+  | .cast e  => exprHasBottom e
+  | .tick e  => exprHasBottom e
+  | _        => false
+
 /-! ## Expr emission -/
 
 mutual
   partial def emitExpr (top : List Name) : Expr → String
     | .var v   => emitVar top v
     | .lit l   => emitLiteral l
-    | .app f a => s!"({emitExpr top f}) ({emitExpr top a})"
+    | .app f a =>
+      match appHeadName f with
+      | some n => if isBottomName n then "default"
+                  else s!"({emitExpr top f}) ({emitExpr top a})"
+      | none   => s!"({emitExpr top f}) ({emitExpr top a})"
     | .lam v body =>
       s!"(fun {localId v} => {emitExpr top body})"
     | .let_ b body =>
@@ -182,16 +244,60 @@ private partial def stripFunTys : Nat → GHCType → GHCType
   | n+1, .forAll _ body => stripFunTys (n+1) body
   | _,     t            => t
 
+/-- Argument types taken from the def's *signature* (not the term-lambda
+    binders). GHC alpha-renames type variables between a function's type and
+    its lambda binders, so the binder type `(Int → Int → _v4550)` and the
+    result type `_v3537` disagree even though both are the same variable `b`.
+    Reading both from the signature keeps the names consistent so the implicit
+    binder unifies them. Forall nodes are skipped without consuming an arg. -/
+private partial def headerArgTys : List Var → GHCType → List GHCType
+  | [],          _            => []
+  | (a :: as), .forAll _ body => headerArgTys (a :: as) body
+  | (_ :: as), .tyFun ta r    => ta :: headerArgTys as r
+  | (a :: as), _              => a.ty :: headerArgTys as a.ty
+
+/-- Free type variables appearing in a type, in first-occurrence order. -/
+private partial def collectTyVars : GHCType → List Name
+  | .tyVar n      => [n]
+  | .tyApp f x    => collectTyVars f ++ collectTyVars x
+  | .tyFun a r    => collectTyVars a ++ collectTyVars r
+  | .forAll _ b   => collectTyVars b
+  | .tyCon _ args => args.flatMap collectTyVars
+  | .tyLit _      => []
+
+private def dedup (xs : List Name) : List Name :=
+  xs.foldl (init := []) fun acc x => if acc.contains x then acc else acc ++ [x]
+
+/-- GHC class-method bindings are named `$c<op>` (e.g. `$c==`). With more than
+    one instance of a class these collide after sanitization, so we suffix them
+    with their unique (like a local). -/
+private def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
+
+private def defNameId (v : Var) : String :=
+  if isClassMethodName v.name then localId v else sanitize v.name
+
 private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
                           (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
-  let name     := sanitize v.name
-  let argStrs  := args.map (fun a => s!"({localId a} : {emitType a.ty})")
+  let name     := defNameId v
+  let argTys   := headerArgTys args v.ty
+  let argStrs  := (args.zip argTys).map (fun (a, t) => s!"({localId a} : {emitType t})")
   let argStr   := String.intercalate " " argStrs
+  -- Implicit `{t : Type}` binders for every free type variable in the
+  -- signature, so polymorphic defs (e.g. continuation glue) type-check.
+  let tyvars   := dedup (collectTyVars v.ty)
+  -- A body containing a bottom emits `default`; when the bottom's type is a
+  -- free type variable, that needs an `[Inhabited t]` binder to elaborate.
+  let needInhab := exprHasBottom rhsBody
+  let implStr  := String.intercalate " " (tyvars.map (fun t =>
+    let tv := tyVarId t
+    if needInhab then s!"\{{tv} : Type} [Inhabited {tv}]"
+    else s!"\{{tv} : Type}"))
+  let binders  := String.intercalate " " (List.filter (· != "") [implStr, argStr])
   let resStr   := emitType resTy
   let body     := emitExpr top rhsBody
   let head     :=
-    if argStrs.isEmpty then s!"def {name} : {resStr} :="
-    else s!"def {name} {argStr} : {resStr} :="
+    if binders.isEmpty then s!"def {name} : {resStr} :="
+    else s!"def {name} {binders} : {resStr} :="
   let term     :=
     if rec? then "\ndecreasing_by all_goals sorry"
     else ""
@@ -256,14 +362,28 @@ def emitDataDecl (d : DataDecl) : String :=
     let arrows := argTys.foldr (init := leanName) fun a acc => s!"{a} → {acc}"
     s!"  | {sanitize c.name} : {arrows}"
   let body := String.intercalate "\n" ctorLines
-  s!"inductive {leanName} where\n{body}\nderiving Repr"
+  -- `Inhabited` so emitted `default` bottoms whose result is this type elaborate.
+  s!"inductive {leanName} where\n{body}\nderiving Repr, Inhabited"
 
-/-- Look up a method binding (e.g. `$c==`) by its Haskell-side name in the
-    top-level program. Returns the sanitized Lean name if found. -/
-private def findMethodBinding (binds : CoreProgram) (haskellName : Name) : Option String :=
+private partial def firstValArgTy : GHCType → Option GHCType
+  | .forAll _ b => firstValArgTy b
+  | .tyFun a _  => some a
+  | _           => none
+
+/-- Find the `$c==` binding belonging to the instance whose head type matches,
+    returning its emitted (unique-suffixed) def name. Multiple `Eq` instances
+    each produce a `$c==` binding; they collide after sanitization, so the def
+    names are unique-suffixed (see `defNameId`) and we disambiguate here by
+    matching the method's first argument type against the instance head. -/
+private def findEqMethod (binds : CoreProgram) (headTyStr : String) : Option String :=
+  let matchesHead (v : Var) : Bool :=
+    v.name == "$c==" &&
+      (match firstValArgTy v.ty with
+       | some t => emitType t == headTyStr
+       | none   => false)
   binds.findSome? fun b => match b with
-    | .nonRec v _ => if v.name == haskellName then some (sanitize v.name) else none
-    | .rec_ pairs => (pairs.find? (·.1.name == haskellName)).map (fun (v, _) => sanitize v.name)
+    | .nonRec v _ => if matchesHead v then some (localId v) else none
+    | .rec_ pairs => (pairs.find? (fun (v, _) => matchesHead v)).map (fun (v, _) => localId v)
 
 /-- Emit a Lean `instance` block. Only `Eq` → Lean `BEq` is wired for now.
     Returns `none` for classes we don't model (Show, Read, etc.) so the
@@ -272,8 +392,9 @@ def emitInstance (binds : CoreProgram) (i : Instance) : Option String :=
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
   match i.className with
   | "Eq" =>
-    let methodRef := (findMethodBinding binds "$c==").getD (sanitize "$c==")
-    some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
+    match findEqMethod binds tyStr with
+    | some methodRef => some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
+    | none           => none
   | _ => none
 
 /-- Build a user-data-constructor-name map from the typeDecls. This lets

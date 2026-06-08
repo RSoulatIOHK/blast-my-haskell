@@ -33,7 +33,14 @@ mutual
       if isTypeOrDictBinder v then lowerExpr body
       else .lam v (lowerExpr body)
     | .let_ b body =>
-      .let_ (lowerBind b) (lowerExpr body)
+      -- Dict/type let-bindings are erased like dict/type args. GHC floats the
+      -- `HasCallStack` dict (`$dIP`) to a top-level `let`; once the `error`
+      -- that used it collapses to `sorry`, the binding is dead and references
+      -- call-stack primitives with no Lean image, so it must be dropped.
+      match b with
+      | .nonRec v _ => if isTypeOrDictBinder v then lowerExpr body
+                       else .let_ (lowerBind b) (lowerExpr body)
+      | _           => .let_ (lowerBind b) (lowerExpr body)
     | .case_ scr cb ty alts =>
       -- Unwrapping ctor in single-alt Case: `case x of cb { I# y -> body }` → `let y := x; body`
       match alts with

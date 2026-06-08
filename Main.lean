@@ -11,6 +11,11 @@ private def isGhcRuntimePlumbing (name : Name) : Bool :=
   name.startsWith "$tr"     ||  -- runtime type rep (Module/TrName)
   name.startsWith "$tc"     ||  -- TyCon type rep
   name.startsWith "$krep"   ||  -- kind rep helpers
+  -- HasCallStack dict GHC float-lifts to top level for `error`; once the
+  -- `error` collapses to `sorry` (Emit) the dict is dead and only references
+  -- call-stack primitives with no Lean image, so drop it. (Lower already
+  -- erases the same dict when it stays a local let.)
+  name.startsWith "$dIP"    ||
   -- Auto-derived Show methods and instance dicts:
   name.startsWith "$fShow"  ||
   name.startsWith "$cshow"  ||
@@ -68,7 +73,8 @@ private def emitNamesCrib (prog : Program) : String :=
       ++ String.intercalate "\n" all
       ++ "\n\n"
 
-def runTranspile (input : System.FilePath) (output : System.FilePath) : IO UInt32 := do
+def runTranspile (input : System.FilePath) (output : System.FilePath)
+    (moduleName : Option String) : IO UInt32 := do
   let src ← IO.FS.readFile input
   match parseProgramFromString src with
   | .error msg =>
@@ -80,13 +86,22 @@ def runTranspile (input : System.FilePath) (output : System.FilePath) : IO UInt3
     let userProg  : Program := { prog with binds := lowered }
     let body      := Emit.emitFullProgram userProg
     let crib      := emitNamesCrib userProg
-    IO.FS.writeFile output (emittedHeader ++ crib ++ body ++ "\n")
+    -- Wrap the emitted defs in a `namespace <module>` so user bindings that
+    -- shadow Lean builtins (e.g. an Int-typed `min`/`max`) resolve to the
+    -- local def rather than colliding with `Min.min`/`Max.max`. The matching
+    -- `end <module>` is appended by transpile.sh after the `@lean` blocks, so
+    -- the theorems land inside the namespace too.
+    let nsOpen := match moduleName with
+      | some m => s!"namespace {m}\n\n"
+      | none   => ""
+    IO.FS.writeFile output (emittedHeader ++ nsOpen ++ crib ++ body ++ "\n")
     IO.println s!"wrote {output}"
     pure 0
 
 def main (args : List String) : IO UInt32 := do
   match args with
-  | [input, output] => runTranspile input output
+  | [input, output]          => runTranspile input output none
+  | [input, output, modname] => runTranspile input output (some modname)
   | _ => do
-    IO.eprintln "usage: ghccoretolean <in.json> <out.lean>"
+    IO.eprintln "usage: ghccoretolean <in.json> <out.lean> [moduleName]"
     pure 1

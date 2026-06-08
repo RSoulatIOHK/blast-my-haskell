@@ -8,6 +8,14 @@ def valueMap : String → Option String
   | "GHC.Num.+"     | "+"  => some "(· + ·)"
   | "GHC.Num.-"     | "-"  => some "(· - ·)"
   | "GHC.Num.*"     | "*"  => some "(· * ·)"
+  | "GHC.Num.negate"| "negate" => some "Neg.neg"
+  | "GHC.Num.abs"   | "abs" => some "(fun a => if a < 0 then -a else a)"
+  -- Integral division. Haskell `quot`/`rem` truncate toward zero (Lean
+  -- `Int.tdiv`/`Int.tmod`); `div`/`mod` floor (Lean `Int.fdiv`/`Int.fmod`).
+  | "GHC.Real.quot" | "quot" => some "Int.tdiv"
+  | "GHC.Real.rem"  | "rem"  => some "Int.tmod"
+  | "GHC.Real.div"  | "div"  => some "Int.fdiv"
+  | "GHC.Real.mod"  | "mod"  => some "Int.fmod"
   -- Haskell's comparison operators return `Bool`. Lean 4's `≤`/`<`/etc. return
   -- `Prop`, so we wrap them in `decide` to get Bool back. `==` is already Bool
   -- via the `BEq` instance, so it does not need wrapping.
@@ -17,6 +25,11 @@ def valueMap : String → Option String
   | "GHC.Classes.<=" | "<=" => some "(fun a b => decide (a ≤ b))"
   | "GHC.Classes.>" | ">"  => some "(fun a b => decide (a > b))"
   | "GHC.Classes.>=" | ">=" => some "(fun a b => decide (a ≥ b))"
+  -- Bottoms. Applied forms are collapsed to `sorry` in Emit (spine-head
+  -- check); this covers the rare bare/unapplied reference.
+  | "GHC.Err.error" | "error"
+  | "GHC.Err.errorWithoutStackTrace" | "errorWithoutStackTrace"
+  | "GHC.Err.undefined" | "undefined" => some "sorry"
   | "GHC.Base.id"          => some "id"
   | "GHC.Base.."           => some "Function.comp"
   -- GHC's True/False are data constructors used in value positions. Map them
@@ -46,10 +59,11 @@ def typeConMap : String → List String → Option String
   | "Either",  [a, b] => some s!"Sum {a} {b}"
   | _,         _      => none
 
-/-- GHC data constructor → Lean constructor reference. -/
+/-- GHC data constructor → Lean constructor reference. Both bare and
+    module-qualified forms are accepted (Core delivers `GHC.Maybe.Just` etc.). -/
 def dataConMap : String → Option String
-  | "Just"    => some "Option.some"
-  | "Nothing" => some "Option.none"
+  | "Just"    | "GHC.Maybe.Just"    => some "Option.some"
+  | "Nothing" | "GHC.Maybe.Nothing" => some "Option.none"
   | ":"       => some "List.cons"
   | "[]"      => some "List.nil"
   | "True"    => some "Bool.true"
