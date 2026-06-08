@@ -48,11 +48,22 @@ def tyVarId (n : String) : String :=
 def localId (v : Var) : String :=
   s!"{sanitize v.name}_{v.unique}"
 
+/-- Render a module-qualified GHC name (e.g. `Ratio.addRatio`) as a Lean
+    qualified identifier, sanitizing each dotted component. A reference into a
+    transpiled dependency resolves against that module's `namespace`. -/
+def qualifyName (n : Name) : String :=
+  String.intercalate "." ((n.splitOn ".").map sanitize)
+
 /-- For a Var reference: bare name if it's a known top-level binding,
     `<name>_<unique>` otherwise. Top-level names are resolved against
     a set of names collected from the program. -/
 def refId (topNames : List Name) (v : Var) : String :=
   if topNames.contains v.name then sanitize v.name
+  -- A module-qualified name that isn't a local top-level binder is an external
+  -- reference (into an imported dependency); emit it qualified, not as a
+  -- unique-suffixed local id. Builtins were already resolved upstream (valueMap
+  -- / dataConMap), so a surviving dotted name is a cross-module user ref.
+  else if v.name.contains '.' then qualifyName v.name
   else localId v
 
 /-! ## Recursion detection -/
@@ -444,11 +455,23 @@ private def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
         , (s!"({bareCtor} (",  s!"({qualCtor} (") ]
       rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
 
+/-- Rewrite `(GHCCore.tyConOpaque "T")` → `M.T` for each external type `T`
+    declared in a transpiled dependency module `M` (built from the dependency
+    `.decls.json`). Applied after `resolveUserTypes`, so locally-declared types
+    are already bare; only imported types are rewritten, and genuinely unknown
+    types stay opaque. -/
+private def resolveExternalTypes (extTypes : List (String × String)) (src : String) : String :=
+  extTypes.foldl (init := src) fun s (tyName, modName) =>
+    let needle      := s!"(GHCCore.tyConOpaque \"{tyName}\")"
+    let replacement := s!"{modName}.{sanitize tyName}"
+    s.replace needle replacement
+
 /-- Top-level entry: emit a full Program (data decls, value defs, instances).
     The user-type and user-ctor post-passes are applied only to the
     value-binding / instance sections; the data declarations themselves
-    must keep their original names. -/
-def emitFullProgram (p : Program) : String :=
+    must keep their original names. `extTypes` maps imported type names to
+    their defining module so cross-module references resolve. -/
+def emitFullProgram (extTypes : List (String × String)) (p : Program) : String :=
   -- User-declared ctors (e.g. `CustomRatio`) participate in the top-name
   -- set so App-position refs to them emit bare, not as `Name_<unique>`.
   let ctorNames : List Name :=
@@ -464,6 +487,8 @@ def emitFullProgram (p : Program) : String :=
   let dataBlock :=
     if datas.isEmpty then "" else String.intercalate "\n\n" datas
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
-  String.intercalate "\n\n" sections
+  -- External-type resolution runs over the whole output (data fields included);
+  -- it only rewrites imported types, so local inductive names are untouched.
+  resolveExternalTypes extTypes (String.intercalate "\n\n" sections)
 
 end GHCCore.Emit

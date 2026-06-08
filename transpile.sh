@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 #
-# Run the GHC Core → Lean pipeline end-to-end on a single Haskell module.
+# Run the GHC Core → Lean pipeline end-to-end on a Haskell module *and its
+# local dependencies* (transitive `import`s that resolve to a .hs under the
+# same source root). Library/Prelude imports are ignored.
 #
 # Usage:
 #   ./transpile.sh <Source.hs> [output.lean]
 #
 # What it does:
-#   1. Stages the .hs file in a per-repo sandbox (.transpile-sandbox/), with
-#      a generated cabal file pinned to GHC 9.2.7 + ghc-dump-core.
-#   2. cabal-builds it; the ghc-dump-core plugin produces .cbor dumps.
-#   3. Runs the Haskell shim on pass-0000.cbor → JSON.
-#   4. Runs ghccoretolean on the JSON → .lean source.
+#   1. Discovers the local import graph (scripts/transpile_graph.py).
+#   2. Stages every local module in a sandbox (.transpile-sandbox/) under a
+#      cabal pinned to GHC 9.2.7 + ghc-dump-core + the decl-dump plugin, and
+#      cabal-builds once (dumping CBOR + decls for all modules).
+#   3. For each module, in dependency order: shim CBOR → JSON, then
+#      ghccoretolean → .lean (each wrapped in `namespace <Module>`, with
+#      `import GhcCoreToLean.Generated.<Dep>` for local deps and a shared
+#      type→module manifest so cross-module refs resolve).
 #
-# The result is NOT auto-imported into the lake project. Wrap it in a
-# namespace, add `#blaster [ … ]`, drop it under GhcCoreToLean/Spike/,
-# import from GhcCoreToLean.lean, then `lake build`.
+# Dependencies land under GhcCoreToLean/Generated/<path>.lean; the entry
+# module lands at [output.lean] (default Generated/<path>.lean). Then:
+# `lake build` (lake sequences the dependency oleans from the import graph).
 
 set -euo pipefail
 
@@ -29,9 +34,10 @@ if [[ ! -f "$SRC" ]]; then
 fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HELPER="${REPO}/scripts/transpile_graph.py"
+GENROOT="${REPO}/GhcCoreToLean/Generated"
 
-# The Haskell module name must come from the `module X where` declaration —
-# not the filename, which can be lowercase (cabal rejects lowercase module ids).
+# Entry module name (from the `module X where` decl, not the filename).
 MODNAME="$(grep -E '^[[:space:]]*module[[:space:]]+[A-Z][A-Za-z0-9_.]*' "$SRC" \
            | head -1 \
            | sed -E 's/^[[:space:]]*module[[:space:]]+([A-Z][A-Za-z0-9_.]*).*/\1/')"
@@ -39,38 +45,45 @@ if [[ -z "$MODNAME" ]]; then
   echo "could not find a 'module X where' declaration in $SRC" >&2
   exit 1
 fi
-MODLOWER="$(echo "$MODNAME" | tr '[:upper:]' '[:lower:]')"
 
-# Default the output under the GhcCoreToLean library so it inherits the lake
-# project's `import Blaster` resolution. Files outside any declared lean_lib
-# are not given the project's deps by the Lean LSP.
-mkdir -p "${REPO}/GhcCoreToLean/Generated"
-OUT="${2:-${REPO}/GhcCoreToLean/Generated/${MODNAME}.lean}"
+# Default the entry output under the lib so it inherits `import Blaster`
+# resolution; the path mirrors the module so its Lean module name is stable.
+OUT="${2:-${GENROOT}/${MODNAME//.//}.lean}"
 
 SANDBOX="${REPO}/.transpile-sandbox"
-mkdir -p "$SANDBOX"
+mkdir -p "$SANDBOX/.decls"
 
-# 1a. Stage the source, prepending the plugin pragma if it's missing.
-cp -- "$SRC" "${SANDBOX}/${MODNAME}.hs"
-if ! grep -q 'GhcDump.Plugin' "${SANDBOX}/${MODNAME}.hs"; then
-  TMP="$(mktemp)"
-  { echo '{-# OPTIONS_GHC -fplugin GhcDump.Plugin #-}'; cat "${SANDBOX}/${MODNAME}.hs"; } >"$TMP"
-  mv -- "$TMP" "${SANDBOX}/${MODNAME}.hs"
+# ---------------------------------------------------------------------------
+# 1. Discover the local import graph (dependency order, deps before dependents).
+MODULES=(); SRCS=(); DEPS=()
+while IFS=$'\t' read -r m s d; do
+  MODULES+=("$m"); SRCS+=("$s"); DEPS+=("$d")
+done < <(python3 "$HELPER" discover "$SRC")
+if [[ ${#MODULES[@]} -eq 0 ]]; then
+  echo "no local modules discovered from $SRC" >&2
+  exit 1
 fi
+echo "→ modules (dep order): ${MODULES[*]}"
 
-# 1b. Write a fresh cabal file scoped to just this module. Always overwrite
-# so MODNAME stays in sync with whichever source the user passed in.
-# Two plugins are injected via ghc-options so user .hs files don't need any
-# pragma:
-#   * GhcDump.Plugin     — value bindings, dumps CBOR
-#   * GhcDeclDump        — type & instance shapes (our plugin), dumps JSON
+# ---------------------------------------------------------------------------
+# 2a. Stage every local module, mirroring its module path. The cabal
+#     ghc-options inject both plugins, so no per-file pragma is required.
+for i in "${!MODULES[@]}"; do
+  rel="${MODULES[$i]//.//}.hs"
+  dest="${SANDBOX}/${rel}"
+  mkdir -p "$(dirname "$dest")"
+  cp -- "${SRCS[$i]}" "$dest"
+done
+
+# 2b. Fresh cabal exposing all staged modules.
+EXPOSED="$(IFS=,; echo "${MODULES[*]}")"
 cat >"${SANDBOX}/transpile-sandbox.cabal" <<EOF
 cabal-version:      2.4
 name:               transpile-sandbox
 version:            0.1.0.0
 
 library
-    exposed-modules:    ${MODNAME}
+    exposed-modules:    ${EXPOSED}
     build-depends:      base, ghc-dump-core, decl-plugin
     default-language:   Haskell2010
     hs-source-dirs:     .
@@ -85,10 +98,9 @@ packages:
     ${REPO}/shim/decl-plugin
 EOF
 
-mkdir -p "${SANDBOX}/.decls"
 export GHC_DECL_DUMP_DIR="${SANDBOX}/.decls"
 
-# 2. cabal build (runs the ghc-dump-core plugin as a side effect).
+# 2c. One cabal build (dumps CBOR + decls for every module).
 echo "→ cabal build (GHC 9.2.7)"
 ( cd "$SANDBOX" && cabal build >/dev/null 2>&1 ) || {
   echo "  cabal build FAILED — re-running with output:" >&2
@@ -96,52 +108,61 @@ echo "→ cabal build (GHC 9.2.7)"
   exit 1
 }
 
-# Find the desugarer-pass dump. The pipeline expects pass-0000 because later
-# passes introduce worker-wrapper + GHC.Prim primops that the current Lower
-# doesn't handle.
-CBOR="$(find "${SANDBOX}/dist-newstyle" -name "${MODNAME}.pass-0000.cbor" -print -quit 2>/dev/null || true)"
-if [[ -z "$CBOR" ]]; then
-  echo "no ${MODNAME}.pass-0000.cbor produced — did the plugin pragma actually run?" >&2
-  exit 1
-fi
-
-# 3. Find the shim binary (cabal puts it under an arch/ghc-version path).
+# ---------------------------------------------------------------------------
+# 3. Locate the shim + transpiler binaries.
 SHIM="$(find "${REPO}/shim/dist-newstyle" -type f -perm -u+x -name ghc-core-shim 2>/dev/null | head -1 || true)"
 if [[ -z "$SHIM" || ! -x "$SHIM" ]]; then
   echo "shim binary not built; run: ( cd shim && cabal build )" >&2
   exit 1
 fi
-
-# 4. The Lean exe is at a stable path under .lake/build/bin.
 TRANSPILER="${REPO}/.lake/build/bin/ghccoretolean"
 if [[ ! -x "$TRANSPILER" ]]; then
   echo "transpiler binary not built; run: lake build ghccoretolean" >&2
   exit 1
 fi
 
-JSON="/tmp/${MODLOWER}.json"
-DECLS_JSON="${SANDBOX}/.decls/${MODNAME}.decls.json"
-echo "→ shim         ${CBOR##*/}  →  ${JSON}"
-if [[ -f "$DECLS_JSON" ]]; then
-  "$SHIM" "$CBOR" --decls "$DECLS_JSON" >"$JSON"
-else
-  "$SHIM" "$CBOR" >"$JSON"
-fi
+# 4. Shared type→module manifest (so external type refs resolve to <Mod>.<Type>).
+MANIFEST="/tmp/transpile-ext-types.tsv"
+python3 "$HELPER" manifest "${SANDBOX}/.decls" "${MODULES[@]}" > "$MANIFEST"
+export EXT_TYPES_MANIFEST="$MANIFEST"
 
-echo "→ transpiler   ${JSON##*/}  →  ${OUT}"
-# Pass MODNAME so the transpiler opens a `namespace <module>` around the
-# emitted defs; the matching `end <module>` is appended below, after the
-# `@lean` blocks, so the theorems sit inside the namespace too.
-"$TRANSPILER" "$JSON" "$OUT" "$MODNAME" >/dev/null
+# ---------------------------------------------------------------------------
+# Emit one module: shim → transpiler (namespace + imports + manifest) →
+# `@lean` extraction (+ source map) → ctor rewrite → close namespace.
+emit_module() {
+  local mod="$1" src="$2" deps="$3" out="$4"
+  local cbor decls json lean_imports dep
 
-export DECLS_JSON_PATH="$DECLS_JSON"
+  # ghc-dump-core names CBOR by module *path* (Lib.Inner → Lib/Inner.pass-0000.cbor),
+  # whereas the decl plugin names by dotted module (Lib.Inner.decls.json).
+  cbor="$(find "${SANDBOX}/dist-newstyle" -path "*/${mod//.//}.pass-0000.cbor" -print -quit 2>/dev/null || true)"
+  if [[ -z "$cbor" ]]; then
+    echo "no ${mod//.//}.pass-0000.cbor produced — did the plugin run for $mod?" >&2
+    exit 1
+  fi
+  decls="${SANDBOX}/.decls/${mod}.decls.json"
+  json="/tmp/transpile-${mod//./_}.json"
+  if [[ -f "$decls" ]]; then
+    "$SHIM" "$cbor" --decls "$decls" >"$json"
+  else
+    "$SHIM" "$cbor" >"$json"
+  fi
 
-# Extract `{- @lean ... -}` annotation blocks from the original source,
-# append them verbatim to the emitted .lean file, and emit a source map
-# sidecar (${OUT}.map.json) listing each block's line range in both files.
-# The map is what the VS Code extension uses to forward Lean diagnostics
-# back onto the original Haskell annotation.
-perl - "$SRC" "$OUT" <<'PERL_EOF'
+  # Lean `import`s for this module's local dependencies.
+  lean_imports=""
+  if [[ -n "$deps" ]]; then
+    IFS=',' read -ra _darr <<< "$deps"
+    for dep in "${_darr[@]}"; do
+      lean_imports+="GhcCoreToLean.Generated.${dep} "
+    done
+  fi
+
+  mkdir -p "$(dirname "$out")"
+  LEAN_IMPORTS="$lean_imports" "$TRANSPILER" "$json" "$out" "$mod" >/dev/null
+  export DECLS_JSON_PATH="$decls"
+
+  # Append `{- @lean ... -}` blocks verbatim and write the source-map sidecar.
+  perl - "$src" "$out" <<'PERL_EOF'
 use strict;
 use warnings;
 use JSON::PP;
@@ -209,18 +230,13 @@ print $mfh JSON::PP->new->canonical->pretty->encode({
 close $mfh;
 
 my $n = scalar(@blocks);
-print STDERR "extracted $n \@lean block(s); map: $map_path\n" if $n > 0;
+print STDERR "  extracted $n \@lean block(s); map: $map_path\n" if $n > 0;
 PERL_EOF
 
-# Final pass: rewrite Haskell-style ctor references (`Ctor`, used in user
-# `@lean` annotations) to Lean-qualified form (`Type.Ctor`). The Lean
-# transpiler already does this for code it emits; this catches the user's
-# annotation text, which was appended *after* the transpiler ran. Rules are
-# the same set as in Emit.lean's `resolveUserCtors` and are idempotent
-# under non-overlapping `String.replace` semantics, so re-applying to the
-# already-rewritten body produces no further changes.
-if [[ -f "$DECLS_JSON" ]]; then
-  perl - "$OUT" "$DECLS_JSON" <<'PERL_EOF'
+  # Rewrite Haskell-style ctor refs (`Ctor`) in the appended `@lean` text to
+  # the Lean-qualified `Type.Ctor` form (mirrors Emit.lean's resolveUserCtors).
+  if [[ -f "$decls" ]]; then
+    perl - "$out" "$decls" <<'PERL_EOF'
 use strict;
 use warnings;
 use JSON::PP;
@@ -269,14 +285,30 @@ open(my $wf, ">", $out_path) or die "write $out_path: $!";
 print $wf $content;
 close $wf;
 PERL_EOF
-fi
+  fi
 
-# Close the `namespace <module>` the transpiler opened. Appended last, after
-# the `@lean` blocks, so every emitted def and theorem is inside the namespace
-# (this does not shift any line range the .map.json already recorded).
-printf '\nend %s\n' "$MODNAME" >>"$OUT"
+  # Close the `namespace <module>` the transpiler opened (after the @lean
+  # blocks, so theorems are inside and no .map.json line range shifts).
+  printf '\nend %s\n' "$mod" >>"$out"
+}
+
+# ---------------------------------------------------------------------------
+# 5. Emit every module in dependency order. Dependencies → Generated/<path>;
+#    the entry module → $OUT.
+for i in "${!MODULES[@]}"; do
+  mod="${MODULES[$i]}"
+  if [[ "$mod" == "$MODNAME" ]]; then
+    out="$OUT"
+  else
+    out="${GENROOT}/${mod//.//}.lean"
+  fi
+  echo "→ ${mod}  →  ${out}"
+  emit_module "$mod" "${SRCS[$i]}" "${DEPS[$i]}" "$out"
+done
 
 echo
-echo "✓ wrote $OUT"
-echo "  next: add a \`#blaster [ … ]\`, drop under GhcCoreToLean/Spike/,"
-echo "        and \`lake build\`."
+echo "✓ ${#MODULES[@]} module(s) transpiled (${MODULES[*]})"
+# Machine-readable entry-output marker consumed by the VS Code extension
+# (regex `wrote (\S+\.lean)`); the entry path must be the first token after it.
+echo "wrote $OUT"
+echo "  next: \`lake build\` (builds dependency oleans from the import graph)."

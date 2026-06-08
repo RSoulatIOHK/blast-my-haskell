@@ -1,0 +1,15 @@
+{-# OPTIONS_GHC -fplugin GhcDump.Plugin #-}
+module OperatorCommons where
+    import Prelude
+    import Ratio (CustomRatio(..), ceilRatio, integerMultRatio)
+
+    operatorFee :: Integer -> Integer -> Integer -> CustomRatio -> Integer
+    operatorFee tprice minFee maxFee feeRatio =
+        min (max minFee (ceilRatio (integerMultRatio tprice feeRatio))) maxFee
+
+
+{- @lean theorem operatorFee_positive :
+    ∀ (tprice minFee maxFee : Int) (feeRatio : Ratio.CustomRatio),
+    tprice > 0 → minFee > 0 →
+    maxFee > 0 →
+    operatorFee tprice minFee maxFee feeRatio >= 0 := by blaster -}

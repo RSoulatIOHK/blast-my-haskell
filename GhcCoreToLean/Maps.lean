@@ -25,6 +25,11 @@ def valueMap : String → Option String
   | "GHC.Classes.<=" | "<=" => some "(fun a b => decide (a ≤ b))"
   | "GHC.Classes.>" | ">"  => some "(fun a b => decide (a > b))"
   | "GHC.Classes.>=" | ">=" => some "(fun a b => decide (a ≥ b))"
+  -- Prelude `min`/`max` (Ord methods) → Lean's. Only the *qualified* Prelude
+  -- names are mapped, never bare `min`/`max`: a user's own `min`/`max` def is a
+  -- bare Core name and must keep resolving to that local def, not be hijacked.
+  | "GHC.Classes.min" => some "Min.min"
+  | "GHC.Classes.max" => some "Max.max"
   -- Bottoms. Applied forms are collapsed to `sorry` in Emit (spine-head
   -- check); this covers the rare bare/unapplied reference.
   | "GHC.Err.error" | "error"

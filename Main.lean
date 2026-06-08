@@ -73,6 +73,24 @@ private def emitNamesCrib (prog : Program) : String :=
       ++ String.intercalate "\n" all
       ++ "\n\n"
 
+/-- Imported-type → defining-module map for cross-module references, read from
+    the tab-separated file named by `EXT_TYPES_MANIFEST` (one `Type\tModule`
+    per line). transpile.sh builds it from the dependencies' `.decls.json`. -/
+def loadExtTypes : IO (List (String × String)) := do
+  let some path ← IO.getEnv "EXT_TYPES_MANIFEST" | pure []
+  if path.isEmpty || !(← System.FilePath.pathExists path) then pure [] else
+  let s ← IO.FS.readFile path
+  pure ((s.splitOn "\n").filterMap fun line =>
+    match line.splitOn "\t" with
+    | [t, m] => if t.isEmpty || m.isEmpty then none else some (t, m)
+    | _      => none)
+
+/-- Lean modules to `import` for transpiled dependencies, from the
+    space-separated `LEAN_IMPORTS` env var (e.g. `GhcCoreToLean.Generated.Ratio`). -/
+def loadLeanImports : IO (List String) := do
+  let some v ← IO.getEnv "LEAN_IMPORTS" | pure []
+  pure ((v.splitOn " ").filter (!·.isEmpty))
+
 def runTranspile (input : System.FilePath) (output : System.FilePath)
     (moduleName : Option String) : IO UInt32 := do
   let src ← IO.FS.readFile input
@@ -84,7 +102,8 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let userBinds := prog.binds.filterMap keepBinding
     let lowered   := Lower.lowerProgram userBinds
     let userProg  : Program := { prog with binds := lowered }
-    let body      := Emit.emitFullProgram userProg
+    let extTypes  ← loadExtTypes
+    let body      := Emit.emitFullProgram extTypes userProg
     let crib      := emitNamesCrib userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that
     -- shadow Lean builtins (e.g. an Int-typed `min`/`max`) resolve to the
@@ -94,7 +113,11 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let nsOpen := match moduleName with
       | some m => s!"namespace {m}\n\n"
       | none   => ""
-    IO.FS.writeFile output (emittedHeader ++ nsOpen ++ crib ++ body ++ "\n")
+    -- `import` lines for transpiled dependencies precede the namespace.
+    let imports    ← loadLeanImports
+    let depImports := String.join (imports.map (s!"import {·}\n"))
+    let header     := s!"import Lean\nimport Blaster\n{depImports}\n"
+    IO.FS.writeFile output (header ++ nsOpen ++ crib ++ body ++ "\n")
     IO.println s!"wrote {output}"
     pure 0
 

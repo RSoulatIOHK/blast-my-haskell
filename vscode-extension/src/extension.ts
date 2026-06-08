@@ -84,9 +84,14 @@ function runPipeline(hsPath: string): Promise<string> {
         reject(new Error(`transpile.sh exit ${code}: ${stderr || stdout}`));
         return;
       }
-      // The script prints "wrote /path/to/out.lean" — parse out the path.
-      const m = /wrote (\S+\.lean)/.exec(stdout);
-      if (m) resolve(m[1]);
+      // transpile.sh prints "wrote <path>.lean" for the entry module, last,
+      // after any dependency modules it also transpiled. Take the final match
+      // so we resolve the entry's output, not a dependency's.
+      const re = /wrote (\S+\.lean)/g;
+      let m: RegExpExecArray | null;
+      let last: string | undefined;
+      while ((m = re.exec(stdout)) !== null) last = m[1];
+      if (last) resolve(last);
       else reject(new Error('transpile.sh succeeded but did not report an output path.'));
     });
   });
