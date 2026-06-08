@@ -84,7 +84,7 @@ version:            0.1.0.0
 
 library
     exposed-modules:    ${EXPOSED}
-    build-depends:      base, ghc-dump-core, decl-plugin
+    build-depends:      base, ghc-dump-core, decl-plugin, lean-spec
     default-language:   Haskell2010
     hs-source-dirs:     .
     ghc-options:        -fplugin GhcDump.Plugin -fplugin GhcDeclDump
@@ -96,9 +96,15 @@ with-compiler: ghc-9.2.7
 packages:
     .
     ${REPO}/shim/decl-plugin
+    ${REPO}/shim/lean-spec
 EOF
 
 export GHC_DECL_DUMP_DIR="${SANDBOX}/.decls"
+# Per-spec dump dir for the `lean` quasi-quoter. Cleared each run; the cp-staging
+# of every source forces recompilation, so all specs re-dump fresh.
+export LEAN_SPEC_DIR="${SANDBOX}/.leanspecs"
+rm -rf "$LEAN_SPEC_DIR"
+mkdir -p "$LEAN_SPEC_DIR"
 
 # 2c. One cabal build (dumps CBOR + decls for every module).
 echo "→ cabal build (GHC 9.2.7)"
