@@ -427,7 +427,7 @@ def userDataConMap (decls : List DataDecl) : Name → Option String := fun n =>
     (since the shim doesn't know the lakefile's type-ctor map); after the
     transpiler emits `inductive X where …`, opaque references should resolve
     to that inductive directly. -/
-private def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
+def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     let needle := s!"(GHCCore.tyConOpaque \"{d.name}\")"
     let replacement := sanitize d.name
@@ -443,7 +443,7 @@ private def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
 
     Type annotations like `(x : T)` or `→ T →` don't match any of these
     needles, so they remain `T` and resolve to the type. -/
-private def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
+def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     d.ctors.foldl (init := s) fun s c =>
       let bareCtor := sanitize c.name
@@ -460,11 +460,18 @@ private def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
     `.decls.json`). Applied after `resolveUserTypes`, so locally-declared types
     are already bare; only imported types are rewritten, and genuinely unknown
     types stay opaque. -/
-private def resolveExternalTypes (extTypes : List (String × String)) (src : String) : String :=
+def resolveExternalTypes (extTypes : List (String × String)) (src : String) : String :=
   extTypes.foldl (init := src) fun s (tyName, modName) =>
     let needle      := s!"(GHCCore.tyConOpaque \"{tyName}\")"
     let replacement := s!"{modName}.{sanitize tyName}"
     s.replace needle replacement
+
+/-- Apply the same name-resolution post-passes used on emitted bodies to a
+    single user spec string: local types → bare, imported types → `M.T`,
+    user ctors → `T.C`. -/
+def resolveSpecText (typeDecls : List DataDecl) (extTypes : List (String × String))
+    (s : String) : String :=
+  resolveExternalTypes extTypes (resolveUserCtors typeDecls (resolveUserTypes typeDecls s))
 
 /-- Top-level entry: emit a full Program (data decls, value defs, instances).
     The user-type and user-ctor post-passes are applied only to the

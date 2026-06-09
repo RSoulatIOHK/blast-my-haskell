@@ -91,6 +91,26 @@ def loadLeanImports : IO (List String) := do
   let some v ← IO.getEnv "LEAN_IMPORTS" | pure []
   pure ((v.splitOn " ").filter (!·.isEmpty))
 
+/-- Read recorded specs for `moduleName` from
+    `$LEAN_SPEC_DIR/<module>/<start>-<end>.lean`, sorted by start line. Each
+    entry is `(hsStartLine, hsEndLine, leanText)`. -/
+def loadSpecs (moduleName : Option String) : IO (List (Nat × Nat × String)) := do
+  let some m := moduleName | pure []
+  let some dir ← IO.getEnv "LEAN_SPEC_DIR" | pure []
+  let modDir := System.FilePath.join dir m
+  if !(← modDir.pathExists) then pure [] else
+  let entries ← modDir.readDir
+  let mut specs : List (Nat × Nat × String) := []
+  for e in entries do
+    let stem := e.fileName.dropRight 5            -- strip ".lean"
+    match stem.splitOn "-" with
+    | [s, en] =>
+      match s.toNat?, en.toNat? with
+      | some sl, some el => specs := (sl, el, ← IO.FS.readFile e.path) :: specs
+      | _, _             => pure ()
+    | _ => pure ()
+  pure (specs.toArray.qsort (fun a b => a.1 < b.1)).toList
+
 def runTranspile (input : System.FilePath) (output : System.FilePath)
     (moduleName : Option String) : IO UInt32 := do
   let src ← IO.FS.readFile input
@@ -117,7 +137,24 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let imports    ← loadLeanImports
     let depImports := String.join (imports.map (s!"import {·}\n"))
     let header     := s!"import Lean\nimport Blaster\n{depImports}\n"
-    IO.FS.writeFile output (header ++ nsOpen ++ crib ++ body ++ "\n")
+    let pre := header ++ nsOpen ++ crib ++ body ++ "\n"
+    let specs ← loadSpecs moduleName
+    let mut out := pre
+    let mut leanCursor := (pre.splitOn "\n").length
+    let mut blocks : List (Nat × Nat × Nat × Nat) := []   -- hsS hsE leanS leanE
+    for (hsStart, hsEnd, raw) in specs do
+      let resolved := Emit.resolveSpecText userProg.typeDecls extTypes raw.trim
+      let nLines   := (resolved.splitOn "\n").length
+      let leanS    := leanCursor + 1
+      let leanE    := leanS + nLines - 1
+      out := out ++ "\n" ++ resolved ++ "\n"
+      blocks := (hsStart, hsEnd, leanS, leanE) :: blocks
+      leanCursor := leanCursor + 1 + nLines
+    IO.FS.writeFile output out
+    let blockJson := String.intercalate ",\n    " (blocks.reverse.map fun (hs, he, ls, le) =>
+      s!"\{ \"hs\": [{hs}, {he}], \"lean\": [{ls}, {le}] }")
+    let mapJson := s!"\{\n  \"haskellPath\": \"\",\n  \"leanPath\": \"{output}\",\n  \"blocks\": [\n    {blockJson}\n  ]\n}\n"
+    IO.FS.writeFile (output.toString ++ ".map.json") mapJson
     IO.println s!"wrote {output}"
     pure 0
 
