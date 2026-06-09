@@ -133,8 +133,8 @@ python3 "$HELPER" manifest "${SANDBOX}/.decls" "${MODULES[@]}" > "$MANIFEST"
 export EXT_TYPES_MANIFEST="$MANIFEST"
 
 # ---------------------------------------------------------------------------
-# Emit one module: shim → transpiler (namespace + imports + manifest) →
-# `@lean` extraction (+ source map) → ctor rewrite → close namespace.
+# Emit one module: shim → transpiler (namespace + imports + manifest + specs
+# + source map) → close namespace.
 emit_module() {
   local mod="$1" src="$2" deps="$3" out="$4"
   local cbor decls json lean_imports dep
@@ -167,134 +167,8 @@ emit_module() {
   LEAN_IMPORTS="$lean_imports" "$TRANSPILER" "$json" "$out" "$mod" >/dev/null
   export DECLS_JSON_PATH="$decls"
 
-  # Append `{- @lean ... -}` blocks verbatim and write the source-map sidecar.
-  perl - "$src" "$out" <<'PERL_EOF'
-use strict;
-use warnings;
-use JSON::PP;
-
-my ($src_path, $out_path) = @ARGV;
-my $map_path = "$out_path.map.json";
-
-my $hs;
-{
-  local $/;  # slurp mode, scoped so the next file read stays line-oriented
-  open(my $sfh, "<", $src_path) or die "open $src_path: $!";
-  $hs = <$sfh>;
-  close $sfh;
-}
-
-# Count existing lines in the .lean output (transpiler-produced part).
-my $existing_lines = 0;
-if (-e $out_path) {
-  open(my $efh, "<", $out_path) or die "open $out_path: $!";
-  while (<$efh>) { $existing_lines++ }
-  close $efh;
-}
-
-my @blocks;
-my $appended_lines = 0;
-
-open(my $afh, ">>", $out_path) or die "append $out_path: $!";
-
-while ($hs =~ /\{-\s*\@lean\s*(.*?)\s*-\}/sg) {
-  my $match_start = $-[0];
-  my $match_end   = $+[0];
-  my $content     = $1;
-
-  # Strip leading/trailing whitespace so the surrounding `{- @lean ... -}`
-  # newlines don't pad the block.
-  $content =~ s/\A\s+//;
-  $content =~ s/\s+\z//;
-
-  my $hs_start_line = 1 + (substr($hs, 0, $match_start) =~ tr/\n//);
-  my $hs_end_line   = 1 + (substr($hs, 0, $match_end)   =~ tr/\n//);
-
-  my $content_lines = 1 + ($content =~ tr/\n//);
-
-  # Layout: one blank separator line, then content, then a terminator newline.
-  print $afh "\n", $content, "\n";
-
-  my $lean_start = $existing_lines + $appended_lines + 2;
-  my $lean_end   = $lean_start + $content_lines - 1;
-
-  push @blocks, {
-    hs   => [$hs_start_line + 0, $hs_end_line + 0],
-    lean => [$lean_start    + 0, $lean_end    + 0],
-  };
-
-  $appended_lines += 1 + $content_lines;
-}
-close $afh;
-
-open(my $mfh, ">", $map_path) or die "write $map_path: $!";
-print $mfh JSON::PP->new->canonical->pretty->encode({
-  haskellPath => $src_path,
-  leanPath    => $out_path,
-  blocks      => \@blocks,
-});
-close $mfh;
-
-my $n = scalar(@blocks);
-print STDERR "  extracted $n \@lean block(s); map: $map_path\n" if $n > 0;
-PERL_EOF
-
-  # Rewrite Haskell-style ctor refs (`Ctor`) in the appended `@lean` text to
-  # the Lean-qualified `Type.Ctor` form (mirrors Emit.lean's resolveUserCtors).
-  if [[ -f "$decls" ]]; then
-    perl - "$out" "$decls" <<'PERL_EOF'
-use strict;
-use warnings;
-use JSON::PP;
-
-my ($out_path, $decls_path) = @ARGV;
-
-my $decls;
-{
-  local $/;
-  open(my $df, "<", $decls_path) or die "open $decls_path: $!";
-  $decls = decode_json(<$df>);
-  close $df;
-}
-
-my @pairs;
-for my $t (@{$decls->{typeDecls} || []}) {
-  my $tn = $t->{name};
-  for my $c (@{$t->{constructors} || []}) {
-    push @pairs, [$tn, $c->{name}];
-  }
-}
-
-exit 0 unless @pairs;
-
-my $content;
-{
-  local $/;
-  open(my $lf, "<", $out_path) or die "open $out_path: $!";
-  $content = <$lf>;
-  close $lf;
-}
-
-for my $p (@pairs) {
-  my ($t, $c) = @$p;
-  my $q = "$t.$c";
-  # Match the rule set from Emit.lean's resolveUserCtors.
-  # The pattern rule uses a negative lookahead so it does not match the
-  # `| Ctor : <type>` ctor *declaration* inside the inductive block.
-  $content =~ s/\Q| $c \E(?!:)/| $q /g;
-  $content =~ s/\Q($c)\E/($q)/g;
-  $content =~ s/ \Q$c\E \(/ $q (/g;
-  $content =~ s/\(\Q$c\E \(/($q (/g;
-}
-
-open(my $wf, ">", $out_path) or die "write $out_path: $!";
-print $wf $content;
-close $wf;
-PERL_EOF
-  fi
-
-  # Close the `namespace <module>` the transpiler opened (after the @lean
-  # blocks, so theorems are inside and no .map.json line range shifts).
+  # Close the `namespace <module>` the transpiler opened (specs are already
+  # emitted by the transpiler itself, inside the namespace).
   printf '\nend %s\n' "$mod" >>"$out"
 }
 
