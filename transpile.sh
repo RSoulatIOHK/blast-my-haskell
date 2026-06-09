@@ -100,11 +100,18 @@ packages:
 EOF
 
 export GHC_DECL_DUMP_DIR="${SANDBOX}/.decls"
-# Per-spec dump dir for the `lean` quasi-quoter. Cleared each run; the cp-staging
-# of every source forces recompilation, so all specs re-dump fresh.
+# Per-spec dump dir for the `lean` quasi-quoter.
 export LEAN_SPEC_DIR="${SANDBOX}/.leanspecs"
 rm -rf "$LEAN_SPEC_DIR"
 mkdir -p "$LEAN_SPEC_DIR"
+
+# The dump plugins and the `lean` quasi-quoter only fire when GHC actually
+# compiles a module. cabal's up-to-date check skips unchanged staged modules
+# (it may not invoke GHC at all), which would leave the just-cleared
+# LEAN_SPEC_DIR empty and silently drop specs. Remove only the staged library's
+# build output (keeping the prebuilt dep/plugin packages) so every run
+# recompiles the staged modules from scratch and re-dumps CBOR + decls + specs.
+rm -rf "${SANDBOX}/dist-newstyle/build/"*/*/transpile-sandbox-*/ 2>/dev/null || true
 
 # 2c. One cabal build (dumps CBOR + decls for every module).
 echo "→ cabal build (GHC 9.2.7)"
