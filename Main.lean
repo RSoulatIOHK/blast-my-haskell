@@ -2,9 +2,6 @@ import GhcCoreToLean
 
 open GHCCore
 
-def emittedHeader : String :=
-  "import Lean\nimport Blaster\n\n"
-
 /-- GHC-generated runtime plumbing that has no Blaster-relevant meaning and
     references GHC.Types/GHC.Show internals we don't translate. -/
 private def isGhcRuntimePlumbing (name : Name) : Bool :=
@@ -128,8 +125,8 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that
     -- shadow Lean builtins (e.g. an Int-typed `min`/`max`) resolve to the
     -- local def rather than colliding with `Min.min`/`Max.max`. The matching
-    -- `end <module>` is appended by transpile.sh after the `@lean` blocks, so
-    -- the theorems land inside the namespace too.
+    -- `end <module>` is appended by transpile.sh; the specs are emitted by the
+    -- transpiler below, inside this namespace.
     let nsOpen := match moduleName with
       | some m => s!"namespace {m}\n\n"
       | none   => ""
@@ -153,7 +150,8 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     IO.FS.writeFile output out
     let blockJson := String.intercalate ",\n    " (blocks.reverse.map fun (hs, he, ls, le) =>
       s!"\{ \"hs\": [{hs}, {he}], \"lean\": [{ls}, {le}] }")
-    let mapJson := s!"\{\n  \"haskellPath\": \"\",\n  \"leanPath\": \"{output}\",\n  \"blocks\": [\n    {blockJson}\n  ]\n}\n"
+    let escPath := (output.toString.replace "\\" "\\\\").replace "\"" "\\\""
+    let mapJson := s!"\{\n  \"haskellPath\": \"\",\n  \"leanPath\": \"{escPath}\",\n  \"blocks\": [\n    {blockJson}\n  ]\n}\n"
     IO.FS.writeFile (output.toString ++ ".map.json") mapJson
     IO.println s!"wrote {output}"
     pure 0

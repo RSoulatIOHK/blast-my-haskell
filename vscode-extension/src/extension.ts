@@ -169,7 +169,7 @@ async function verify(): Promise<void> {
 
   const map = readSourceMap(leanPath);
   if (!map || map.blocks.length === 0) {
-    vscode.window.showInformationMessage('No @lean blocks found — nothing to verify.');
+    vscode.window.showInformationMessage('No [lean| … |] blocks found — nothing to verify.');
     diagCol.delete(doc.uri);
     richMessages.delete(doc.uri.toString());
     return;
@@ -240,7 +240,7 @@ async function verify(): Promise<void> {
     }
   }
 
-  // Build decoration options per block — span the *entire* `{- @lean ... -}`
+  // Build decoration options per block — span the *entire* `[lean| … |]`
   // comment block including the opener and closer lines, so the squiggle
   // covers everything the user can see as one annotation.
   const successRanges: vscode.DecorationOptions[] = [];
@@ -267,7 +267,7 @@ async function verify(): Promise<void> {
   );
   if (hsDiags.length === 0 && successRanges.length === 0 && failureRanges.length === 0) {
     vscode.window.showInformationMessage(
-      'No Lean diagnostics matched any @lean block — make sure the Lean4 extension is installed and Blaster is configured.',
+      'No Lean diagnostics matched any [lean| … |] block — make sure the Lean4 extension is installed and Blaster is configured.',
     );
   }
 }

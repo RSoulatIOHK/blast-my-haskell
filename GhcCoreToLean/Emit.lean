@@ -439,7 +439,7 @@ def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
 
       *  `| Ctor `                              ← alt-pattern
       *  `(Ctor)`                               ← App in transpiler-emitted style
-      *  `Ctor (` (preceded by whitespace)      ← App in user `@lean` annotation
+      *  `Ctor (` (preceded by whitespace)      ← App in user `[lean| … |]` spec
 
     Type annotations like `(x : T)` or `→ T →` don't match any of these
     needles, so they remain `T` and resolve to the type. -/
