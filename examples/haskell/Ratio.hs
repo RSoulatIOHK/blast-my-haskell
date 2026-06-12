@@ -1,6 +1,10 @@
 {-# OPTIONS_GHC -fplugin GhcDump.Plugin #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 
 module Ratio where
+
+import Lean.Spec (lean)
 
 data CustomRatio =
     CustomRatio {numerator :: Integer,
@@ -240,4 +244,11 @@ safeRecipRatio :: CustomRatio -> CustomRatio
 safeRecipRatio (CustomRatio n d) =
     if n == 0 then error "safeRecipRatio: zero numerator"
     else normalizeRatio (CustomRatio d n)
+
+[lean|
+theorem addRatio_correct :
+    ∀ (n1 d1 n2 d2 : Int), d1 > 0 → d2 > 0 →
+    addRatio (CustomRatio.CustomRatio n1 d1) (CustomRatio.CustomRatio n2 d2)
+      = CustomRatio.CustomRatio (n1 * d2 + n2 * d1) (d1 * d2) := by blaster
+|]
 
