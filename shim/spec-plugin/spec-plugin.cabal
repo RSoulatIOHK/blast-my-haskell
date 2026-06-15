@@ -1,0 +1,12 @@
+cabal-version:      2.4
+name:               spec-plugin
+version:            0.1.0.0
+synopsis:           GHC source plugin that records {- @lean … -} block comments
+                    to $LEAN_SPEC_DIR for the ghcCoreToLean transpiler.
+
+library
+    exposed-modules:    GhcSpecDump
+    build-depends:      base >=4.16 && <5, directory, filepath,
+                        ghc  >=9.2 && <9.3
+    default-language:   Haskell2010
+    ghc-options:        -Wall -Wno-unused-imports
