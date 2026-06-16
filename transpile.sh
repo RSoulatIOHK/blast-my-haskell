@@ -84,10 +84,10 @@ version:            0.1.0.0
 
 library
     exposed-modules:    ${EXPOSED}
-    build-depends:      base, ghc-dump-core, decl-plugin, lean-spec
+    build-depends:      base, ghc-dump-core, decl-plugin, lean-spec, spec-plugin
     default-language:   Haskell2010
     hs-source-dirs:     .
-    ghc-options:        -fplugin GhcDump.Plugin -fplugin GhcDeclDump
+    ghc-options:        -fplugin GhcDump.Plugin -fplugin GhcDeclDump -fplugin GhcSpecDump
 EOF
 
 cat >"${SANDBOX}/cabal.project" <<EOF
@@ -97,6 +97,7 @@ packages:
     .
     ${REPO}/shim/decl-plugin
     ${REPO}/shim/lean-spec
+    ${REPO}/shim/spec-plugin
 EOF
 
 export GHC_DECL_DUMP_DIR="${SANDBOX}/.decls"
