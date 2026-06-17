@@ -270,7 +270,7 @@ async function verify(): Promise<void> {
   // Per-block outcomes for the CodeLens (✓ Valid / ✗ Falsified — counterexample).
   const outcomes: SpecOutcome[] = [];
   for (const [key, outcome] of blockOutcomes) {
-    const detail = (rich.get(key) ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const detail = formatCounterexample(rich.get(key) ?? '');
     outcomes.push({ hsStart: outcome.block.hs[0], ok: outcome.kind === 'success', detail });
   }
   outcomesByUri.set(doc.uri.toString(), outcomes);
@@ -285,6 +285,19 @@ async function verify(): Promise<void> {
       'No Lean diagnostics matched any [lean| … |] block — make sure the Lean4 extension is installed and Blaster is configured.',
     );
   }
+}
+
+// Extract just the counterexample variable bindings (`- x: 1` lines) from the
+// accumulated Lean diagnostic text, as a compact `x = 1, y = 2` one-liner for
+// the single-line CodeLens title. The full multi-line diagnostic stays on hover.
+function formatCounterexample(rich: string): string {
+  const binds: string[] = [];
+  for (const raw of rich.split('\n')) {
+    const line = raw.replace(/^(ERROR|WARNING|hint):\s*/i, '').trim();
+    const m = /^-\s*([^:]+):\s*(.+)$/.exec(line);
+    if (m) binds.push(`${m[1].trim()} = ${m[2].trim()}`);
+  }
+  return binds.join(', ');
 }
 
 function severityLabel(sev: vscode.DiagnosticSeverity): string {
@@ -330,7 +343,9 @@ class SpecCodeLensProvider implements vscode.CodeLensProvider {
     return outcomes.map((o) => {
       const line = Math.max(0, o.hsStart - 1);
       const range = new vscode.Range(line, 0, line, 0);
-      const title = o.ok ? '✓ Valid' : `✗ Falsified — ${o.detail}`;
+      const title = o.ok
+        ? '✓ Valid'
+        : (o.detail ? `✗ Falsified — ${o.detail}` : '✗ Falsified');
       return new vscode.CodeLens(range, { title, command: '' });
     });
   }
