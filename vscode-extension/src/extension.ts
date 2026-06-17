@@ -18,18 +18,26 @@ const diagCol = vscode.languages.createDiagnosticCollection('ghccoretolean');
 // (incl. counterexamples) even when the inline diagnostic shows a short label.
 const richMessages = new Map<string, Map<string, string>>();
 
-// Wavy underline like Lean's info/warning squiggle, but recolored. Green for
-// ✅ Valid, red for ❌ Falsified. No background fill — just the underline,
-// matching the look of a regular diagnostic squiggle. The overview-ruler
-// marker keeps the outcome visible when the line is offscreen.
+// Per-block verification outcomes keyed by .hs URI, feeding the CodeLens
+// provider: the block's 1-based Haskell start line, pass/fail, and a one-line
+// detail (the counterexample/message, for failures).
+interface SpecOutcome { hsStart: number; ok: boolean; detail: string }
+const outcomesByUri = new Map<string, SpecOutcome[]>();
+const codeLensEmitter = new vscode.EventEmitter<void>();
+
+// Gutter icon on the block's first line: green ✓ for ✅ Valid, red ✗ for
+// ❌ Falsified. The overview-ruler marker keeps the outcome visible when the
+// line is offscreen.
 const successDecoration = vscode.window.createTextEditorDecorationType({
-  textDecoration: 'underline wavy rgb(46, 204, 113)',
+  gutterIconPath: vscode.Uri.file(path.join(__dirname, '..', 'media', 'pass.svg')),
+  gutterIconSize: 'contain',
   overviewRulerColor: 'rgba(46, 204, 113, 0.7)',
   overviewRulerLane: vscode.OverviewRulerLane.Right,
 });
 
 const failureDecoration = vscode.window.createTextEditorDecorationType({
-  textDecoration: 'underline wavy rgb(231, 76, 60)',
+  gutterIconPath: vscode.Uri.file(path.join(__dirname, '..', 'media', 'fail.svg')),
+  gutterIconSize: 'contain',
   overviewRulerColor: 'rgba(231, 76, 60, 0.7)',
   overviewRulerLane: vscode.OverviewRulerLane.Right,
 });
@@ -240,19 +248,18 @@ async function verify(): Promise<void> {
     }
   }
 
-  // Build decoration options per block — span the *entire* `[lean| … |]`
-  // comment block including the opener and closer lines, so the squiggle
-  // covers everything the user can see as one annotation.
+  // Build decoration options per block — place a gutter icon on the block's
+  // *first* line only (a gutter icon renders once per line; decorating the
+  // whole range would put an icon on every line of the block).
   const successRanges: vscode.DecorationOptions[] = [];
   const failureRanges: vscode.DecorationOptions[] = [];
   for (const [key, outcome] of blockOutcomes) {
     // block.hs is 1-based; VS Code Range is 0-based.
-    const startLine = Math.max(0, outcome.block.hs[0] - 1);
-    const endLine   = Math.max(startLine, outcome.block.hs[1] - 1);
-    const range = new vscode.Range(startLine, 0, endLine, Number.MAX_SAFE_INTEGER);
+    const firstLine = Math.max(0, outcome.block.hs[0] - 1);
+    const gutterRange = new vscode.Range(firstLine, 0, firstLine, 0);
     const hover = new vscode.MarkdownString();
     hover.appendCodeblock((rich.get(key) ?? '').trim(), 'lean');
-    const opt: vscode.DecorationOptions = { range, hoverMessage: hover };
+    const opt: vscode.DecorationOptions = { range: gutterRange, hoverMessage: hover };
     if (outcome.kind === 'success') successRanges.push(opt);
     else failureRanges.push(opt);
   }
@@ -260,6 +267,14 @@ async function verify(): Promise<void> {
   diagCol.set(doc.uri, hsDiags);
   richMessages.set(doc.uri.toString(), rich);
   decorationsByUri.set(doc.uri.toString(), { success: successRanges, failure: failureRanges });
+  // Per-block outcomes for the CodeLens (✓ Valid / ✗ Falsified — counterexample).
+  const outcomes: SpecOutcome[] = [];
+  for (const [key, outcome] of blockOutcomes) {
+    const detail = (rich.get(key) ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    outcomes.push({ hsStart: outcome.block.hs[0], ok: outcome.kind === 'success', detail });
+  }
+  outcomesByUri.set(doc.uri.toString(), outcomes);
+  codeLensEmitter.fire();
   applyDecorations(doc.uri);
 
   channel.appendLine(
@@ -306,9 +321,26 @@ class AnnotationHoverProvider implements vscode.HoverProvider {
   }
 }
 
+// CodeLens above each property: ✓ Valid, or ✗ Falsified with the counterexample.
+// Display-only (empty command). Refreshes when `verify` updates outcomes.
+class SpecCodeLensProvider implements vscode.CodeLensProvider {
+  onDidChangeCodeLenses = codeLensEmitter.event;
+  provideCodeLenses(doc: vscode.TextDocument): vscode.CodeLens[] {
+    const outcomes = outcomesByUri.get(doc.uri.toString()) ?? [];
+    return outcomes.map((o) => {
+      const line = Math.max(0, o.hsStart - 1);
+      const range = new vscode.Range(line, 0, line, 0);
+      const title = o.ok ? '✓ Valid' : `✗ Falsified — ${o.detail}`;
+      return new vscode.CodeLens(range, { title, command: '' });
+    });
+  }
+}
+
 function clearDiagnostics(): void {
   diagCol.clear();
   richMessages.clear();
+  outcomesByUri.clear();
+  codeLensEmitter.fire();
   // Clear all editor decorations too.
   for (const [uriStr] of decorationsByUri) {
     const uri = vscode.Uri.parse(uriStr);
@@ -330,6 +362,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('ghcCoreLean.verify', verify),
     vscode.commands.registerCommand('ghcCoreLean.clearDiagnostics', clearDiagnostics),
     vscode.languages.registerHoverProvider('haskell', new AnnotationHoverProvider()),
+    vscode.languages.registerCodeLensProvider({ language: 'haskell', scheme: 'file' }, new SpecCodeLensProvider()),
     // Decorations are editor-scoped, not document-scoped. Re-apply when the
     // user switches back to a .hs editor that has cached decorations.
     vscode.window.onDidChangeActiveTextEditor((editor) => {
