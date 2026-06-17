@@ -1,8 +1,8 @@
 {
   "name": "ghccoretolean-vscode",
-  "displayName": "GHC Core → Lean Verifier",
-  "description": "Runs the GHC→Lean spike pipeline on Haskell files and surfaces Blaster's verdicts as colour-coded wavy squiggles on the proven line (green = ✅ Valid, red = ❌ Falsified) plus hover on the {- @lean ... -} annotation.",
-  "version": "0.3.2",
+  "displayName": "GHC Core \u2192 Lean Verifier",
+  "description": "Runs the GHC\u2192Lean spike pipeline on Haskell files and surfaces Blaster's verdicts as colour-coded wavy squiggles on the proven line (green = \u2705 Valid, red = \u274c Falsified) plus hover on the {- @lean ... -} annotation.",
+  "version": "0.4.0",
   "publisher": "iohk-spike",
   "private": true,
   "engines": {
@@ -20,16 +20,16 @@
       {
         "command": "ghcCoreLean.verify",
         "title": "Verify @lean annotations via Blaster",
-        "category": "GHC Core → Lean"
+        "category": "GHC Core \u2192 Lean"
       },
       {
         "command": "ghcCoreLean.clearDiagnostics",
         "title": "Clear Lean diagnostics",
-        "category": "GHC Core → Lean"
+        "category": "GHC Core \u2192 Lean"
       }
     ],
     "configuration": {
-      "title": "GHC Core → Lean",
+      "title": "GHC Core \u2192 Lean",
       "properties": {
         "ghcCoreLean.scriptPath": {
           "type": "string",
