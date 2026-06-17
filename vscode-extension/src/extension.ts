@@ -52,7 +52,9 @@ interface BlockDecorations {
 const decorationsByUri = new Map<string, BlockDecorations>();
 
 function classify(msg: string): 'success' | 'failure' | 'other' {
-  if (msg.includes('✅ Valid')) return 'success';
+  // `declaration uses 'blasterProven'` is blaster's SMT-verified marker — treat
+  // it as success (so it counts green and never posts a yellow Warning squiggle).
+  if (msg.includes('✅ Valid') || msg.includes('blasterProven')) return 'success';
   if (msg.includes('❌ Falsified') || msg.toLowerCase().includes('falsified')) return 'failure';
   return 'other';
 }
