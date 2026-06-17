@@ -219,7 +219,9 @@ async function verify(): Promise<void> {
     const tag = severityLabel(d.severity);
     const message = `${tag}${d.message}`;
     const key = `${block.hs[0]}-${block.hs[1]}`;
-    rich.set(key, (rich.get(key) ?? '') + message + '\n\n');
+    // Hover/CodeLens text uses the raw Lean message (no ERROR:/WARNING: prefix —
+    // those are only for the Problems-panel diagnostic posted below).
+    rich.set(key, (rich.get(key) ?? '') + d.message.trim() + '\n');
 
     if (klass === 'success') {
       if (!blockOutcomes.has(key)) {
@@ -326,9 +328,16 @@ class AnnotationHoverProvider implements vscode.HoverProvider {
     const content = rich.get(`${startLine}-${endLine}`);
     if (!content) return null;
 
+    const lines = content.trim().split('\n');
+    const goalLines = lines.filter((l) => l.trimStart().startsWith('⊢'));
+    const rest = lines.filter((l) => !l.trimStart().startsWith('⊢') && l.trim() !== '');
     const md = new vscode.MarkdownString();
-    md.appendMarkdown('**Lean verification result**\n\n');
-    md.appendCodeblock(content.trim(), 'lean');
+    md.appendMarkdown('**Lean verification**\n\n');
+    if (rest.length) md.appendCodeblock(rest.join('\n'), 'lean');
+    if (goalLines.length) {
+      md.appendMarkdown('\n**Goal**\n\n');
+      md.appendCodeblock(goalLines.join('\n'), 'lean');
+    }
     md.isTrusted = false;
     return new vscode.Hover(md, hit.range);
   }
