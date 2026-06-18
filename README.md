@@ -42,6 +42,19 @@ JSON + recorded specs ──(ghccoretolean, Lean)──▶ Generated/<Module>.le
   (wrapped in `namespace <Module>`), and `lake build` runs Blaster on each
   property.
 
+## Quick start (devcontainer) — recommended
+
+If you have Docker + the VS Code **Dev Containers** extension: open this repo in
+VS Code and run **"Dev Containers: Reopen in Container"**. The container installs
+the full toolchain (GHC 9.2.7, Lean v4.24.0, cabal, Python, Node), then its
+`postCreate` runs `lake build`, builds the shim, and builds + installs this
+project's VS Code extension. When it finishes, open any `examples/haskell/*.hs`
+and run **"GHC Core → Lean: Verify"**. (First build takes a few minutes — it
+compiles Blaster and both toolchains.)
+
+Running natively instead? Follow Prerequisites + Build below, and use the
+**"GHC Core → Lean: Check Environment"** command to see what's missing.
+
 ## Prerequisites
 
 - **Lean 4** via [`elan`](https://github.com/leanprover/elan) — the toolchain is
