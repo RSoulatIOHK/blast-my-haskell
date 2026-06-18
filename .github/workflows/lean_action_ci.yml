@@ -1,5 +1,8 @@
 name: Lean Action CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -61,6 +64,10 @@ jobs:
         run: |
           find examples/haskell -name '*.hs' -print | sort | while read -r src; do
             mod="$(sed -nE 's/^[[:space:]]*module[[:space:]]+([A-Z][A-Za-z0-9_.]*).*/\1/p' "$src" | head -n 1)"
+            if [ -z "$mod" ]; then
+              echo "Could not determine module name for $src" >&2
+              exit 1
+            fi
             echo "::group::${src}"
             ./transpile.sh "$src"
             lake build "GhcCoreToLean.Generated.${mod}"
