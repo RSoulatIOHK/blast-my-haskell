@@ -45,4 +45,24 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 #guard valueMap "Data.Tuple.fst" == some "Prod.fst"
 #guard valueMap "Data.Tuple.snd" == some "Prod.snd"
 
+-- Task 3: Num/Integral/Ord completion. LHS names confirmed via Generated/NumOrd.lean:
+--   divMod/quotRem/gcd/lcm  : GHC.Real.*
+--   signum                  : GHC.Num.signum
+--   compare                 : GHC.Classes.compare
+--   Ordering type           : "Ordering" (inside GHCCore.tyConOpaque)
+--   LT/EQ/GT constructors   : GHC.Types.LT / GHC.Types.EQ / GHC.Types.GT
+#guard valueMap "GHC.Num.fromInteger"    == some "id"
+#guard valueMap "GHC.Real.toInteger"     == some "id"
+#guard valueMap "GHC.Real.fromIntegral"  == some "id"
+#guard valueMap "GHC.Num.signum"         == some "(fun a => if a < 0 then -1 else if a > 0 then 1 else 0)"
+#guard valueMap "GHC.Real.divMod"        == some "(fun a b => (Int.fdiv a b, Int.fmod a b))"
+#guard valueMap "GHC.Real.quotRem"       == some "(fun a b => (Int.tdiv a b, Int.tmod a b))"
+#guard valueMap "GHC.Real.gcd"           == some "(fun a b => (Int.gcd a b : Int))"
+#guard valueMap "GHC.Real.lcm"           == some "(fun a b => (Int.lcm a b : Int))"
+#guard valueMap "GHC.Classes.compare"    == some "compare"
+#guard typeConMap "Ordering" []          == some "Ordering"
+#guard dataConMap "GHC.Types.LT"         == some "Ordering.lt"
+#guard dataConMap "GHC.Types.EQ"         == some "Ordering.eq"
+#guard dataConMap "GHC.Types.GT"         == some "Ordering.gt"
+
 end GhcCoreToLean.Tests

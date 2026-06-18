@@ -71,6 +71,20 @@ def valueMap : String → Option String
   -- desugarer resolves these through `Data.Tuple.*`.
   | "Data.Tuple.fst"              => some "Prod.fst"
   | "Data.Tuple.snd"              => some "Prod.snd"
+  -- Num / Integral / Ord completion. Qualified names only (no bare alphabetic
+  -- forms), so a user's own `signum`/`divMod`/… top-level def is not hijacked.
+  -- Integer/Int are both Lean `Int`, so the coercion methods are identities.
+  | "GHC.Num.fromInteger"   => some "id"
+  | "GHC.Real.toInteger"    => some "id"
+  | "GHC.Real.fromIntegral" => some "id"
+  | "GHC.Num.signum"        => some "(fun a => if a < 0 then -1 else if a > 0 then 1 else 0)"
+  -- divMod floors (fdiv/fmod); quotRem truncates (tdiv/tmod). Returns a pair.
+  | "GHC.Real.divMod"       => some "(fun a b => (Int.fdiv a b, Int.fmod a b))"
+  | "GHC.Real.quotRem"      => some "(fun a b => (Int.tdiv a b, Int.tmod a b))"
+  -- Lean `Int.gcd`/`Int.lcm` return `Nat`; Haskell returns the numeric type.
+  | "GHC.Real.gcd"          => some "(fun a b => (Int.gcd a b : Int))"
+  | "GHC.Real.lcm"          => some "(fun a b => (Int.lcm a b : Int))"
+  | "GHC.Classes.compare"   => some "compare"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,
@@ -99,6 +113,7 @@ def typeConMap : String → List String → Option String
   | "GHC.Tuple.(,)", [a, b] => some s!"({a} × {b})"
   | "(,,)",  [a, b, c] => some s!"({a} × {b} × {c})"
   | "GHC.Tuple.(,,)", [a, b, c] => some s!"({a} × {b} × {c})"
+  | "Ordering", []    => some "Ordering"
   | _,         _      => none
 
 /-- GHC data constructor → Lean constructor reference. Both bare and
@@ -118,6 +133,11 @@ def dataConMap : String → Option String
   -- which is ill-typed. Tracked as a follow-up (see TupleBasics report). The
   -- type (`a × b × c`) and pattern (`(x, y, z)`) paths DO support 3-tuples.
   | "(,)"     | "GHC.Tuple.(,)" => some "Prod.mk"
+  -- Ordering constructors. Core delivers the qualified `GHC.Types.*` forms
+  -- (confirmed via Generated/NumOrd.lean); bare forms kept as a hedge.
+  | "LT" | "GHC.Types.LT" => some "Ordering.lt"
+  | "EQ" | "GHC.Types.EQ" => some "Ordering.eq"
+  | "GT" | "GHC.Types.GT" => some "Ordering.gt"
   | _         => none
 
 /-- Transparent unwrapping data constructors: I#, W#, C# (and module-qualified variants).
