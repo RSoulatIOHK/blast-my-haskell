@@ -1,14 +1,75 @@
 name: Lean Action CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
   workflow_dispatch:
 
+env:
+  Z3_VERSION: "4.15.2"
+  GLIBC_Z3: "2.39"
+
 jobs:
-  build:
+  lean-build:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+      - name: Install Z3
+        run: |
+          cd /home/runner/
+          wget -q https://github.com/Z3Prover/z3/releases/download/z3-${{ env.Z3_VERSION }}/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          unzip -q z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          echo "/home/runner/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}/bin" >> "$GITHUB_PATH"
+      - name: Check Z3 version
+        run: z3 --version
       - uses: leanprover/lean-action@v1
+
+  examples:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.2.7"
+      - name: Setup Lean
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "/home/runner/.elan/bin" >> "$GITHUB_PATH"
+      - name: Fix Lean version
+        run: |
+          elan toolchain install "$(cat lean-toolchain)"
+          elan default "$(cat lean-toolchain)"
+      - name: Install Z3
+        run: |
+          cd /home/runner/
+          wget -q https://github.com/Z3Prover/z3/releases/download/z3-${{ env.Z3_VERSION }}/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          unzip -q z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          echo "/home/runner/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}/bin" >> "$GITHUB_PATH"
+      - name: Check tool versions
+        run: |
+          ghc --version
+          cabal --version
+          lake --version
+          z3 --version
+      - name: Build transpiler
+        run: lake build ghccoretolean
+      - name: Build shim
+        run: cd shim && cabal build
+      - name: Verify Haskell examples
+        run: |
+          find examples/haskell -name '*.hs' -print | sort | while read -r src; do
+            mod="$(sed -nE 's/^[[:space:]]*module[[:space:]]+([A-Z][A-Za-z0-9_.]*).*/\1/p' "$src" | head -n 1)"
+            if [ -z "$mod" ]; then
+              echo "Could not determine module name for $src" >&2
+              exit 1
+            fi
+            echo "::group::${src}"
+            ./transpile.sh "$src"
+            lake build "GhcCoreToLean.Generated.${mod}"
+            echo "::endgroup::"
+          done
