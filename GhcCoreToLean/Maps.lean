@@ -67,6 +67,10 @@ def valueMap : String → Option String
   | "GHC.Base.flip"               => some "(fun f a b => f b a)"
   | "GHC.Base.$"       | "$"       => some "(fun f x => f x)"
   | "GHC.Base.otherwise"          => some "true"
+  -- Tuple projections. Qualified only (a user could define `fst`/`snd`); the
+  -- desugarer resolves these through `Data.Tuple.*`.
+  | "Data.Tuple.fst"              => some "Prod.fst"
+  | "Data.Tuple.snd"              => some "Prod.snd"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,
@@ -88,6 +92,13 @@ def typeConMap : String → List String → Option String
   | "[]",      [a]    => some s!"List {a}"
   | "Maybe",   [a]    => some s!"Option {a}"
   | "Either",  [a, b] => some s!"Sum {a} {b}"
+  -- Tuples. Lean's `×` is right-nested: `a × b × c = a × (b × c)`. Both the
+  -- bare GHC tycon `(,)` (what the shim emits inside `tyConOpaque`) and any
+  -- qualified form resolve here.
+  | "(,)",   [a, b]    => some s!"({a} × {b})"
+  | "GHC.Tuple.(,)", [a, b] => some s!"({a} × {b})"
+  | "(,,)",  [a, b, c] => some s!"({a} × {b} × {c})"
+  | "GHC.Tuple.(,,)", [a, b, c] => some s!"({a} × {b} × {c})"
   | _,         _      => none
 
 /-- GHC data constructor → Lean constructor reference. Both bare and
@@ -100,6 +111,13 @@ def dataConMap : String → Option String
   | "True"    => some "Bool.true"
   | "False"   => some "Bool.false"
   | "()"      => some "Unit.unit"
+  -- 2-tuple construction → `Prod.mk a b`. Both the bare pattern-position name
+  -- `(,)` and the qualified value-position name `GHC.Tuple.(,)` resolve here.
+  -- NOTE: 3-tuple construction is intentionally NOT mapped: `Prod.mk` is binary,
+  -- and `emitExpr` left-applies, so `(,,) a b c` would emit `((Prod.mk a) b) c`,
+  -- which is ill-typed. Tracked as a follow-up (see TupleBasics report). The
+  -- type (`a × b × c`) and pattern (`(x, y, z)`) paths DO support 3-tuples.
+  | "(,)"     | "GHC.Tuple.(,)" => some "Prod.mk"
   | _         => none
 
 /-- Transparent unwrapping data constructors: I#, W#, C# (and module-qualified variants).
