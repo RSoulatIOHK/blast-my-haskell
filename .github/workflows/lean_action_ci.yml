@@ -13,7 +13,7 @@ env:
   GLIBC_Z3: "2.39"
 
 jobs:
-  build:
+  lean-build:
     runs-on: ubuntu-latest
 
     steps:
