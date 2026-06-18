@@ -5,10 +5,22 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  Z3_VERSION: "4.15.2"
+  GLIBC_Z3: "2.39"
+
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
+      - name: Install Z3
+        run: |
+          cd /home/runner/
+          wget -q https://github.com/Z3Prover/z3/releases/download/z3-${{ env.Z3_VERSION }}/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          unzip -q z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          echo "/home/runner/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}/bin" >> "$GITHUB_PATH"
+      - name: Check Z3 version
+        run: z3 --version
       - uses: leanprover/lean-action@v1
