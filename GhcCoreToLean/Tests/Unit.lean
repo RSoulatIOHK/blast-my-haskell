@@ -22,7 +22,6 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 #guard valueMap "&&"                 == some "(· && ·)"
 #guard valueMap "GHC.Classes.||"     == some "(· || ·)"
 #guard valueMap "GHC.Classes.not"    == some "not"
-#guard valueMap "not"                == some "not"
 #guard valueMap "GHC.Base.const"     == some "(Function.const _)"
 #guard valueMap "GHC.Base.flip"      == some "(fun f a b => f b a)"
 #guard valueMap "GHC.Base.$"         == some "(fun f x => f x)"
