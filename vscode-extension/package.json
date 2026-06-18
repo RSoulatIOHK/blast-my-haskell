@@ -2,7 +2,7 @@
   "name": "ghccoretolean-vscode",
   "displayName": "GHC Core \u2192 Lean Verifier",
   "description": "Runs the GHC\u2192Lean spike pipeline on Haskell files and surfaces Blaster's verdicts as colour-coded wavy squiggles on the proven line (green = \u2705 Valid, red = \u274c Falsified) plus hover on the {- @lean ... -} annotation.",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "publisher": "iohk-spike",
   "private": true,
   "engines": {
@@ -25,6 +25,11 @@
       {
         "command": "ghcCoreLean.clearDiagnostics",
         "title": "Clear Lean diagnostics",
+        "category": "GHC Core \u2192 Lean"
+      },
+      {
+        "command": "ghcCoreLean.checkEnvironment",
+        "title": "Check Environment",
         "category": "GHC Core \u2192 Lean"
       }
     ],

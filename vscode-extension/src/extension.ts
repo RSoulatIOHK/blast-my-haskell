@@ -173,7 +173,8 @@ async function verify(): Promise<void> {
       () => runPipeline(doc.fileName),
     );
   } catch (e) {
-    vscode.window.showErrorMessage(`transpile.sh failed: ${(e as Error).message}`);
+    vscode.window.showErrorMessage(
+      `transpile.sh failed: ${(e as Error).message} — run "GHC Core → Lean: Check Environment".`);
     return;
   }
 
@@ -382,11 +383,86 @@ function clearDiagnostics(): void {
   channel.appendLine('Cleared all GHC Core → Lean diagnostics and decorations.');
 }
 
+function tryExec(cmd: string): string | null {
+  try {
+    return cp.execSync(cmd, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  } catch {
+    return null;
+  }
+}
+
+interface EnvCheck { name: string; ok: boolean; detail: string; fix: string }
+
+function gatherEnvChecks(ws: string): EnvCheck[] {
+  const checks: EnvCheck[] = [];
+
+  const lean = tryExec('lean --version');
+  checks.push({ name: 'Lean (elan)', ok: !!lean, detail: lean ?? 'not found',
+    fix: 'Install elan: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh' });
+
+  const ghc = tryExec('ghc-9.2.7 --version')
+    ?? (tryExec('ghcup whereis ghc 9.2.7') ? 'ghc 9.2.7 (via ghcup)' : null);
+  checks.push({ name: 'GHC 9.2.7', ok: !!ghc, detail: ghc ?? 'not found',
+    fix: 'ghcup install ghc 9.2.7 --set' });
+
+  const cabal = tryExec('cabal --version');
+  checks.push({ name: 'cabal', ok: !!cabal, detail: cabal?.split('\n')[0] ?? 'not found',
+    fix: 'ghcup install cabal --set' });
+
+  const py = tryExec('python3 --version');
+  checks.push({ name: 'python3', ok: !!py, detail: py ?? 'not found',
+    fix: 'Install Python 3 (e.g. apt install python3 / brew install python3)' });
+
+  const shimDir = path.join(ws, 'shim', 'dist-newstyle');
+  const shim = tryExec(`find ${JSON.stringify(shimDir)} -type f -name ghc-core-shim -perm -u+x 2>/dev/null | head -1`);
+  checks.push({ name: 'shim binary (ghc-core-shim)', ok: !!(shim && shim.length), detail: shim && shim.length ? shim : 'not built',
+    fix: '( cd shim && cabal build )' });
+
+  const transp = path.join(ws, '.lake', 'build', 'bin', 'ghccoretolean');
+  const transpOk = fs.existsSync(transp);
+  checks.push({ name: 'transpiler binary (ghccoretolean)', ok: transpOk, detail: transpOk ? transp : 'not built',
+    fix: 'lake build' });
+
+  return checks;
+}
+
+async function checkEnvironment(): Promise<void> {
+  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!ws) {
+    vscode.window.showWarningMessage('Open the GhcCoreToLean workspace folder first.');
+    return;
+  }
+  channel.show(true);
+  channel.appendLine('--- GHC Core → Lean: environment check ---');
+  const checks = gatherEnvChecks(ws);
+  for (const c of checks) {
+    channel.appendLine(`${c.ok ? '✓' : '✗'} ${c.name}: ${c.detail}`);
+    if (!c.ok) channel.appendLine(`    fix: ${c.fix}`);
+  }
+
+  const toolsOk = checks.slice(0, 4).every((c) => c.ok);
+  const binsOk = checks.slice(4).every((c) => c.ok);
+  if (toolsOk && binsOk) {
+    vscode.window.showInformationMessage('GHC Core → Lean: environment looks good ✅');
+  } else if (toolsOk && !binsOk) {
+    const pick = await vscode.window.showWarningMessage(
+      'Toolchains present, but the project binaries are not built yet.', 'Build now');
+    if (pick === 'Build now') {
+      const term = vscode.window.createTerminal('GHC Core → Lean build');
+      term.show();
+      term.sendText('lake build && ( cd shim && cabal build ) && echo "✅ build complete — run Verify"');
+    }
+  } else {
+    vscode.window.showWarningMessage('Missing toolchains — see the "GHC Core → Lean" output channel for install commands.');
+  }
+}
+
 export function activate(ctx: vscode.ExtensionContext): void {
   ctx.subscriptions.push(diagCol, channel, successDecoration, failureDecoration);
   ctx.subscriptions.push(
     vscode.commands.registerCommand('ghcCoreLean.verify', verify),
     vscode.commands.registerCommand('ghcCoreLean.clearDiagnostics', clearDiagnostics),
+    vscode.commands.registerCommand('ghcCoreLean.checkEnvironment', checkEnvironment),
     vscode.languages.registerHoverProvider('haskell', new AnnotationHoverProvider()),
     vscode.languages.registerCodeLensProvider({ language: 'haskell', scheme: 'file' }, new SpecCodeLensProvider()),
     // Decorations are editor-scoped, not document-scoped. Re-apply when the
