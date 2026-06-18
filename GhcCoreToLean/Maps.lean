@@ -41,6 +41,28 @@ def valueMap : String → Option String
   -- to Lean's Bool literals so dict-method bodies like `$c/=` compile.
   | "GHC.Types.True"       => some "true"
   | "GHC.Types.False"      => some "false"
+  -- List library (total). Haskell `++`/`map`/… map directly to Lean `List.*`.
+  -- `foldr`/`foldl` are eta-wrapped so their Haskell arg order (f, z, xs) is
+  -- pinned explicitly.
+  | "GHC.Base.++"      | "++"      => some "List.append"
+  | "GHC.Base.map"     | "map"     => some "List.map"
+  | "GHC.List.filter"  | "filter"  => some "List.filter"
+  | "GHC.List.reverse" | "reverse" => some "List.reverse"
+  -- Foldable methods (post-FTP). The desugarer resolves these through
+  -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
+  -- mapping fires regardless of which name appears.
+  | "Data.Foldable.length" | "GHC.List.length" | "length"  => some "List.length"
+  | "Data.Foldable.null"   | "GHC.List.null"   | "null"    => some "List.isEmpty"
+  | "Data.Foldable.foldr"  | "GHC.List.foldr"  | "foldr"   => some "(fun f z xs => List.foldr f z xs)"
+  | "Data.Foldable.foldl"  | "GHC.List.foldl"  | "foldl"   => some "(fun f z xs => List.foldl f z xs)"
+  -- Boolean / Prelude combinators.
+  | "GHC.Classes.&&"   | "&&"      => some "(· && ·)"
+  | "GHC.Classes.||"   | "||"      => some "(· || ·)"
+  | "GHC.Classes.not"  | "not"     => some "not"
+  | "GHC.Base.const"   | "const"   => some "(Function.const _)"
+  | "GHC.Base.flip"    | "flip"    => some "(fun f a b => f b a)"
+  | "GHC.Base.$"       | "$"       => some "(fun f x => f x)"
+  | "GHC.Base.otherwise" | "otherwise" => some "true"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,
