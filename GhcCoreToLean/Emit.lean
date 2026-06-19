@@ -221,6 +221,15 @@ private partial def exprHasBottom : Expr → Bool
   | .tick e  => exprHasBottom e
   | _        => false
 
+/-- Peel leading lambdas off an expression, returning the binders and body.
+    Hoisted above the emission mutual block so `emitLet` can use it (the other
+    `peelLams` lives after the block and is not visible here). -/
+private partial def peelLamsLocal : Expr → List Var × Expr
+  | .lam v body =>
+    let (vs, b) := peelLamsLocal body
+    (v :: vs, b)
+  | other       => ([], other)
+
 /-! ## Expr emission -/
 
 mutual
@@ -258,14 +267,27 @@ mutual
     | .mk con bndrs rhs =>
       s!"| {emitAltPattern con bndrs} => {emitExpr top rhs}"
 
+  /-- Emit a single `let rec` binding: peel lambdas into parameters and emit
+      `let rec {id} {params} := {body}`. (Lean's `let rec` has no `decreasing_by`,
+      so only structurally-decreasing recursion elaborates; non-structural local
+      rec is a documented follow-up.) -/
+  partial def emitLetRecBinding (top : List Name) (v : Var) (e : Expr) : String :=
+    let (params, body) := peelLamsLocal e
+    let paramStr := String.intercalate " " (params.map (fun p => s!"({localId p})"))
+    let head := if paramStr.isEmpty then s!"let rec {localId v} :="
+                else s!"let rec {localId v} {paramStr} :="
+    s!"{head} {emitExpr top body}"
+
   partial def emitLet (top : List Name) : Bind → String
     | .nonRec v e =>
-      s!"let {localId v} := {emitExpr top e}"
+      -- A `where`-style recursive helper can arrive tagged NonRec while its RHS
+      -- references the binder. A plain Lean `let` can't self-reference, so route
+      -- self-recursive NonRec bindings through `let rec` too.
+      if occursInExpr v.name e then emitLetRecBinding top v e
+      else s!"let {localId v} := {emitExpr top e}"
     | .rec_ pairs =>
-      let lines := pairs.map fun (v, e) =>
-        s!"  {localId v} := {emitExpr top e}"
-      let body := String.intercalate "\n" lines
-      s!"-- TODO: local Rec let unsupported, emitted as opaque\n{body}"
+      -- Local recursion → `let rec`. Multiple bindings emit as consecutive lines.
+      String.intercalate "\n" (pairs.map (fun (v, e) => emitLetRecBinding top v e))
 end
 
 /-! ## Def-header construction -/

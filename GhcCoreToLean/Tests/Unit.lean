@@ -96,4 +96,12 @@ def caseNoBinder : Expr :=
       .mk .default [] (.lit (.litInt 1)) ]   -- no reference to cb
 #guard ((emitExpr [] caseNoBinder).splitOn "let wild_8 :=").length == 1
 
+-- Task 7: local recursive let emits `let rec`, not a TODO comment.
+def localRecLet : Bind :=
+  .rec_ [ ( {name := "go", unique := 3, ty := .tyFun (.tyCon "Int" []) (.tyCon "Int" []), role := .id},
+            .lam {name := "k", unique := 4, ty := .tyCon "Int" [], role := .id}
+                 (.var {name := "k", unique := 4, ty := .tyCon "Int" [], role := .id}) ) ]
+#guard ((emitLet [] localRecLet).splitOn "let rec go_3").length == 2
+#guard ((emitLet [] localRecLet).splitOn "TODO").length == 1   -- no TODO marker
+
 end GhcCoreToLean.Tests
