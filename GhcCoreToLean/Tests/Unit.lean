@@ -64,17 +64,42 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 #guard dataConMap "GHC.Types.LT"         == some "Ordering.lt"
 #guard dataConMap "GHC.Types.EQ"         == some "Ordering.eq"
 #guard dataConMap "GHC.Types.GT"         == some "Ordering.gt"
+-- Task 3: behavioral locks on the error-prone Int semantics (sign of remainder
+-- on negative operands; signum). String guards above can't catch a wrong
+-- truncate-vs-floor direction; these do.
+#guard (Int.fdiv (-7) 2, Int.fmod (-7) 2) == (-4, 1)    -- div/mod: floor
+#guard (Int.tdiv (-7) 2, Int.tmod (-7) 2) == (-3, -1)   -- quot/rem: truncate
+#guard ((fun a b => (Int.fdiv a b, Int.fmod a b)) (-7) 2) == (-4, 1)   -- divMod
+#guard ((fun a b => (Int.tdiv a b, Int.tmod a b)) (-7) 2) == (-3, -1)  -- quotRem
+#guard ((fun a => if a < 0 then -1 else if a > 0 then 1 else 0) (-5 : Int)) == -1
+#guard ((fun a => if a < 0 then -1 else if a > 0 then 1 else 0) (0 : Int)) == 0
+#guard ((Int.gcd (-12) 8 : Int), (Int.lcm 4 6 : Int)) == (4, 12)
 
--- Task 5: partial library functions collapse to `default` like error/undefined.
+-- Task 5: partial functions map to FAITHFUL totals (head/last/!!/fromJust use
+-- `default` only on the ⊥ part of the domain), NOT an unconditional `default`.
+-- `head xs` emits the faithful `headD default` form, not the literal "default".
 def headApp : Expr :=
   .app (.var {name := "GHC.List.head", unique := 0, ty := .tyVar "a", role := .id})
        (.var {name := "xs", unique := 1, ty := .tyCon "List" [.tyVar "a"], role := .id})
-#guard emitExpr [] headApp == "default"
+#guard emitExpr [] headApp == "((fun xs => xs.headD default)) (xs_1)"
+#guard emitExpr [] headApp != "default"   -- regression: must NOT blanket-collapse
 
 def fromJustApp : Expr :=
   .app (.var {name := "Data.Maybe.fromJust", unique := 0, ty := .tyVar "a", role := .id})
        (.var {name := "m", unique := 1, ty := .tyCon "Maybe" [.tyVar "a"], role := .id})
-#guard emitExpr [] fromJustApp == "default"
+#guard emitExpr [] fromJustApp == "((fun m => m.getD default)) (m_1)"
+
+-- Task 5: behavioral locks — the emitted faithful forms compute Haskell
+-- semantics on the DEFINED domain, and `default` only where Haskell is ⊥.
+#guard ((fun xs => xs.headD default) [1,2,3] : Int) == 1
+#guard ((fun xs => xs.headD default) ([] : List Int)) == 0          -- ⊥ → default
+#guard (List.tail [1,2,3] : List Int) == [2,3]
+#guard (List.tail ([] : List Int)) == []                            -- ⊥ → []
+#guard (List.dropLast [1,2,3] : List Int) == [1,2]
+#guard ((fun xs => xs.getLastD default) [1,2,3] : Int) == 3
+#guard ((fun xs i => xs.getD i.toNat default) [10,20,30] (1 : Int)) == 20
+#guard ((fun m => m.getD default) (some 5) : Int) == 5
+#guard ((fun m => m.getD default) (none : Option Int)) == 0         -- ⊥ → default
 
 -- Task 6: a case binder referenced in an alt must be bound via `let`.
 def caseWithBinder : Expr :=

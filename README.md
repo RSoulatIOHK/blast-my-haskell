@@ -173,10 +173,13 @@ Development Host.)
   (`fst snd`, construction, patterns), and `Maybe`/`Either` eliminators
   (`maybe fromMaybe isJust isNothing either`). Local recursive `where`/`let`
   helpers emit as Lean `let rec` (structural recursion only).
-- Partial functions (`error`, `undefined`, `head`, `tail`, `init`, `last`,
-  `!!`, `fromJust`) lower to Lean `default` (a total, sound bottom), so proofs
-  that reduce through them stay sound; properties should carry the
-  preconditions that rule the partial branch out.
+- `error`/`undefined` are ⊥ on their whole domain, so they lower to Lean
+  `default` (a total, sound bottom). The partial list/Maybe functions
+  (`head`, `tail`, `init`, `last`, `!!`, `fromJust`) are ⊥ *only* on the
+  empty list / `Nothing`, so they lower to Lean's total `*D`/`getD` forms:
+  faithful on their defined domain (`head [1,2,3] = 1`) and `default` exactly
+  where Haskell is ⊥. Either way, properties should carry the preconditions
+  that rule the ⊥ branch out (partial-correctness modeling).
 - Not yet supported: 3-tuple *construction* (type and pattern work; a
   constructed 3-tuple is a loud compile error), Haskell list-literal syntax
   (`[a, b, c]` desugars to `GHC.Base.build`), user-defined type classes /

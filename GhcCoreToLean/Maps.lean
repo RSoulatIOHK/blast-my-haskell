@@ -69,6 +69,22 @@ def valueMap : String → Option String
   | "GHC.Base.flip"               => some "(fun f a b => f b a)"
   | "GHC.Base.$"       | "$"       => some "(fun f x => f x)"
   | "GHC.Base.otherwise"          => some "true"
+  -- Partial functions. Haskell `head`/`last`/`!!`/`fromJust` are ⊥ ONLY on the
+  -- empty list / `Nothing`; they are faithful on the rest of their domain. So
+  -- they must NOT collapse to `default` everywhere (that breaks the defined
+  -- domain, e.g. `head [1,2,3]`). We map to Lean's total `*D`/`getD` forms:
+  -- faithful where Haskell is defined, and `default` (an arbitrary inhabitant)
+  -- exactly where Haskell is ⊥ — the documented partial-correctness tradeoff.
+  -- `default` needs `[Inhabited t]`, which `emitDefHeader` adds for polymorphic
+  -- defs (Emit recognises these names via `isPartialDefaultName`). `tail`/`init`
+  -- map to Lean totals that need no default. Qualified only (don't shadow a
+  -- user's own `head`/`tail`/… def).
+  | "GHC.List.head"       => some "(fun xs => xs.headD default)"
+  | "GHC.List.tail"       => some "List.tail"
+  | "GHC.List.init"       => some "List.dropLast"
+  | "GHC.List.last"       => some "(fun xs => xs.getLastD default)"
+  | "GHC.List.!!"         => some "(fun xs i => xs.getD i.toNat default)"
+  | "Data.Maybe.fromJust" => some "(fun m => m.getD default)"
   -- Tuple projections. Qualified only (a user could define `fst`/`snd`); the
   -- desugarer resolves these through `Data.Tuple.*`.
   | "Data.Tuple.fst"              => some "Prod.fst"

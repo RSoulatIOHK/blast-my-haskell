@@ -179,17 +179,18 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
 private def isBottomName : Name → Bool
   | "GHC.Err.error" | "error"
   | "GHC.Err.errorWithoutStackTrace" | "errorWithoutStackTrace"
-  | "GHC.Err.undefined" | "undefined"
-  -- Partial list functions: ⊥ on the empty list. Qualified names only — a
-  -- user could define a *total* `head`/`tail`/`init`, and collapsing that to
-  -- `default` would be an unsound silent miscompile. Core references these
-  -- partials qualified, so the bare forms are never needed (cf. the bare-name
-  -- rule for `valueMap`). The `!!` operator can't be user-shadowed harmfully,
-  -- but is kept qualified for uniformity.
-  | "GHC.List.head" | "GHC.List.tail"
-  | "GHC.List.last" | "GHC.List.init"
-  | "GHC.List.!!"
-  -- Partial Maybe eliminator: ⊥ on Nothing.
+  | "GHC.Err.undefined" | "undefined" => true
+  | _ => false
+
+/-- Partial functions whose *faithful* `valueMap` image uses `default` on the
+    ⊥ part of their domain (`head`/`last`/`!!`/`fromJust`). They are NOT bottoms
+    — they do not collapse to `default` everywhere (that would be unsound on the
+    defined domain, e.g. `head [1,2,3]`). But because their emitted term mentions
+    `default`, a polymorphic def using one needs an `[Inhabited t]` binder, so
+    `exprHasBottom` must see through to them. (`tail`→`List.tail` and
+    `init`→`List.dropLast` are total with no `default`, so they're not listed.) -/
+private def isPartialDefaultName : Name → Bool
+  | "GHC.List.head" | "GHC.List.last" | "GHC.List.!!"
   | "Data.Maybe.fromJust" => true
   | _ => false
 
@@ -200,14 +201,18 @@ private partial def appHeadName : Expr → Option Name
   | .tick e  => appHeadName e
   | _        => none
 
-/-- Does any subexpression apply a bottom (`error`/`undefined`)? Used to decide
-    whether a def's polymorphic result needs an `[Inhabited t]` binder so the
-    emitted `default` elaborates. -/
+/-- Does any subexpression emit a `default`? True for an applied bottom
+    (`error`/`undefined`) or an applied partial whose faithful image uses
+    `default` (`head`/`last`/`!!`/`fromJust`). Used to decide whether a def's
+    polymorphic result needs an `[Inhabited t]` binder so the emitted `default`
+    elaborates. -/
 private partial def exprHasBottom : Expr → Bool
   | .var _   => false
   | .lit _   => false
   | .app f a =>
-    (match appHeadName f with | some n => isBottomName n | none => false)
+    (match appHeadName f with
+     | some n => isBottomName n || isPartialDefaultName n
+     | none   => false)
       || exprHasBottom f || exprHasBottom a
   | .lam _ b => exprHasBottom b
   | .let_ b body =>
