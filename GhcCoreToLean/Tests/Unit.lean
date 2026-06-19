@@ -104,4 +104,15 @@ def localRecLet : Bind :=
 #guard ((emitLet [] localRecLet).splitOn "let rec go_3").length == 2
 #guard ((emitLet [] localRecLet).splitOn "TODO").length == 1   -- no TODO marker
 
+-- Task 8: unboxed Int# arithmetic/comparison primops.
+#guard valueMap "GHC.Prim.+#"  == some "(· + ·)"
+#guard valueMap "GHC.Prim.-#"  == some "(· - ·)"
+#guard valueMap "GHC.Prim.*#"  == some "(· * ·)"
+#guard valueMap "GHC.Prim.==#" == some "(· == ·)"
+#guard valueMap "GHC.Prim.<#"  == some "(fun a b => decide (a < b))"
+#guard valueMap "GHC.Prim.<=#" == some "(fun a b => decide (a ≤ b))"
+#guard valueMap "GHC.Prim.>#"  == some "(fun a b => decide (a > b))"
+#guard valueMap "GHC.Prim.>=#" == some "(fun a b => decide (a ≥ b))"
+#guard valueMap "GHC.Prim./=#" == some "(fun a b => !(a == b))"
+
 end GhcCoreToLean.Tests

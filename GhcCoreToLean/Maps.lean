@@ -87,6 +87,17 @@ def valueMap : String → Option String
   | "GHC.Real.gcd"          => some "(fun a b => (Int.gcd a b : Int))"
   | "GHC.Real.lcm"          => some "(fun a b => (Int.lcm a b : Int))"
   | "GHC.Classes.compare"   => some "compare"
+  -- Unboxed Int# primops. Arithmetic maps to boxed ops (I#/Int# both → Int);
+  -- comparisons mirror the GHC.Classes.* `decide`-wrapped Bool forms.
+  | "GHC.Prim.+#"  => some "(· + ·)"
+  | "GHC.Prim.-#"  => some "(· - ·)"
+  | "GHC.Prim.*#"  => some "(· * ·)"
+  | "GHC.Prim.==#" => some "(· == ·)"
+  | "GHC.Prim./=#" => some "(fun a b => !(a == b))"
+  | "GHC.Prim.<#"  => some "(fun a b => decide (a < b))"
+  | "GHC.Prim.<=#" => some "(fun a b => decide (a ≤ b))"
+  | "GHC.Prim.>#"  => some "(fun a b => decide (a > b))"
+  | "GHC.Prim.>=#" => some "(fun a b => decide (a ≥ b))"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,
