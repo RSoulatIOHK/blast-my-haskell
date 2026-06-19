@@ -180,9 +180,16 @@ Development Host.)
   faithful on their defined domain (`head [1,2,3] = 1`) and `default` exactly
   where Haskell is ⊥. Either way, properties should carry the preconditions
   that rule the ⊥ branch out (partial-correctness modeling).
+- Instances: hand-written `Eq` translates to `BEq` from its body (so
+  non-structural equality like Ratio's cross-multiply is preserved); derived
+  `Eq`/`Ord` are reconstructed via Lean `deriving DecidableEq, Ord` plus
+  `LE`/`LT`/`Min`/`Max`, so user types with `deriving (Eq, Ord)` support
+  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` would be
+  modeled structurally (a known limitation). `Show`/`Read` are skipped
+  (derived `Repr` prints counterexamples).
 - Not yet supported: 3-tuple *construction* (type and pattern work; a
   constructed 3-tuple is a loud compile error), Haskell list-literal syntax
-  (`[a, b, c]` desugars to `GHC.Base.build`), user-defined type classes /
-  dictionary passing (only derived `Eq`→`BEq` is wired), and `Show`/`Read`.
+  (`[a, b, c]` desugars to `GHC.Base.build`), and user-defined type classes /
+  dictionary passing.
   Theorems over lists/recursion need a user-written `induction` proof — bare
   `by blaster` (SMT) discharges only quantifier-free arithmetic goals.
