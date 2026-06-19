@@ -435,14 +435,15 @@ private partial def firstValArgTy : GHCType → Option GHCType
   | .tyFun a _  => some a
   | _           => none
 
-/-- Find the `$c==` binding belonging to the instance whose head type matches,
-    returning its emitted (unique-suffixed) def name. Multiple `Eq` instances
-    each produce a `$c==` binding; they collide after sanitization, so the def
-    names are unique-suffixed (see `defNameId`) and we disambiguate here by
-    matching the method's first argument type against the instance head. -/
-private def findEqMethod (binds : CoreProgram) (headTyStr : String) : Option String :=
+/-- Find the `$c<method>` binding belonging to the instance whose head type
+    matches `headTyStr`, returning its emitted (unique-suffixed) def name.
+    Generalizes the former `findEqMethod`: multiple instances of a class each
+    produce a `$c<method>` binding that collides after sanitization, so we
+    disambiguate by matching the method's first value-argument type against the
+    instance head. -/
+private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
   let matchesHead (v : Var) : Bool :=
-    v.name == "$c==" &&
+    v.name == method &&
       (match firstValArgTy v.ty with
        | some t => emitType t == headTyStr
        | none   => false)
@@ -450,16 +451,25 @@ private def findEqMethod (binds : CoreProgram) (headTyStr : String) : Option Str
     | .nonRec v _ => if matchesHead v then some (localId v) else none
     | .rec_ pairs => (pairs.find? (fun (v, _) => matchesHead v)).map (fun (v, _) => localId v)
 
-/-- Emit a Lean `instance` block. Only `Eq` → Lean `BEq` is wired for now.
-    Returns `none` for classes we don't model (Show, Read, etc.) so the
-    caller can skip them entirely. -/
+/-- Emit a Lean `instance` block. `Eq` → Lean `BEq` and `Ord` → Lean `Ord`
+    are wired. Returns `none` for classes we don't model (Show, Read, etc.)
+    so the caller can skip them entirely. -/
 def emitInstance (binds : CoreProgram) (i : Instance) : Option String :=
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
   match i.className with
   | "Eq" =>
-    match findEqMethod binds tyStr with
+    match findClassMethod binds "$c==" tyStr with
     | some methodRef => some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
     | none           => none
+  | "Ord" =>
+    match findClassMethod binds "$ccompare" tyStr with
+    | some methodRef => some s!"instance : Ord {tyStr} where\n  compare := {methodRef}"
+    | none           => none
+  -- Show is deliberately not translated: GHC's `$cshowsPrec` body is string
+  -- plumbing that rarely matches Lean's `ToString`, and emitted data decls
+  -- already `derive Repr`, which Blaster uses to print counterexamples.
+  -- Translating Show would risk a *wrong* printer; skipping is sound.
+  | "Show" => none
   | _ => none
 
 /-- Build a user-data-constructor-name map from the typeDecls. This lets

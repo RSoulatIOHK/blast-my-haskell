@@ -160,4 +160,33 @@ def localRecLet : Bind :=
 #guard valueMap "Data.Maybe.isNothing" == some "Option.isNone"
 #guard valueMap "Data.Either.either"   == some "(fun f g e => Sum.elim f g e)"
 
+-- Tier 3 Task 1: Eq instance emission survives the findEqMethod→findClassMethod refactor.
+def eqInstProgram : CoreProgram :=
+  [ .nonRec {name := "$c==", unique := 50,
+             ty := .tyFun (.tyCon "Foo" []) (.tyFun (.tyCon "Foo" []) (.tyCon "Bool" [])),
+             role := .id}
+            (.lam {name := "a", unique := 1, ty := .tyCon "Foo" [], role := .id}
+                  (.lit (.litInt 0))) ]
+def eqInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Foo" []], dfunName := "$fEqFoo", dfunUnique := 99}
+#guard (emitInstance eqInstProgram eqInst).isSome
+#guard (((emitInstance eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
+
+-- Tier 3 Task 2: Ord instance emits a Lean `Ord` instance from `$ccompare`.
+def ordInstProgram : CoreProgram :=
+  [ .nonRec {name := "$ccompare", unique := 60,
+             ty := .tyFun (.tyCon "Foo" []) (.tyFun (.tyCon "Foo" []) (.tyCon "Ordering" [])),
+             role := .id}
+            (.lam {name := "a", unique := 1, ty := .tyCon "Foo" [], role := .id}
+                  (.var {name := "GHC.Types.EQ", unique := 2, ty := .tyCon "Ordering" [], role := .id})) ]
+def ordInst : Instance :=
+  {className := "Ord", headTypes := [.tyCon "Foo" []], dfunName := "$fOrdFoo", dfunUnique := 98}
+#guard (((emitInstance ordInstProgram ordInst).getD "").splitOn "instance : Ord (GHCCore.tyConOpaque \"Foo\")").length == 2
+#guard (((emitInstance ordInstProgram ordInst).getD "").splitOn "compare :=").length == 2
+
+-- Tier 3 Task 3: Show instances are intentionally skipped (derived Repr handles printing).
+def showInst : Instance :=
+  {className := "Show", headTypes := [.tyCon "Foo" []], dfunName := "$fShowFoo", dfunUnique := 97}
+#guard emitInstance [] showInst == none
+
 end GhcCoreToLean.Tests
