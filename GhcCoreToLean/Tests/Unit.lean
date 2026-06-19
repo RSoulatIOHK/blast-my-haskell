@@ -13,7 +13,7 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 #guard valueMap "++"                 == some "List.append"
 #guard valueMap "GHC.Base.map"       == some "List.map"
 #guard valueMap "GHC.List.filter"    == some "List.filter"
-#guard valueMap "GHC.List.length"    == some "List.length"
+#guard valueMap "GHC.List.length"    == some "(fun xs => (List.length xs : Int))"
 #guard valueMap "GHC.List.reverse"   == some "List.reverse"
 #guard valueMap "GHC.List.null"      == some "List.isEmpty"
 #guard valueMap "GHC.List.foldr"     == some "(fun f z xs => List.foldr f z xs)"

@@ -55,7 +55,9 @@ def valueMap : String → Option String
   -- Foldable methods (post-FTP). The desugarer resolves these through
   -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
   -- mapping fires regardless of which name appears.
-  | "Data.Foldable.length" | "GHC.List.length"  => some "List.length"
+  -- Haskell `length` returns `Int`; Lean `List.length` returns `Nat`. Coerce
+  -- to `Int` (like `gcd`/`lcm`) so it composes with Int arithmetic.
+  | "Data.Foldable.length" | "GHC.List.length"  => some "(fun xs => (List.length xs : Int))"
   | "Data.Foldable.null"   | "GHC.List.null"    => some "List.isEmpty"
   | "Data.Foldable.foldr"  | "GHC.List.foldr"   => some "(fun f z xs => List.foldr f z xs)"
   | "Data.Foldable.foldl"  | "GHC.List.foldl"   => some "(fun f z xs => List.foldl f z xs)"
