@@ -236,12 +236,20 @@ mutual
       s!"(fun {localId v} => {emitExpr top body})"
     | .let_ b body =>
       s!"({emitLet top b}\n{emitExpr top body})"
-    | .case_ scr _cb _ty alts =>
+    | .case_ scr cb _ty alts =>
       let alts'   := reorderAlts alts
       let altsStr := alts'.map (emitAlt top)
-      let header  := s!"(match {emitExpr top scr} with"
+      let scrStr  := emitExpr top scr
       let body    := String.intercalate "\n" altsStr
-      s!"{header}\n{body})"
+      -- GHC binds the case binder to the scrutinee; alts may reference it.
+      -- When used, bind it once and match *on the binder* — single evaluation
+      -- of the scrutinee, matching Core's semantics. When unused, match the
+      -- scrutinee directly.
+      let usesCb  := alts.any (fun (.mk _ _ r) => occursInExpr cb.name r)
+      if usesCb then
+        s!"(let {localId cb} := {scrStr}\n(match {localId cb} with\n{body}))"
+      else
+        s!"(match {scrStr} with\n{body})"
     | .cast e  => emitExpr top e
     | .tick e  => emitExpr top e
     | .type_ _ => "(GHCCore.typeArg : GHCCore.GHCType)"

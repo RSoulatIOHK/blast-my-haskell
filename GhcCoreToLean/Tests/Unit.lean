@@ -76,4 +76,24 @@ def fromJustApp : Expr :=
        (.var {name := "m", unique := 1, ty := .tyCon "Maybe" [.tyVar "a"], role := .id})
 #guard emitExpr [] fromJustApp == "default"
 
+-- Task 6: a case binder referenced in an alt must be bound via `let`.
+def caseWithBinder : Expr :=
+  let cb : Var := {name := "wild", unique := 7, ty := .tyCon "Int" [], role := .id}
+  .case_
+    (.var {name := "n", unique := 1, ty := .tyCon "Int" [], role := .id})
+    cb (.tyCon "Int" [])
+    [ .mk (.litAlt (.litInt 0)) [] (.lit (.litInt 0)),
+      .mk .default [] (.var cb) ]   -- DEFAULT references the case binder
+#guard ((emitExpr [] caseWithBinder).splitOn "let wild_7 :=").length == 2
+
+-- Task 6: an UNUSED case binder must NOT be let-bound (match scrutinee directly).
+def caseNoBinder : Expr :=
+  let cb : Var := {name := "wild", unique := 8, ty := .tyCon "Int" [], role := .id}
+  .case_
+    (.var {name := "n", unique := 1, ty := .tyCon "Int" [], role := .id})
+    cb (.tyCon "Int" [])
+    [ .mk (.litAlt (.litInt 0)) [] (.lit (.litInt 0)),
+      .mk .default [] (.lit (.litInt 1)) ]   -- no reference to cb
+#guard ((emitExpr [] caseNoBinder).splitOn "let wild_8 :=").length == 1
+
 end GhcCoreToLean.Tests
