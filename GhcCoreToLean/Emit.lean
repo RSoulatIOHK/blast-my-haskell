@@ -179,7 +179,18 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
 private def isBottomName : Name → Bool
   | "GHC.Err.error" | "error"
   | "GHC.Err.errorWithoutStackTrace" | "errorWithoutStackTrace"
-  | "GHC.Err.undefined" | "undefined" => true
+  | "GHC.Err.undefined" | "undefined"
+  -- Partial list functions: ⊥ on the empty list. Qualified names only — a
+  -- user could define a *total* `head`/`tail`/`init`, and collapsing that to
+  -- `default` would be an unsound silent miscompile. Core references these
+  -- partials qualified, so the bare forms are never needed (cf. the bare-name
+  -- rule for `valueMap`). The `!!` operator can't be user-shadowed harmfully,
+  -- but is kept qualified for uniformity.
+  | "GHC.List.head" | "GHC.List.tail"
+  | "GHC.List.last" | "GHC.List.init"
+  | "GHC.List.!!"
+  -- Partial Maybe eliminator: ⊥ on Nothing.
+  | "Data.Maybe.fromJust" => true
   | _ => false
 
 private partial def appHeadName : Expr → Option Name

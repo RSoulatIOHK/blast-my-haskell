@@ -65,4 +65,15 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 #guard dataConMap "GHC.Types.EQ"         == some "Ordering.eq"
 #guard dataConMap "GHC.Types.GT"         == some "Ordering.gt"
 
+-- Task 5: partial library functions collapse to `default` like error/undefined.
+def headApp : Expr :=
+  .app (.var {name := "GHC.List.head", unique := 0, ty := .tyVar "a", role := .id})
+       (.var {name := "xs", unique := 1, ty := .tyCon "List" [.tyVar "a"], role := .id})
+#guard emitExpr [] headApp == "default"
+
+def fromJustApp : Expr :=
+  .app (.var {name := "Data.Maybe.fromJust", unique := 0, ty := .tyVar "a", role := .id})
+       (.var {name := "m", unique := 1, ty := .tyCon "Maybe" [.tyVar "a"], role := .id})
+#guard emitExpr [] fromJustApp == "default"
+
 end GhcCoreToLean.Tests
