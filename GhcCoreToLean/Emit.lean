@@ -420,7 +420,7 @@ def emitProgramWith (p : CoreProgram) (extraTopNames : List Name) : String :=
     body post-passes rewrite Haskell-style refs to the qualified `T.C` form.
     Field selectors GHC auto-generates are emitted alongside as regular
     defs. -/
-def emitDataDecl (d : DataDecl) : String :=
+def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
   let leanName := sanitize d.name
   let ctorLines := d.ctors.map fun c =>
     let argTys := c.fields.map (emitType ·.ty)
@@ -428,12 +428,73 @@ def emitDataDecl (d : DataDecl) : String :=
     s!"  | {sanitize c.name} : {arrows}"
   let body := String.intercalate "\n" ctorLines
   -- `Inhabited` so emitted `default` bottoms whose result is this type elaborate.
-  s!"inductive {leanName} where\n{body}\nderiving Repr, Inhabited"
+  -- A *derived* Eq/Ord (whose GHC `$c==`/`$ccompare` body uses untranslatable
+  -- tag primops) is reconstructed structurally here via Lean `deriving`, which
+  -- matches GHC's derived semantics. `Ord` additionally needs `LE`/`LT`/`Min`/
+  -- `Max` (Lean's `Ord` doesn't supply them) so the transpiler's lowered
+  -- `decide (a ≤ b)` / `Min.min` / … resolve.
+  let derivs := "Repr, Inhabited"
+    ++ (if derivedEq || hasOrd then ", DecidableEq" else "")
+    ++ (if hasOrd then ", Ord" else "")
+  let ordInsts :=
+    if hasOrd then
+      s!"\n\ninstance : LE {leanName} := leOfOrd\ninstance : LT {leanName} := ltOfOrd"
+        ++ s!"\ninstance : Min {leanName} := minOfLe\ninstance : Max {leanName} := maxOfLe"
+    else ""
+  s!"inductive {leanName} where\n{body}\nderiving {derivs}{ordInsts}"
 
 private partial def firstValArgTy : GHCType → Option GHCType
   | .forAll _ b => firstValArgTy b
   | .tyFun a _  => some a
   | _           => none
+
+/-- Does the expression reference a constructor-tag primop (`dataToTag#` /
+    `tagToEnum#`)? Such a body is a GHC *derived* Eq/Ord we cannot translate —
+    those types are routed through Lean `deriving` instead. Hand-written
+    instances (e.g. Ratio's cross-multiply `==`) never use these primops, so
+    they keep their normal body-translation. -/
+private partial def usesTagPrim : Expr → Bool
+  | .var v       => v.name.endsWith "dataToTag#" || v.name.endsWith "tagToEnum#"
+  | .lit _       => false
+  | .app f a     => usesTagPrim f || usesTagPrim a
+  | .lam _ b     => usesTagPrim b
+  | .let_ bnd b  =>
+    (match bnd with
+     | .nonRec _ e => usesTagPrim e
+     | .rec_ ps    => ps.any (fun p => usesTagPrim p.2))
+      || usesTagPrim b
+  | .case_ s _ _ alts =>
+    usesTagPrim s || alts.any (fun (.mk _ _ r) => usesTagPrim r)
+  | .cast e      => usesTagPrim e
+  | .tick e      => usesTagPrim e
+  | .type_ _     => false
+
+/-- Class-method binder names, by class. Used both to detect derived instances
+    and to suppress their (untranslatable) method defs. -/
+private def eqMethodNames  : List Name := ["$c==", "$c/="]
+private def ordMethodNames : List Name := ["$ccompare", "$c<", "$c<=", "$c>", "$c>=", "$cmax", "$cmin"]
+
+/-- Head-type string of a class-method `Var` (its first value argument's type,
+    emitted), matching the strings `emitInstance`/`emitDataDecl` compare against. -/
+private def methodHeadStr (v : Var) : Option String :=
+  (firstValArgTy v.ty).map emitType
+
+/-- Scan binds for *derived* Eq methods (`$c==`/`$c/=` whose body uses the tag
+    primops `dataToTag#`/`tagToEnum#`) and return their head-type strings. Such
+    Eq instances can't be body-translated and are routed through Lean
+    `deriving DecidableEq` instead. Hand-written Eq (e.g. Ratio's cross-multiply
+    `==`) never uses tag primops, so it keeps its body-translation. (Ord is
+    handled by instance-existence, not this scan — see `emitFullProgram` — since
+    a derived `compare` on a small enum is case-based and indistinguishable from
+    a hand-written one.) -/
+private def derivedEqTypes (binds : CoreProgram) : List String :=
+  let step (acc : List String) (v : Var) (e : Expr) : List String :=
+    if usesTagPrim e && eqMethodNames.contains v.name then
+      match methodHeadStr v with | some hs => hs :: acc | none => acc
+    else acc
+  binds.foldl (init := []) fun acc b => match b with
+    | .nonRec v e => step acc v e
+    | .rec_ pairs => pairs.foldl (init := acc) (fun acc (v, e) => step acc v e)
 
 /-- Find the `$c<method>` binding belonging to the instance whose head type
     matches `headTyStr`, returning its emitted (unique-suffixed) def name.
@@ -454,17 +515,24 @@ private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : S
 /-- Emit a Lean `instance` block. `Eq` → Lean `BEq` and `Ord` → Lean `Ord`
     are wired. Returns `none` for classes we don't model (Show, Read, etc.)
     so the caller can skip them entirely. -/
-def emitInstance (binds : CoreProgram) (i : Instance) : Option String :=
+def emitInstance (derivedEq : List String) (binds : CoreProgram) (i : Instance) : Option String :=
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
   match i.className with
   | "Eq" =>
-    match findClassMethod binds "$c==" tyStr with
+    -- A *derived* Eq is handled by the type's `deriving DecidableEq` (its
+    -- `$c==` body uses untranslatable tag primops); skip the body-translation.
+    -- Hand-written Eq still translates to a `BEq` instance from its body.
+    if derivedEq.contains tyStr then none
+    else match findClassMethod binds "$c==" tyStr with
     | some methodRef => some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
     | none           => none
   | "Ord" =>
-    match findClassMethod binds "$ccompare" tyStr with
-    | some methodRef => some s!"instance : Ord {tyStr} where\n  compare := {methodRef}"
-    | none           => none
+    -- Ord is reconstructed via `deriving Ord` + `leOfOrd`/… in the data block
+    -- (emitted by `emitDataDecl`), so instances precede the binds that use
+    -- `≤`/`<`/`min`/`max` (Lean instances are not forward-visible). Nothing to
+    -- emit here. The GHC `$ccompare`/`$c<=`/… method defs are suppressed in
+    -- `emitFullProgram`.
+    none
   -- Show is deliberately not translated: GHC's `$cshowsPrec` body is string
   -- plumbing that rarely matches Lean's `ToString`, and emitted data decls
   -- already `derive Repr`, which Blaster uses to print counterexamples.
@@ -547,9 +615,32 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   -- set so App-position refs to them emit bare, not as `Name_<unique>`.
   let ctorNames : List Name :=
     p.typeDecls.flatMap fun d => d.ctors.map (·.name)
-  let datas := p.typeDecls.map emitDataDecl
-  let binds := emitProgramWith p.binds ctorNames
-  let insts := p.instances.filterMap (emitInstance p.binds)
+  -- Eq: detect *derived* Eq (tag-primop `$c==`) → route through `deriving
+  -- DecidableEq` and suppress the untranslatable method defs; hand-written Eq
+  -- keeps body-translation. Ord: any type with an Ord instance is reconstructed
+  -- via `deriving Ord` + `leOfOrd`/… in the data block (so the instances precede
+  -- the binds that use `≤`/`<`/`min`/`max` — Lean instances aren't forward-
+  -- visible); its GHC `$ccompare`/`$c<=`/… method defs are all dead boilerplate
+  -- and suppressed.
+  let derivedEq : List String := derivedEqTypes p.binds
+  let ordTypes  : List String :=
+    p.instances.filterMap fun i =>
+      if i.className == "Ord" then some (i.headTypes.map emitType |> String.intercalate " ") else none
+  let headMatches (v : Var) (s : List String) : Bool :=
+    match methodHeadStr v with | some hs => s.contains hs | none => false
+  let isSuppressedMethod (v : Var) : Bool :=
+    (eqMethodNames.contains v.name  && headMatches v derivedEq)
+    || (ordMethodNames.contains v.name && headMatches v ordTypes)
+  let keptBinds : CoreProgram := p.binds.filterMap fun b => match b with
+    | .nonRec v e => if isSuppressedMethod v then none else some (.nonRec v e)
+    | .rec_ pairs =>
+      let kept := pairs.filter (fun (v, _) => !isSuppressedMethod v)
+      if kept.isEmpty then none else some (.rec_ kept)
+  let datas := p.typeDecls.map fun d =>
+    let hs := emitType (.tyCon d.name [])
+    emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
+  let binds := emitProgramWith keptBinds ctorNames
+  let insts := p.instances.filterMap (emitInstance derivedEq p.binds)
   let bodyRaw :=
     (if binds.isEmpty then "" else binds)
       ++ (if insts.isEmpty then "" else "\n\n" ++ String.intercalate "\n\n" insts)

@@ -169,24 +169,40 @@ def eqInstProgram : CoreProgram :=
                   (.lit (.litInt 0))) ]
 def eqInst : Instance :=
   {className := "Eq", headTypes := [.tyCon "Foo" []], dfunName := "$fEqFoo", dfunUnique := 99}
-#guard (emitInstance eqInstProgram eqInst).isSome
-#guard (((emitInstance eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
+#guard (emitInstance [] eqInstProgram eqInst).isSome
+#guard (((emitInstance [] eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
 
--- Tier 3 Task 2: Ord instance emits a Lean `Ord` instance from `$ccompare`.
-def ordInstProgram : CoreProgram :=
-  [ .nonRec {name := "$ccompare", unique := 60,
-             ty := .tyFun (.tyCon "Foo" []) (.tyFun (.tyCon "Foo" []) (.tyCon "Ordering" [])),
-             role := .id}
-            (.lam {name := "a", unique := 1, ty := .tyCon "Foo" [], role := .id}
-                  (.var {name := "GHC.Types.EQ", unique := 2, ty := .tyCon "Ordering" [], role := .id})) ]
+-- Tier 3 Task 2/4: Ord is reconstructed via `deriving Ord` + LE/LT/Min/Max in
+-- the data block (instances precede binds; Lean instances aren't forward-
+-- visible), so `emitInstance` emits nothing for Ord — it's covered by the
+-- emitDataDecl guards below.
 def ordInst : Instance :=
   {className := "Ord", headTypes := [.tyCon "Foo" []], dfunName := "$fOrdFoo", dfunUnique := 98}
-#guard (((emitInstance ordInstProgram ordInst).getD "").splitOn "instance : Ord (GHCCore.tyConOpaque \"Foo\")").length == 2
-#guard (((emitInstance ordInstProgram ordInst).getD "").splitOn "compare :=").length == 2
+#guard emitInstance [] [] ordInst == none
 
 -- Tier 3 Task 3: Show instances are intentionally skipped (derived Repr handles printing).
 def showInst : Instance :=
   {className := "Show", headTypes := [.tyCon "Foo" []], dfunName := "$fShowFoo", dfunUnique := 97}
-#guard emitInstance [] showInst == none
+#guard emitInstance [] [] showInst == none
+
+-- Tier 3 Task 4: derived Eq (DecidableEq) and Ord (deriving Ord + LE/LT/Min/Max).
+def coinDecl : DataDecl :=
+  {name := "Coin", kind := "data",
+   ctors := [ {name := "Heads", fields := []}, {name := "Tails", fields := []} ]}
+-- derivedEq + hasOrd → inductive carries DecidableEq, Ord + LE/LT/Min/Max.
+#guard ((emitDataDecl true true coinDecl).splitOn "deriving Repr, Inhabited, DecidableEq, Ord").length == 2
+#guard ((emitDataDecl true true coinDecl).splitOn "instance : LE Coin := leOfOrd").length == 2
+#guard ((emitDataDecl true true coinDecl).splitOn "instance : Min Coin := minOfLe").length == 2
+-- hasOrd alone (Eq not tag-derived) still gets DecidableEq + Ord + LE/LT.
+#guard ((emitDataDecl false true coinDecl).splitOn "DecidableEq, Ord").length == 2
+#guard ((emitDataDecl false true coinDecl).splitOn "leOfOrd").length == 2
+-- neither → unchanged (no DecidableEq/Ord/LE).
+#guard ((emitDataDecl false false coinDecl).splitOn "deriving Repr, Inhabited").length == 2
+#guard ((emitDataDecl false false coinDecl).splitOn "DecidableEq").length == 1
+#guard ((emitDataDecl false false coinDecl).splitOn "leOfOrd").length == 1
+-- derived Eq instance is skipped (deriving handles it); hand-written (empty
+-- derived set) still emits its BEq from the translated body.
+#guard emitInstance ["(GHCCore.tyConOpaque \"Foo\")"] eqInstProgram eqInst == none
+#guard (emitInstance [] eqInstProgram eqInst).isSome
 
 end GhcCoreToLean.Tests
