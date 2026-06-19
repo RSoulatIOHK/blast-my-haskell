@@ -115,4 +115,24 @@ def localRecLet : Bind :=
 #guard valueMap "GHC.Prim.>=#" == some "(fun a b => decide (a ≥ b))"
 #guard valueMap "GHC.Prim./=#" == some "(fun a b => !(a == b))"
 
+-- Task 9: confirm eliminator argument order (behavioral, not string).
+-- Confirmed v4.24.0 signatures (via #check):
+--   @Option.elim : Option α → β → (α → β) → β        (scrutinee FIRST)
+--   @Sum.elim    : (α → γ) → (β → γ) → α ⊕ β → γ      (scrutinee LAST)
+#guard (Option.elim (some 5) 0 (fun x => x + 1)) == 6     -- elim o default f : f applied on some
+#guard (Option.elim (none : Option Nat) 0 (fun x => x + 1)) == 0
+#guard (Option.getD (some 5) 0) == 5
+#guard (Option.getD (none : Option Nat) 0) == 0
+-- NOTE: confirmed via `#check @Sum.elim` — Sum.elim is scrutinee-LAST:
+--   (α → γ) → (β → γ) → α ⊕ β → γ. So Haskell `either f g e` ≡ `Sum.elim f g e`.
+#guard (Sum.elim (fun a => a + 10) (fun b => b + 20) (Sum.inl 3 : Sum Nat Nat)) == 13
+#guard (Sum.elim (fun a => a + 10) (fun b => b + 20) (Sum.inr 3 : Sum Nat Nat)) == 23
+
+-- Task 9: total Maybe/Either eliminators.
+#guard valueMap "GHC.Maybe.maybe"      == some "(fun d f m => Option.elim m d f)"
+#guard valueMap "Data.Maybe.fromMaybe" == some "(fun d m => Option.getD m d)"
+#guard valueMap "Data.Maybe.isJust"    == some "Option.isSome"
+#guard valueMap "Data.Maybe.isNothing" == some "Option.isNone"
+#guard valueMap "Data.Either.either"   == some "(fun f g e => Sum.elim f g e)"
+
 end GhcCoreToLean.Tests

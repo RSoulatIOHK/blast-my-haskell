@@ -98,6 +98,17 @@ def valueMap : String → Option String
   | "GHC.Prim.<=#" => some "(fun a b => decide (a ≤ b))"
   | "GHC.Prim.>#"  => some "(fun a b => decide (a > b))"
   | "GHC.Prim.>=#" => some "(fun a b => decide (a ≥ b))"
+  -- Maybe/Either eliminators (total). Confirmed v4.24.0 signatures:
+  --   `Option.elim : Option α → β → (α → β) → β`   (scrutinee FIRST), so
+  --   Haskell `maybe d f m` ≡ `Option.elim m d f`.
+  --   `Sum.elim : (α → γ) → (β → γ) → α ⊕ β → γ`   (scrutinee LAST), so
+  --   Haskell `either f g e` ≡ `Sum.elim f g e`.
+  --   `fromMaybe d m` ≡ `Option.getD m d`.
+  | "GHC.Maybe.maybe"      => some "(fun d f m => Option.elim m d f)"
+  | "Data.Maybe.fromMaybe" => some "(fun d m => Option.getD m d)"
+  | "Data.Maybe.isJust"    => some "Option.isSome"
+  | "Data.Maybe.isNothing" => some "Option.isNone"
+  | "Data.Either.either"   => some "(fun f g e => Sum.elim f g e)"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,
