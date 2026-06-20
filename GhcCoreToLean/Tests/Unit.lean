@@ -213,4 +213,22 @@ def sizedClass : ClassDecl :=
 #guard sizedClass.methods.length == 1
 #guard (sizedClass.methods.head!).name == "size"
 
+-- Dict Task 2: reconstruct ClassDecl + method→class map from binds + instances.
+def csizeBind : Bind :=
+  .nonRec {name := "$csize", unique := 90,
+           ty := .tyFun (.tyCon "Box" []) (.tyCon "Int" []), role := .id}
+          (.lam {name := "b", unique := 1, ty := .tyCon "Box" [], role := .id}
+                (.lit (.litInt 0)))
+def dfunBind : Bind :=
+  .nonRec {name := "$fSizedBox", unique := 91, ty := .tyCon "Sized" [.tyCon "Box" []], role := .id}
+          (.var {name := "$csize", unique := 90, ty := .tyFun (.tyCon "Box" []) (.tyCon "Int" []), role := .id})
+def sizedInst : Instance :=
+  {className := "Sized", headTypes := [.tyCon "Box" []], dfunName := "$fSizedBox", dfunUnique := 91}
+def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
+#guard reconRes.1.length == 1
+#guard (reconRes.1.head!).name == "Sized"
+#guard (reconRes.1.head!).methods.map (·.name) == ["size"]
+#guard reconRes.2 == [("size", "Sized")]
+#guard emitType (reconRes.1.head!).methods.head!.ty == emitType (.tyFun (.tyVar "a") (.tyCon "Int" []))
+
 end GhcCoreToLean.Tests

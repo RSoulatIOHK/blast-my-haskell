@@ -496,6 +496,60 @@ private def derivedEqTypes (binds : CoreProgram) : List String :=
     | .nonRec v e => step acc v e
     | .rec_ pairs => pairs.foldl (init := acc) (fun acc (v, e) => step acc v e)
 
+/-- Names of `$c…` class-method `Var`s referenced anywhere in an expression. -/
+private partial def collectCMethodRefs : Expr → List Name
+  | .var v       => if v.name.startsWith "$c" then [v.name] else []
+  | .app f a     => collectCMethodRefs f ++ collectCMethodRefs a
+  | .lam _ b     => collectCMethodRefs b
+  | .let_ bnd b  =>
+    (match bnd with
+     | .nonRec _ e => collectCMethodRefs e
+     | .rec_ ps    => ps.flatMap (fun p => collectCMethodRefs p.2))
+      ++ collectCMethodRefs b
+  | .case_ s _ _ alts => collectCMethodRefs s ++ alts.flatMap (fun (.mk _ _ r) => collectCMethodRefs r)
+  | .cast e      => collectCMethodRefs e
+  | .tick e      => collectCMethodRefs e
+  | _            => []
+
+/-- Look up a top-level binding by name. -/
+private def findBind (binds : CoreProgram) (n : Name) : Option (Var × Expr) :=
+  binds.findSome? fun b => match b with
+    | .nonRec v e => if v.name == n then some (v, e) else none
+    | .rec_ pairs => pairs.find? (fun (v, _) => v.name == n)
+
+/-- Replace every `tyCon headName []` occurrence with `tyVar tv` (generalize an
+    instance-specialized method type back to the class-parameter form). -/
+private partial def generalizeTy (headName tv : Name) : GHCType → GHCType
+  | .tyCon n args => if n == headName && args.isEmpty then .tyVar tv
+                     else .tyCon n (args.map (generalizeTy headName tv))
+  | .tyApp f x    => .tyApp (generalizeTy headName tv f) (generalizeTy headName tv x)
+  | .tyFun a r    => .tyFun (generalizeTy headName tv a) (generalizeTy headName tv r)
+  | .forAll v b   => .forAll v (generalizeTy headName tv b)
+  | t             => t
+
+/-- Reconstruct `ClassDecl`s + a `(method, class)` map from the program's
+    instance dict-builders (which reference their `$c<method>` bindings) and the
+    `$c<method>` binding types (generalized to the class parameter). No GHC-plugin
+    support is needed: the dfun (`$f…`) body names the instance's methods. -/
+def reconstructClasses (binds : CoreProgram) (insts : List Instance)
+    : List ClassDecl × List (Name × Name) :=
+  let tv := "a"
+  let perInstance (i : Instance) : Option (ClassDecl × List (Name × Name)) := do
+    let (_, dfunRhs) ← findBind binds i.dfunName
+    let headName ← match i.headTypes.head? with | some (.tyCon n _) => some n | _ => none
+    let cmethods := (collectCMethodRefs dfunRhs).eraseDups
+    let methods := cmethods.filterMap fun cm => do
+      let (mv, _) ← findBind binds cm
+      let mname := cm.drop 2   -- strip "$c"
+      some ({ name := mname, ty := generalizeTy headName tv mv.ty } : ClassMethod)
+    let pairs := methods.map (fun m => (m.name, i.className))
+    some ({ name := i.className, tyVar := tv, methods }, pairs)
+  let results := insts.filterMap perInstance
+  let classes := results.foldl (init := ([] : List ClassDecl)) fun acc (cd, _) =>
+    if acc.any (·.name == cd.name) then acc else acc ++ [cd]
+  let methodMap := (results.flatMap (·.2)).eraseDups
+  (classes, methodMap)
+
 /-- Find the `$c<method>` binding belonging to the instance whose head type
     matches `headTyStr`, returning its emitted (unique-suffixed) def name.
     Generalizes the former `findEqMethod`: multiple instances of a class each
