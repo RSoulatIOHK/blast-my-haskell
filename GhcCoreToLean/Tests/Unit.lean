@@ -205,4 +205,12 @@ def coinDecl : DataDecl :=
 #guard emitInstance ["(GHCCore.tyConOpaque \"Foo\")"] eqInstProgram eqInst == none
 #guard (emitInstance [] eqInstProgram eqInst).isSome
 
+-- Dict Task 1: ClassDecl / ClassMethod AST types exist and hold the shape.
+def sizedClass : ClassDecl :=
+  { name := "Sized", tyVar := "a",
+    methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+#guard sizedClass.name == "Sized"
+#guard sizedClass.methods.length == 1
+#guard (sizedClass.methods.head!).name == "size"
+
 end GhcCoreToLean.Tests

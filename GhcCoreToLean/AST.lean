@@ -96,6 +96,17 @@ structure Instance where
   dfunUnique : Nat
 deriving Repr, Inhabited
 
+structure ClassMethod where
+  name : Name
+  ty   : GHCType   -- the *generalized* method type, e.g. `a → Int`
+deriving Repr, Inhabited
+
+structure ClassDecl where
+  name    : Name
+  tyVar   : Name           -- the class's type parameter, e.g. "a"
+  methods : List ClassMethod
+deriving Repr, Inhabited
+
 structure Program where
   binds     : CoreProgram
   typeDecls : List DataDecl
