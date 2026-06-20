@@ -231,4 +231,7 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 #guard reconRes.2 == [("size", "Sized")]
 #guard emitType (reconRes.1.head!).methods.head!.ty == emitType (.tyFun (.tyVar "a") (.tyCon "Int" []))
 
+-- Dict Task 3: emit a Lean `class` from a ClassDecl.
+#guard emitClassDecl sizedClass == "class Sized (a : Type) where\n  size : (a → Int)"
+
 end GhcCoreToLean.Tests

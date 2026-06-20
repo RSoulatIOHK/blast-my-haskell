@@ -443,6 +443,13 @@ def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
     else ""
   s!"inductive {leanName} where\n{body}\nderiving {derivs}{ordInsts}"
 
+/-- Emit a single-parameter user class as a Lean `class`. -/
+def emitClassDecl (c : ClassDecl) : String :=
+  let methodLines := c.methods.map fun m =>
+    s!"  {sanitize m.name} : {emitType m.ty}"
+  s!"class {sanitize c.name} ({tyVarId c.tyVar} : Type) where\n" ++
+    String.intercalate "\n" methodLines
+
 private partial def firstValArgTy : GHCType → Option GHCType
   | .forAll _ b => firstValArgTy b
   | .tyFun a _  => some a
