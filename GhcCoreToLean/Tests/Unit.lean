@@ -169,8 +169,8 @@ def eqInstProgram : CoreProgram :=
                   (.lit (.litInt 0))) ]
 def eqInst : Instance :=
   {className := "Eq", headTypes := [.tyCon "Foo" []], dfunName := "$fEqFoo", dfunUnique := 99}
-#guard (emitInstance [] eqInstProgram eqInst).isSome
-#guard (((emitInstance [] eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
+#guard (emitInstance [] [] eqInstProgram eqInst).isSome
+#guard (((emitInstance [] [] eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
 
 -- Tier 3 Task 2/4: Ord is reconstructed via `deriving Ord` + LE/LT/Min/Max in
 -- the data block (instances precede binds; Lean instances aren't forward-
@@ -178,12 +178,12 @@ def eqInst : Instance :=
 -- emitDataDecl guards below.
 def ordInst : Instance :=
   {className := "Ord", headTypes := [.tyCon "Foo" []], dfunName := "$fOrdFoo", dfunUnique := 98}
-#guard emitInstance [] [] ordInst == none
+#guard emitInstance [] [] [] ordInst == none
 
 -- Tier 3 Task 3: Show instances are intentionally skipped (derived Repr handles printing).
 def showInst : Instance :=
   {className := "Show", headTypes := [.tyCon "Foo" []], dfunName := "$fShowFoo", dfunUnique := 97}
-#guard emitInstance [] [] showInst == none
+#guard emitInstance [] [] [] showInst == none
 
 -- Tier 3 Task 4: derived Eq (DecidableEq) and Ord (deriving Ord + LE/LT/Min/Max).
 def coinDecl : DataDecl :=
@@ -202,8 +202,8 @@ def coinDecl : DataDecl :=
 #guard ((emitDataDecl false false coinDecl).splitOn "leOfOrd").length == 1
 -- derived Eq instance is skipped (deriving handles it); hand-written (empty
 -- derived set) still emits its BEq from the translated body.
-#guard emitInstance ["(GHCCore.tyConOpaque \"Foo\")"] eqInstProgram eqInst == none
-#guard (emitInstance [] eqInstProgram eqInst).isSome
+#guard emitInstance [] ["(GHCCore.tyConOpaque \"Foo\")"] eqInstProgram eqInst == none
+#guard (emitInstance [] [] eqInstProgram eqInst).isSome
 
 -- Dict Task 1: ClassDecl / ClassMethod AST types exist and hold the shape.
 def sizedClass : ClassDecl :=
@@ -237,5 +237,13 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 -- Dict Task 4: a bare class-method selector emits `Class.method`; others unaffected.
 #guard emitVar [("size","Sized")] [] {name := "size", unique := 7, ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .id} == "Sized.size"
 #guard emitVar [("size","Sized")] [] {name := "other", unique := 8, ty := .tyCon "Int" [], role := .id} == "other_8"
+
+-- Dict Task 5: a user-class instance emits `instance : C T where m := <ref>`.
+#guard (((emitInstanceUser [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
+         "instance : Sized (GHCCore.tyConOpaque \"Box\") where").length == 2
+#guard (((emitInstanceUser [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
+         "size := ").length == 2
+-- no matching class → none
+#guard emitInstanceUser [] [csizeBind, dfunBind] sizedInst == none
 
 end GhcCoreToLean.Tests

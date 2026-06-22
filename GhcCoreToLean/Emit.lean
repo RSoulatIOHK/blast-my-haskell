@@ -577,10 +577,24 @@ private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : S
     | .nonRec v _ => if matchesHead v then some (localId v) else none
     | .rec_ pairs => (pairs.find? (fun (v, _) => matchesHead v)).map (fun (v, _) => localId v)
 
-/-- Emit a Lean `instance` block. `Eq` → Lean `BEq` and `Ord` → Lean `Ord`
-    are wired. Returns `none` for classes we don't model (Show, Read, etc.)
-    so the caller can skip them entirely. -/
-def emitInstance (derivedEq : List String) (binds : CoreProgram) (i : Instance) : Option String :=
+/-- Emit a user-class instance: for each class method, find the matching
+    `$c<method>` binding for this instance's head type and wire it as a field.
+    Returns `none` if any method can't be resolved (skip rather than emit broken). -/
+def emitInstanceUser (classes : List ClassDecl) (binds : CoreProgram) (i : Instance) : Option String := do
+  let cd ← classes.find? (·.name == i.className)
+  let tyStr := i.headTypes.map emitType |> String.intercalate " "
+  let fields := cd.methods.filterMap fun m =>
+    match findClassMethod binds ("$c" ++ m.name) tyStr with
+    | some ref => some s!"  {sanitize m.name} := {ref}"
+    | none     => none
+  if fields.length == cd.methods.length && !fields.isEmpty then
+    some (s!"instance : {sanitize i.className} {tyStr} where\n" ++ String.intercalate "\n" fields)
+  else none
+
+/-- Emit a Lean `instance` block. `Eq` → Lean `BEq`, `Ord` → Lean `Ord` (the
+    latter via `deriving` in the data block), and user classes via
+    `emitInstanceUser`. Returns `none` for classes we don't model (Show, Read). -/
+def emitInstance (classes : List ClassDecl) (derivedEq : List String) (binds : CoreProgram) (i : Instance) : Option String :=
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
   match i.className with
   | "Eq" =>
@@ -603,7 +617,7 @@ def emitInstance (derivedEq : List String) (binds : CoreProgram) (i : Instance) 
   -- already `derive Repr`, which Blaster uses to print counterexamples.
   -- Translating Show would risk a *wrong* printer; skipping is sound.
   | "Show" => none
-  | _ => none
+  | _ => emitInstanceUser classes binds i
 
 /-- Build a user-data-constructor-name map from the typeDecls. This lets
     the Lean emitter rewrite `case x of CustomRatio …` patterns to use the
@@ -701,13 +715,13 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
     | .rec_ pairs =>
       let kept := pairs.filter (fun (v, _) => !isSuppressedMethod v)
       if kept.isEmpty then none else some (.rec_ kept)
-  -- Reconstruct user classes → method→class map for selector rewriting.
-  let (_userClasses, methodMap) := reconstructClasses p.binds p.instances
+  -- Reconstruct user classes → class decls + method→class map (selector rewrite).
+  let (userClasses, methodMap) := reconstructClasses p.binds p.instances
   let datas := p.typeDecls.map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
   let binds := emitProgramWith methodMap keptBinds ctorNames
-  let insts := p.instances.filterMap (emitInstance derivedEq p.binds)
+  let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
   let bodyRaw :=
     (if binds.isEmpty then "" else binds)
       ++ (if insts.isEmpty then "" else "\n\n" ++ String.intercalate "\n\n" insts)
