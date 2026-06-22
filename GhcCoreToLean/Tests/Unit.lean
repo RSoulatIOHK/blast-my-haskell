@@ -246,4 +246,16 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 -- no matching class → none
 #guard emitInstanceUser [] [csizeBind, dfunBind] sizedInst == none
 
+-- Dict Task 6: a `C a =>`-constrained def emits `[C a]` and no leaked dict arg.
+def totalBind : Bind :=
+  .nonRec
+    {name := "total", unique := 70,
+     ty := .forAll "a" (.tyFun (.tyCon "Sized" [.tyVar "a"])
+            (.tyFun (.tyCon "List" [.tyVar "a"]) (.tyCon "Int" []))),
+     role := .id}
+    (.lam {name := "xs", unique := 71, ty := .tyCon "List" [.tyVar "a"], role := .id}
+          (.lit (.litInt 0)))
+#guard ((emitBind [] ["Sized"] [] totalBind).splitOn "[Sized a]").length == 2
+#guard ((emitBind [] ["Sized"] [] totalBind).splitOn "tyConOpaque \"Sized\"").length == 1
+
 end GhcCoreToLean.Tests

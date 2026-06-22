@@ -307,6 +307,21 @@ private partial def peelLams : Expr → List Var × Expr
     (v :: vs, b)
   | other       => ([], other)
 
+/-- Peel leading class-constraint arrows (`C t → …` where `C ∈ classNames`) off a
+    def signature, returning the `[C t]` instance-implicit binder strings and the
+    remaining (constraint-stripped) type. `∀`-binders are skipped (their tyvars
+    are handled by `collectTyVars`). The term-level dict binder is already erased
+    by `Lower`, so stripping the dict arrow from the *type* realigns the value
+    args / result with the term binders. Stops at the first non-constraint arrow. -/
+private partial def stripClassConstraints (classNames : List Name) : GHCType → List String × GHCType
+  | .forAll _ b => stripClassConstraints classNames b
+  | .tyFun (.tyCon c [.tyVar t]) r =>
+    if classNames.contains c then
+      let (cs, rest) := stripClassConstraints classNames r
+      (s!"[{sanitize c} {tyVarId t}]" :: cs, rest)
+    else ([], .tyFun (.tyCon c [.tyVar t]) r)
+  | t => ([], t)
+
 private partial def stripFunTys : Nat → GHCType → GHCType
   | 0,     t            => t
   | n+1, .tyFun _ r     => stripFunTys n r
@@ -345,10 +360,15 @@ private def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
 private def defNameId (v : Var) : String :=
   if isClassMethodName v.name then localId v else sanitize v.name
 
-private def emitDefHeader (mm : List (Name × Name)) (top : List Name) (v : Var) (args : List Var)
+private def emitDefHeader (mm : List (Name × Name)) (classNames : List Name) (top : List Name)
+                          (v : Var) (args : List Var)
                           (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
   let name     := defNameId v
-  let argTys   := headerArgTys args v.ty
+  -- Strip class-constraint arrows (`C a =>`) from the signature → `[C a]`
+  -- instance-implicit binders; the remaining type aligns with the term binders
+  -- (the dict term-binder is already erased by Lower).
+  let (constraints, strippedTy) := stripClassConstraints classNames v.ty
+  let argTys   := headerArgTys args strippedTy
   let argStrs  := (args.zip argTys).map (fun (a, t) => s!"({localId a} : {emitType t})")
   let argStr   := String.intercalate " " argStrs
   -- Implicit `{t : Type}` binders for every free type variable in the
@@ -361,7 +381,8 @@ private def emitDefHeader (mm : List (Name × Name)) (top : List Name) (v : Var)
     let tv := tyVarId t
     if needInhab then s!"\{{tv} : Type} [Inhabited {tv}]"
     else s!"\{{tv} : Type}"))
-  let binders  := String.intercalate " " (List.filter (· != "") [implStr, argStr])
+  let constraintStr := String.intercalate " " constraints
+  let binders  := String.intercalate " " (List.filter (· != "") [implStr, constraintStr, argStr])
   let resStr   := emitType resTy
   let body     := emitExpr mm top rhsBody
   let head     :=
@@ -374,25 +395,29 @@ private def emitDefHeader (mm : List (Name × Name)) (top : List Name) (v : Var)
 
 /-! ## Top-level binds -/
 
-private def emitBind (mm : List (Name × Name)) (top : List Name) (b : Bind) : String :=
+def emitBind (mm : List (Name × Name)) (classNames : List Name) (top : List Name) (b : Bind) : String :=
+  -- Result type is computed from the constraint-stripped signature so the
+  -- erased dict arrow isn't mistaken for a value arg.
+  let resTyOf (v : Var) (nargs : Nat) : GHCType :=
+    stripFunTys nargs (stripClassConstraints classNames v.ty).2
   match b with
   | .nonRec v e =>
     let (args, body) := peelLams e
-    let resTy        := stripFunTys args.length v.ty
+    let resTy        := resTyOf v args.length
     let rec?         := occursInExpr v.name e
-    emitDefHeader mm top v args resTy body rec?
+    emitDefHeader mm classNames top v args resTy body rec?
   | .rec_ pairs =>
     match pairs with
     | [(v, e)] =>
       let (args, body) := peelLams e
-      let resTy        := stripFunTys args.length v.ty
+      let resTy        := resTyOf v args.length
       let rec?         := occursInExpr v.name e
-      emitDefHeader mm top v args resTy body rec?
+      emitDefHeader mm classNames top v args resTy body rec?
     | _        =>
       let defs := pairs.map fun (v, e) =>
         let (args, body) := peelLams e
-        let resTy        := stripFunTys args.length v.ty
-        emitDefHeader mm top v args resTy body true
+        let resTy        := resTyOf v args.length
+        emitDefHeader mm classNames top v args resTy body true
       let body := String.intercalate "\n" defs
       s!"mutual\n{body}\nend"
 
@@ -402,18 +427,18 @@ private def collectTopNames (p : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc
 
-def emitProgram (mm : List (Name × Name)) (p : CoreProgram) : String :=
+def emitProgram (mm : List (Name × Name)) (classNames : List Name) (p : CoreProgram) : String :=
   let top      := collectTopNames p
-  let bindStrs := p.map (emitBind mm top)
+  let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
 
 /-- Like `emitProgram`, but extends the "top-level names" set with extra
     names that should NOT get a `_unique` suffix when emitted as Var refs.
     The intended use is to splice in user-declared data constructors so
     `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
-def emitProgramWith (mm : List (Name × Name)) (p : CoreProgram) (extraTopNames : List Name) : String :=
+def emitProgramWith (mm : List (Name × Name)) (classNames : List Name) (p : CoreProgram) (extraTopNames : List Name) : String :=
   let top      := extraTopNames ++ collectTopNames p
-  let bindStrs := p.map (emitBind mm top)
+  let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
 
 /-! ## Data type declarations and instances -/
@@ -720,7 +745,8 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   let datas := p.typeDecls.map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
-  let binds := emitProgramWith methodMap keptBinds ctorNames
+  let classNames := userClasses.map (·.name)
+  let binds := emitProgramWith methodMap classNames keptBinds ctorNames
   let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
   let bodyRaw :=
     (if binds.isEmpty then "" else binds)
