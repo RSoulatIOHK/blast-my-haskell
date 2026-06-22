@@ -1,6 +1,9 @@
 {-# OPTIONS_GHC -fplugin GhcDump.Plugin #-}
+{-# LANGUAGE QuasiQuotes #-}
+{-# LANGUAGE TemplateHaskell #-}
 module UserClass where
     import Prelude
+    import Lean.Spec (lean)
 
     class Sized a where
         size :: a -> Int
@@ -15,3 +18,9 @@ module UserClass where
 
     boxTotal :: [Box] -> Int
     boxTotal = total
+
+    [lean|
+    theorem boxTotal_correct :
+        ∀ (boxes : List Box),
+        boxTotal boxes = total boxes + 1 := by blaster
+    |]
