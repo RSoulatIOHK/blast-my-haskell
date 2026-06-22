@@ -81,13 +81,13 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 def headApp : Expr :=
   .app (.var {name := "GHC.List.head", unique := 0, ty := .tyVar "a", role := .id})
        (.var {name := "xs", unique := 1, ty := .tyCon "List" [.tyVar "a"], role := .id})
-#guard emitExpr [] headApp == "((fun xs => xs.headD default)) (xs_1)"
-#guard emitExpr [] headApp != "default"   -- regression: must NOT blanket-collapse
+#guard emitExpr [] [] headApp == "((fun xs => xs.headD default)) (xs_1)"
+#guard emitExpr [] [] headApp != "default"   -- regression: must NOT blanket-collapse
 
 def fromJustApp : Expr :=
   .app (.var {name := "Data.Maybe.fromJust", unique := 0, ty := .tyVar "a", role := .id})
        (.var {name := "m", unique := 1, ty := .tyCon "Maybe" [.tyVar "a"], role := .id})
-#guard emitExpr [] fromJustApp == "((fun m => m.getD default)) (m_1)"
+#guard emitExpr [] [] fromJustApp == "((fun m => m.getD default)) (m_1)"
 
 -- Task 5: behavioral locks — the emitted faithful forms compute Haskell
 -- semantics on the DEFINED domain, and `default` only where Haskell is ⊥.
@@ -109,7 +109,7 @@ def caseWithBinder : Expr :=
     cb (.tyCon "Int" [])
     [ .mk (.litAlt (.litInt 0)) [] (.lit (.litInt 0)),
       .mk .default [] (.var cb) ]   -- DEFAULT references the case binder
-#guard ((emitExpr [] caseWithBinder).splitOn "let wild_7 :=").length == 2
+#guard ((emitExpr [] [] caseWithBinder).splitOn "let wild_7 :=").length == 2
 
 -- Task 6: an UNUSED case binder must NOT be let-bound (match scrutinee directly).
 def caseNoBinder : Expr :=
@@ -119,15 +119,15 @@ def caseNoBinder : Expr :=
     cb (.tyCon "Int" [])
     [ .mk (.litAlt (.litInt 0)) [] (.lit (.litInt 0)),
       .mk .default [] (.lit (.litInt 1)) ]   -- no reference to cb
-#guard ((emitExpr [] caseNoBinder).splitOn "let wild_8 :=").length == 1
+#guard ((emitExpr [] [] caseNoBinder).splitOn "let wild_8 :=").length == 1
 
 -- Task 7: local recursive let emits `let rec`, not a TODO comment.
 def localRecLet : Bind :=
   .rec_ [ ( {name := "go", unique := 3, ty := .tyFun (.tyCon "Int" []) (.tyCon "Int" []), role := .id},
             .lam {name := "k", unique := 4, ty := .tyCon "Int" [], role := .id}
                  (.var {name := "k", unique := 4, ty := .tyCon "Int" [], role := .id}) ) ]
-#guard ((emitLet [] localRecLet).splitOn "let rec go_3").length == 2
-#guard ((emitLet [] localRecLet).splitOn "TODO").length == 1   -- no TODO marker
+#guard ((emitLet [] [] localRecLet).splitOn "let rec go_3").length == 2
+#guard ((emitLet [] [] localRecLet).splitOn "TODO").length == 1   -- no TODO marker
 
 -- Task 8: unboxed Int# arithmetic/comparison primops.
 #guard valueMap "GHC.Prim.+#"  == some "(· + ·)"
@@ -233,5 +233,9 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 
 -- Dict Task 3: emit a Lean `class` from a ClassDecl.
 #guard emitClassDecl sizedClass == "class Sized (a : Type) where\n  size : (a → Int)"
+
+-- Dict Task 4: a bare class-method selector emits `Class.method`; others unaffected.
+#guard emitVar [("size","Sized")] [] {name := "size", unique := 7, ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .id} == "Sized.size"
+#guard emitVar [("size","Sized")] [] {name := "other", unique := 8, ty := .tyCon "Int" [], role := .id} == "other_8"
 
 end GhcCoreToLean.Tests

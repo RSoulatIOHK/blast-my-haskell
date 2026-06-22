@@ -126,9 +126,13 @@ def emitLiteralPattern : Literal → String
 
 /-! ## Var emission -/
 
-/-- Map a Var reference. Mapped value-map hits short-circuit; top-level
-    refs use bare names; locals get unique-suffixed. -/
-def emitVar (topNames : List Name) (v : Var) : String :=
+/-- Map a Var reference. A class-method selector (in `methodMap`) emits
+    `Class.method`; otherwise value-map hits short-circuit; top-level refs use
+    bare names; locals get unique-suffixed. -/
+def emitVar (methodMap : List (Name × Name)) (topNames : List Name) (v : Var) : String :=
+  match methodMap.find? (·.1 == v.name) with
+  | some (_, cls) => s!"{sanitize cls}.{sanitize v.name}"
+  | none      =>
   match valueMap v.name with
   | some lean => lean
   | none      =>
@@ -238,22 +242,22 @@ private partial def peelLamsLocal : Expr → List Var × Expr
 /-! ## Expr emission -/
 
 mutual
-  partial def emitExpr (top : List Name) : Expr → String
-    | .var v   => emitVar top v
+  partial def emitExpr (mm : List (Name × Name)) (top : List Name) : Expr → String
+    | .var v   => emitVar mm top v
     | .lit l   => emitLiteral l
     | .app f a =>
       match appHeadName f with
       | some n => if isBottomName n then "default"
-                  else s!"({emitExpr top f}) ({emitExpr top a})"
-      | none   => s!"({emitExpr top f}) ({emitExpr top a})"
+                  else s!"({emitExpr mm top f}) ({emitExpr mm top a})"
+      | none   => s!"({emitExpr mm top f}) ({emitExpr mm top a})"
     | .lam v body =>
-      s!"(fun {localId v} => {emitExpr top body})"
+      s!"(fun {localId v} => {emitExpr mm top body})"
     | .let_ b body =>
-      s!"({emitLet top b}\n{emitExpr top body})"
+      s!"({emitLet mm top b}\n{emitExpr mm top body})"
     | .case_ scr cb _ty alts =>
       let alts'   := reorderAlts alts
-      let altsStr := alts'.map (emitAlt top)
-      let scrStr  := emitExpr top scr
+      let altsStr := alts'.map (emitAlt mm top)
+      let scrStr  := emitExpr mm top scr
       let body    := String.intercalate "\n" altsStr
       -- GHC binds the case binder to the scrutinee; alts may reference it.
       -- When used, bind it once and match *on the binder* — single evaluation
@@ -264,35 +268,35 @@ mutual
         s!"(let {localId cb} := {scrStr}\n(match {localId cb} with\n{body}))"
       else
         s!"(match {scrStr} with\n{body})"
-    | .cast e  => emitExpr top e
-    | .tick e  => emitExpr top e
+    | .cast e  => emitExpr mm top e
+    | .tick e  => emitExpr mm top e
     | .type_ _ => "(GHCCore.typeArg : GHCCore.GHCType)"
 
-  partial def emitAlt (top : List Name) : Alt → String
+  partial def emitAlt (mm : List (Name × Name)) (top : List Name) : Alt → String
     | .mk con bndrs rhs =>
-      s!"| {emitAltPattern con bndrs} => {emitExpr top rhs}"
+      s!"| {emitAltPattern con bndrs} => {emitExpr mm top rhs}"
 
   /-- Emit a single `let rec` binding: peel lambdas into parameters and emit
       `let rec {id} {params} := {body}`. (Lean's `let rec` has no `decreasing_by`,
       so only structurally-decreasing recursion elaborates; non-structural local
       rec is a documented follow-up.) -/
-  partial def emitLetRecBinding (top : List Name) (v : Var) (e : Expr) : String :=
+  partial def emitLetRecBinding (mm : List (Name × Name)) (top : List Name) (v : Var) (e : Expr) : String :=
     let (params, body) := peelLamsLocal e
     let paramStr := String.intercalate " " (params.map (fun p => s!"({localId p})"))
     let head := if paramStr.isEmpty then s!"let rec {localId v} :="
                 else s!"let rec {localId v} {paramStr} :="
-    s!"{head} {emitExpr top body}"
+    s!"{head} {emitExpr mm top body}"
 
-  partial def emitLet (top : List Name) : Bind → String
+  partial def emitLet (mm : List (Name × Name)) (top : List Name) : Bind → String
     | .nonRec v e =>
       -- A `where`-style recursive helper can arrive tagged NonRec while its RHS
       -- references the binder. A plain Lean `let` can't self-reference, so route
       -- self-recursive NonRec bindings through `let rec` too.
-      if occursInExpr v.name e then emitLetRecBinding top v e
-      else s!"let {localId v} := {emitExpr top e}"
+      if occursInExpr v.name e then emitLetRecBinding mm top v e
+      else s!"let {localId v} := {emitExpr mm top e}"
     | .rec_ pairs =>
       -- Local recursion → `let rec`. Multiple bindings emit as consecutive lines.
-      String.intercalate "\n" (pairs.map (fun (v, e) => emitLetRecBinding top v e))
+      String.intercalate "\n" (pairs.map (fun (v, e) => emitLetRecBinding mm top v e))
 end
 
 /-! ## Def-header construction -/
@@ -341,7 +345,7 @@ private def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
 private def defNameId (v : Var) : String :=
   if isClassMethodName v.name then localId v else sanitize v.name
 
-private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
+private def emitDefHeader (mm : List (Name × Name)) (top : List Name) (v : Var) (args : List Var)
                           (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
   let name     := defNameId v
   let argTys   := headerArgTys args v.ty
@@ -359,7 +363,7 @@ private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
     else s!"\{{tv} : Type}"))
   let binders  := String.intercalate " " (List.filter (· != "") [implStr, argStr])
   let resStr   := emitType resTy
-  let body     := emitExpr top rhsBody
+  let body     := emitExpr mm top rhsBody
   let head     :=
     if binders.isEmpty then s!"def {name} : {resStr} :="
     else s!"def {name} {binders} : {resStr} :="
@@ -370,25 +374,25 @@ private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
 
 /-! ## Top-level binds -/
 
-private def emitBind (top : List Name) (b : Bind) : String :=
+private def emitBind (mm : List (Name × Name)) (top : List Name) (b : Bind) : String :=
   match b with
   | .nonRec v e =>
     let (args, body) := peelLams e
     let resTy        := stripFunTys args.length v.ty
     let rec?         := occursInExpr v.name e
-    emitDefHeader top v args resTy body rec?
+    emitDefHeader mm top v args resTy body rec?
   | .rec_ pairs =>
     match pairs with
     | [(v, e)] =>
       let (args, body) := peelLams e
       let resTy        := stripFunTys args.length v.ty
       let rec?         := occursInExpr v.name e
-      emitDefHeader top v args resTy body rec?
+      emitDefHeader mm top v args resTy body rec?
     | _        =>
       let defs := pairs.map fun (v, e) =>
         let (args, body) := peelLams e
         let resTy        := stripFunTys args.length v.ty
-        emitDefHeader top v args resTy body true
+        emitDefHeader mm top v args resTy body true
       let body := String.intercalate "\n" defs
       s!"mutual\n{body}\nend"
 
@@ -398,18 +402,18 @@ private def collectTopNames (p : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc
 
-def emitProgram (p : CoreProgram) : String :=
+def emitProgram (mm : List (Name × Name)) (p : CoreProgram) : String :=
   let top      := collectTopNames p
-  let bindStrs := p.map (emitBind top)
+  let bindStrs := p.map (emitBind mm top)
   String.intercalate "\n\n" bindStrs
 
 /-- Like `emitProgram`, but extends the "top-level names" set with extra
     names that should NOT get a `_unique` suffix when emitted as Var refs.
     The intended use is to splice in user-declared data constructors so
     `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
-def emitProgramWith (p : CoreProgram) (extraTopNames : List Name) : String :=
+def emitProgramWith (mm : List (Name × Name)) (p : CoreProgram) (extraTopNames : List Name) : String :=
   let top      := extraTopNames ++ collectTopNames p
-  let bindStrs := p.map (emitBind top)
+  let bindStrs := p.map (emitBind mm top)
   String.intercalate "\n\n" bindStrs
 
 /-! ## Data type declarations and instances -/
@@ -697,10 +701,12 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
     | .rec_ pairs =>
       let kept := pairs.filter (fun (v, _) => !isSuppressedMethod v)
       if kept.isEmpty then none else some (.rec_ kept)
+  -- Reconstruct user classes → method→class map for selector rewriting.
+  let (_userClasses, methodMap) := reconstructClasses p.binds p.instances
   let datas := p.typeDecls.map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
-  let binds := emitProgramWith keptBinds ctorNames
+  let binds := emitProgramWith methodMap keptBinds ctorNames
   let insts := p.instances.filterMap (emitInstance derivedEq p.binds)
   let bodyRaw :=
     (if binds.isEmpty then "" else binds)
