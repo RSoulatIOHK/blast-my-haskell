@@ -563,6 +563,13 @@ private partial def generalizeTy (headName tv : Name) : GHCType → GHCType
   | .forAll v b   => .forAll v (generalizeTy headName tv b)
   | t             => t
 
+/-- Built-in classes handled elsewhere (Eq→BEq, Ord→deriving, Show skipped) or
+    with no Lean image — never reconstructed as user classes. -/
+private def builtinClasses : List Name :=
+  ["Eq", "Ord", "Show", "Read", "Num", "Integral", "Real", "Fractional",
+   "Floating", "Enum", "Bounded", "Functor", "Applicative", "Monad",
+   "Foldable", "Traversable", "Semigroup", "Monoid"]
+
 /-- Reconstruct `ClassDecl`s + a `(method, class)` map from the program's
     instance dict-builders (which reference their `$c<method>` bindings) and the
     `$c<method>` binding types (generalized to the class parameter). No GHC-plugin
@@ -571,6 +578,7 @@ def reconstructClasses (binds : CoreProgram) (insts : List Instance)
     : List ClassDecl × List (Name × Name) :=
   let tv := "a"
   let perInstance (i : Instance) : Option (ClassDecl × List (Name × Name)) := do
+    if builtinClasses.contains i.className then none else
     let (_, dfunRhs) ← findBind binds i.dfunName
     let headName ← match i.headTypes.head? with | some (.tyCon n _) => some n | _ => none
     let cmethods := (collectCMethodRefs dfunRhs).eraseDups
@@ -742,19 +750,32 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
       if kept.isEmpty then none else some (.rec_ kept)
   -- Reconstruct user classes → class decls + method→class map (selector rewrite).
   let (userClasses, methodMap) := reconstructClasses p.binds p.instances
+  let classNames := userClasses.map (·.name)
   let datas := p.typeDecls.map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
-  let classNames := userClasses.map (·.name)
-  let binds := emitProgramWith methodMap classNames keptBinds ctorNames
+  let classDecls := userClasses.map emitClassDecl
+  -- Partition kept binds for forward-visibility-safe ordering. Drop instance
+  -- dict-builders (`$f…`) and Typeable junk; `$c…` method defs precede the
+  -- instances (which reference them) which precede user binds (which use the
+  -- instances). Classes go in the data block (before everything).
+  let bindHeadName : Bind → Name
+    | .nonRec v _ => v.name
+    | .rec_ ps    => (ps.head?.map (·.1.name)).getD ""
+  let isJunkName (n : Name) : Bool :=
+    n.startsWith "$f" || n.startsWith "$tc" || n.startsWith "$tr" || n.startsWith "$kr"
+  let methodDefs := keptBinds.filter (fun b => (bindHeadName b).startsWith "$c")
+  let userBinds  := keptBinds.filter (fun b =>
+    let n := bindHeadName b; !(n.startsWith "$c") && !(isJunkName n))
+  let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames
+  let userStr   := emitProgramWith methodMap classNames userBinds ctorNames
   let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
-  let bodyRaw :=
-    (if binds.isEmpty then "" else binds)
-      ++ (if insts.isEmpty then "" else "\n\n" ++ String.intercalate "\n\n" insts)
+  let instStr := String.intercalate "\n\n" insts
+  let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
                     |> resolveUserCtors p.typeDecls
   let dataBlock :=
-    if datas.isEmpty then "" else String.intercalate "\n\n" datas
+    String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
   -- External-type resolution runs over the whole output (data fields included);
   -- it only rewrites imported types, so local inductive names are untouched.

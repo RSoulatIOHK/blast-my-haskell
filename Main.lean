@@ -18,20 +18,18 @@ private def isGhcRuntimePlumbing (name : Name) : Bool :=
   name.startsWith "$cshow"  ||
   name.startsWith "$sshow"
 
-/-- The `$f<Class><Type>` bindings are instance dictionary literals — their
-    rhs is the dict-constructor applied to the methods. We surface instances
-    via the `instances` section of the JSON instead. -/
-private def isInstanceDictBinding (name : Name) : Bool :=
-  name.startsWith "$f"
-
 /-- Default-method bindings GHC auto-derives. `$c/=` is `not ∘ (==)` — we
     don't need it (BEq supplies bne automatically) and emitting it creates a
     circular dependency on the BEq instance we're about to define. -/
 private def isAutoDerivedDefault (name : Name) : Bool :=
   name == "$c/="
 
+/-- NOTE: `$f<Class><Type>` instance dict-builders are NOT dropped here — they
+    reach `emitFullProgram`, which reads their bodies to reconstruct user-class
+    declarations and then suppresses them from emission (they have no Lean
+    image). `$fShow*` is still dropped above via `isGhcRuntimePlumbing`. -/
 private def shouldDrop (n : Name) : Bool :=
-  isGhcRuntimePlumbing n || isInstanceDictBinding n || isAutoDerivedDefault n
+  isGhcRuntimePlumbing n || isAutoDerivedDefault n
 
 /-- Filter bindings, including splitting `Rec` groups: if a Rec lumps
     together a dict literal and a method, drop the dict half and keep the
@@ -51,7 +49,9 @@ private def topBinderNames (prog : CoreProgram) : List Name :=
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc).reverse
 
 private def emitNamesCrib (prog : Program) : String :=
-  let names := topBinderNames prog.binds
+  -- `$f` dict-builders survive into emitFullProgram (for class reconstruction)
+  -- but are suppressed from emission; keep them out of the crib too.
+  let names := (topBinderNames prog.binds).filter (fun n => !n.startsWith "$f")
   if names.isEmpty && prog.typeDecls.isEmpty && prog.instances.isEmpty then ""
   else
     let bindLines := names.map fun n =>
