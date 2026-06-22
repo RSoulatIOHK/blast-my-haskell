@@ -187,9 +187,14 @@ Development Host.)
   `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` would be
   modeled structurally (a known limitation). `Show`/`Read` are skipped
   (derived `Repr` prints counterexamples).
+- User-defined single-parameter type classes transpile: `class C a where …`
+  → Lean `class`, instances → Lean `instance`, `C a =>` constraints →
+  instance-implicit `[C a]`, and method calls → `C.method` — all reconstructed
+  from Core (no GHC-plugin changes). Not yet: superclasses, multi-parameter
+  classes, default methods, methods whose signature doesn't mention the class
+  parameter, and same-named methods across classes.
 - Not yet supported: 3-tuple *construction* (type and pattern work; a
-  constructed 3-tuple is a loud compile error), Haskell list-literal syntax
-  (`[a, b, c]` desugars to `GHC.Base.build`), and user-defined type classes /
-  dictionary passing.
+  constructed 3-tuple is a loud compile error), and Haskell list-literal syntax
+  (`[a, b, c]` desugars to `GHC.Base.build`).
   Theorems over lists/recursion need a user-written `induction` proof — bare
   `by blaster` (SMT) discharges only quantifier-free arithmetic goals.
