@@ -9,3 +9,4 @@ import GhcCoreToLean.Spike.Fib
 import GhcCoreToLean.Spike.FibEmitted
 import GhcCoreToLean.Spike.FibFromShim
 import GhcCoreToLean.Spike.FibComplexFromShim
+import GhcCoreToLean.Tests.Unit

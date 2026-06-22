@@ -163,8 +163,38 @@ Development Host.)
 
 - Pinned to GHC 9.2.7 (the Core dump format and plugin API are version-specific)
   and Lean `v4.24.0`.
-- The pipeline consumes the `pass-0000` (desugarer) Core; later optimizer passes
-  introduce primops the lowering doesn't handle.
-- Partial functions (`error`) lower to Lean `default` (a total, sound bottom),
-  so proofs that reduce through them stay sound; properties should carry the
-  preconditions that rule the error branch out.
+- The pipeline consumes the `pass-0000` (desugarer) Core. Common unboxed
+  `Int#` primops are mapped; exotic primops (string/array/IO) are not.
+- Mapped `base` surface: arithmetic (`+ - * negate abs signum`),
+  integral (`quot rem div mod divMod quotRem gcd lcm fromIntegral fromInteger`),
+  comparison/`Ord` (`== /= < <= > >= min max compare`/`Ordering`), booleans
+  (`&& || not otherwise`), combinators (`id . const flip $`), the total list
+  library (`++ map filter foldr foldl length reverse null`), 2-tuples
+  (`fst snd`, construction, patterns), and `Maybe`/`Either` eliminators
+  (`maybe fromMaybe isJust isNothing either`). Local recursive `where`/`let`
+  helpers emit as Lean `let rec` (structural recursion only).
+- `error`/`undefined` are ⊥ on their whole domain, so they lower to Lean
+  `default` (a total, sound bottom). The partial list/Maybe functions
+  (`head`, `tail`, `init`, `last`, `!!`, `fromJust`) are ⊥ *only* on the
+  empty list / `Nothing`, so they lower to Lean's total `*D`/`getD` forms:
+  faithful on their defined domain (`head [1,2,3] = 1`) and `default` exactly
+  where Haskell is ⊥. Either way, properties should carry the preconditions
+  that rule the ⊥ branch out (partial-correctness modeling).
+- Instances: hand-written `Eq` translates to `BEq` from its body (so
+  non-structural equality like Ratio's cross-multiply is preserved); derived
+  `Eq`/`Ord` are reconstructed via Lean `deriving DecidableEq, Ord` plus
+  `LE`/`LT`/`Min`/`Max`, so user types with `deriving (Eq, Ord)` support
+  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` would be
+  modeled structurally (a known limitation). `Show`/`Read` are skipped
+  (derived `Repr` prints counterexamples).
+- User-defined single-parameter type classes transpile: `class C a where …`
+  → Lean `class`, instances → Lean `instance`, `C a =>` constraints →
+  instance-implicit `[C a]`, and method calls → `C.method` — all reconstructed
+  from Core (no GHC-plugin changes). Not yet: superclasses, multi-parameter
+  classes, default methods, methods whose signature doesn't mention the class
+  parameter, and same-named methods across classes.
+- Not yet supported: 3-tuple *construction* (type and pattern work; a
+  constructed 3-tuple is a loud compile error), and Haskell list-literal syntax
+  (`[a, b, c]` desugars to `GHC.Base.build`).
+  Theorems over lists/recursion need a user-written `induction` proof — bare
+  `by blaster` (SMT) discharges only quantifier-free arithmetic goals.

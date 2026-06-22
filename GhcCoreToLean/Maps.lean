@@ -41,6 +41,90 @@ def valueMap : String → Option String
   -- to Lean's Bool literals so dict-method bodies like `$c/=` compile.
   | "GHC.Types.True"       => some "true"
   | "GHC.Types.False"      => some "false"
+  -- List library (total). Haskell `++`/`map`/… map directly to Lean `List.*`.
+  -- `foldr`/`foldl` are eta-wrapped so their Haskell arg order (f, z, xs) is
+  -- pinned explicitly. As with `min`/`max` above, bare *alphabetic* forms are
+  -- intentionally omitted: a user's own top-level `map`/`filter`/`length`/… def
+  -- is a bare Core name and must keep resolving to that local def, not be
+  -- hijacked here. Core qualifies these names anyway, so nothing is lost. Bare
+  -- *operator* forms (`++`, `&&`, …) stay, since users can't shadow them.
+  | "GHC.Base.++"      | "++"      => some "List.append"
+  | "GHC.Base.map"                => some "List.map"
+  | "GHC.List.filter"             => some "List.filter"
+  | "GHC.List.reverse"            => some "List.reverse"
+  -- Foldable methods (post-FTP). The desugarer resolves these through
+  -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
+  -- mapping fires regardless of which name appears.
+  -- Haskell `length` returns `Int`; Lean `List.length` returns `Nat`. Coerce
+  -- to `Int` (like `gcd`/`lcm`) so it composes with Int arithmetic.
+  | "Data.Foldable.length" | "GHC.List.length"  => some "(fun xs => (List.length xs : Int))"
+  | "Data.Foldable.null"   | "GHC.List.null"    => some "List.isEmpty"
+  | "Data.Foldable.foldr"  | "GHC.List.foldr"   => some "(fun f z xs => List.foldr f z xs)"
+  | "Data.Foldable.foldl"  | "GHC.List.foldl"   => some "(fun f z xs => List.foldl f z xs)"
+  -- Boolean / Prelude combinators.
+  | "GHC.Classes.&&"   | "&&"      => some "(· && ·)"
+  | "GHC.Classes.||"   | "||"      => some "(· || ·)"
+  | "GHC.Classes.not"             => some "not"
+  | "GHC.Base.const"              => some "(Function.const _)"
+  | "GHC.Base.flip"               => some "(fun f a b => f b a)"
+  | "GHC.Base.$"       | "$"       => some "(fun f x => f x)"
+  | "GHC.Base.otherwise"          => some "true"
+  -- Partial functions. Haskell `head`/`last`/`!!`/`fromJust` are ⊥ ONLY on the
+  -- empty list / `Nothing`; they are faithful on the rest of their domain. So
+  -- they must NOT collapse to `default` everywhere (that breaks the defined
+  -- domain, e.g. `head [1,2,3]`). We map to Lean's total `*D`/`getD` forms:
+  -- faithful where Haskell is defined, and `default` (an arbitrary inhabitant)
+  -- exactly where Haskell is ⊥ — the documented partial-correctness tradeoff.
+  -- `default` needs `[Inhabited t]`, which `emitDefHeader` adds for polymorphic
+  -- defs (Emit recognises these names via `isPartialDefaultName`). `tail`/`init`
+  -- map to Lean totals that need no default. Qualified only (don't shadow a
+  -- user's own `head`/`tail`/… def).
+  | "GHC.List.head"       => some "(fun xs => xs.headD default)"
+  | "GHC.List.tail"       => some "List.tail"
+  | "GHC.List.init"       => some "List.dropLast"
+  | "GHC.List.last"       => some "(fun xs => xs.getLastD default)"
+  | "GHC.List.!!"         => some "(fun xs i => xs.getD i.toNat default)"
+  | "Data.Maybe.fromJust" => some "(fun m => m.getD default)"
+  -- Tuple projections. Qualified only (a user could define `fst`/`snd`); the
+  -- desugarer resolves these through `Data.Tuple.*`.
+  | "Data.Tuple.fst"              => some "Prod.fst"
+  | "Data.Tuple.snd"              => some "Prod.snd"
+  -- Num / Integral / Ord completion. Qualified names only (no bare alphabetic
+  -- forms), so a user's own `signum`/`divMod`/… top-level def is not hijacked.
+  -- Integer/Int are both Lean `Int`, so the coercion methods are identities.
+  | "GHC.Num.fromInteger"   => some "id"
+  | "GHC.Real.toInteger"    => some "id"
+  | "GHC.Real.fromIntegral" => some "id"
+  | "GHC.Num.signum"        => some "(fun a => if a < 0 then -1 else if a > 0 then 1 else 0)"
+  -- divMod floors (fdiv/fmod); quotRem truncates (tdiv/tmod). Returns a pair.
+  | "GHC.Real.divMod"       => some "(fun a b => (Int.fdiv a b, Int.fmod a b))"
+  | "GHC.Real.quotRem"      => some "(fun a b => (Int.tdiv a b, Int.tmod a b))"
+  -- Lean `Int.gcd`/`Int.lcm` return `Nat`; Haskell returns the numeric type.
+  | "GHC.Real.gcd"          => some "(fun a b => (Int.gcd a b : Int))"
+  | "GHC.Real.lcm"          => some "(fun a b => (Int.lcm a b : Int))"
+  | "GHC.Classes.compare"   => some "compare"
+  -- Unboxed Int# primops. Arithmetic maps to boxed ops (I#/Int# both → Int);
+  -- comparisons mirror the GHC.Classes.* `decide`-wrapped Bool forms.
+  | "GHC.Prim.+#"  => some "(· + ·)"
+  | "GHC.Prim.-#"  => some "(· - ·)"
+  | "GHC.Prim.*#"  => some "(· * ·)"
+  | "GHC.Prim.==#" => some "(· == ·)"
+  | "GHC.Prim./=#" => some "(fun a b => !(a == b))"
+  | "GHC.Prim.<#"  => some "(fun a b => decide (a < b))"
+  | "GHC.Prim.<=#" => some "(fun a b => decide (a ≤ b))"
+  | "GHC.Prim.>#"  => some "(fun a b => decide (a > b))"
+  | "GHC.Prim.>=#" => some "(fun a b => decide (a ≥ b))"
+  -- Maybe/Either eliminators (total). Confirmed v4.24.0 signatures:
+  --   `Option.elim : Option α → β → (α → β) → β`   (scrutinee FIRST), so
+  --   Haskell `maybe d f m` ≡ `Option.elim m d f`.
+  --   `Sum.elim : (α → γ) → (β → γ) → α ⊕ β → γ`   (scrutinee LAST), so
+  --   Haskell `either f g e` ≡ `Sum.elim f g e`.
+  --   `fromMaybe d m` ≡ `Option.getD m d`.
+  | "GHC.Maybe.maybe"      => some "(fun d f m => Option.elim m d f)"
+  | "Data.Maybe.fromMaybe" => some "(fun d m => Option.getD m d)"
+  | "Data.Maybe.isJust"    => some "Option.isSome"
+  | "Data.Maybe.isNothing" => some "Option.isNone"
+  | "Data.Either.either"   => some "(fun f g e => Sum.elim f g e)"
   | _                      => none
 
 /-- GHC type constructor name + args → Lean type expression (as a string,
@@ -62,6 +146,14 @@ def typeConMap : String → List String → Option String
   | "[]",      [a]    => some s!"List {a}"
   | "Maybe",   [a]    => some s!"Option {a}"
   | "Either",  [a, b] => some s!"Sum {a} {b}"
+  -- Tuples. Lean's `×` is right-nested: `a × b × c = a × (b × c)`. Both the
+  -- bare GHC tycon `(,)` (what the shim emits inside `tyConOpaque`) and any
+  -- qualified form resolve here.
+  | "(,)",   [a, b]    => some s!"({a} × {b})"
+  | "GHC.Tuple.(,)", [a, b] => some s!"({a} × {b})"
+  | "(,,)",  [a, b, c] => some s!"({a} × {b} × {c})"
+  | "GHC.Tuple.(,,)", [a, b, c] => some s!"({a} × {b} × {c})"
+  | "Ordering", []    => some "Ordering"
   | _,         _      => none
 
 /-- GHC data constructor → Lean constructor reference. Both bare and
@@ -74,6 +166,18 @@ def dataConMap : String → Option String
   | "True"    => some "Bool.true"
   | "False"   => some "Bool.false"
   | "()"      => some "Unit.unit"
+  -- 2-tuple construction → `Prod.mk a b`. Both the bare pattern-position name
+  -- `(,)` and the qualified value-position name `GHC.Tuple.(,)` resolve here.
+  -- NOTE: 3-tuple construction is intentionally NOT mapped: `Prod.mk` is binary,
+  -- and `emitExpr` left-applies, so `(,,) a b c` would emit `((Prod.mk a) b) c`,
+  -- which is ill-typed. Tracked as a follow-up (see TupleBasics report). The
+  -- type (`a × b × c`) and pattern (`(x, y, z)`) paths DO support 3-tuples.
+  | "(,)"     | "GHC.Tuple.(,)" => some "Prod.mk"
+  -- Ordering constructors. Core delivers the qualified `GHC.Types.*` forms
+  -- (confirmed via Generated/NumOrd.lean); bare forms kept as a hedge.
+  | "LT" | "GHC.Types.LT" => some "Ordering.lt"
+  | "EQ" | "GHC.Types.EQ" => some "Ordering.eq"
+  | "GT" | "GHC.Types.GT" => some "Ordering.gt"
   | _         => none
 
 /-- Transparent unwrapping data constructors: I#, W#, C# (and module-qualified variants).

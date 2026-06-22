@@ -126,9 +126,13 @@ def emitLiteralPattern : Literal → String
 
 /-! ## Var emission -/
 
-/-- Map a Var reference. Mapped value-map hits short-circuit; top-level
-    refs use bare names; locals get unique-suffixed. -/
-def emitVar (topNames : List Name) (v : Var) : String :=
+/-- Map a Var reference. A class-method selector (in `methodMap`) emits
+    `Class.method`; otherwise value-map hits short-circuit; top-level refs use
+    bare names; locals get unique-suffixed. -/
+def emitVar (methodMap : List (Name × Name)) (topNames : List Name) (v : Var) : String :=
+  match methodMap.find? (·.1 == v.name) with
+  | some (_, cls) => s!"{sanitize cls}.{sanitize v.name}"
+  | none      =>
   match valueMap v.name with
   | some lean => lean
   | none      =>
@@ -152,11 +156,19 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
   | .default      => "_"
   | .litAlt l     => emitLiteralPattern l
   | .dataCon name =>
-    let resolved := (dataConMap name).getD (sanitize name)
-    if bndrs.isEmpty then resolved
+    -- Tuple patterns use Lean's anonymous-tuple syntax `(x, y, …)`, which
+    -- right-nests for any arity (so 3-tuples are fine here). The pattern-
+    -- position ctor name is bare `(,)`/`(,,)`; qualified forms covered too.
+    if name == "(,)" || name == "(,,)"
+       || name == "GHC.Tuple.(,)" || name == "GHC.Tuple.(,,)" then
+      let bs := String.intercalate ", " (bndrs.map localId)
+      s!"({bs})"
     else
-      let bs := String.intercalate " " (bndrs.map localId)
-      s!"{resolved} {bs}"
+      let resolved := (dataConMap name).getD (sanitize name)
+      if bndrs.isEmpty then resolved
+      else
+        let bs := String.intercalate " " (bndrs.map localId)
+        s!"{resolved} {bs}"
 
 /-! ## Bottoms (error / undefined) -/
 
@@ -174,6 +186,18 @@ private def isBottomName : Name → Bool
   | "GHC.Err.undefined" | "undefined" => true
   | _ => false
 
+/-- Partial functions whose *faithful* `valueMap` image uses `default` on the
+    ⊥ part of their domain (`head`/`last`/`!!`/`fromJust`). They are NOT bottoms
+    — they do not collapse to `default` everywhere (that would be unsound on the
+    defined domain, e.g. `head [1,2,3]`). But because their emitted term mentions
+    `default`, a polymorphic def using one needs an `[Inhabited t]` binder, so
+    `exprHasBottom` must see through to them. (`tail`→`List.tail` and
+    `init`→`List.dropLast` are total with no `default`, so they're not listed.) -/
+private def isPartialDefaultName : Name → Bool
+  | "GHC.List.head" | "GHC.List.last" | "GHC.List.!!"
+  | "Data.Maybe.fromJust" => true
+  | _ => false
+
 private partial def appHeadName : Expr → Option Name
   | .var v   => some v.name
   | .app f _ => appHeadName f
@@ -181,14 +205,18 @@ private partial def appHeadName : Expr → Option Name
   | .tick e  => appHeadName e
   | _        => none
 
-/-- Does any subexpression apply a bottom (`error`/`undefined`)? Used to decide
-    whether a def's polymorphic result needs an `[Inhabited t]` binder so the
-    emitted `default` elaborates. -/
+/-- Does any subexpression emit a `default`? True for an applied bottom
+    (`error`/`undefined`) or an applied partial whose faithful image uses
+    `default` (`head`/`last`/`!!`/`fromJust`). Used to decide whether a def's
+    polymorphic result needs an `[Inhabited t]` binder so the emitted `default`
+    elaborates. -/
 private partial def exprHasBottom : Expr → Bool
   | .var _   => false
   | .lit _   => false
   | .app f a =>
-    (match appHeadName f with | some n => isBottomName n | none => false)
+    (match appHeadName f with
+     | some n => isBottomName n || isPartialDefaultName n
+     | none   => false)
       || exprHasBottom f || exprHasBottom a
   | .lam _ b => exprHasBottom b
   | .let_ b body =>
@@ -202,43 +230,73 @@ private partial def exprHasBottom : Expr → Bool
   | .tick e  => exprHasBottom e
   | _        => false
 
+/-- Peel leading lambdas off an expression, returning the binders and body.
+    Hoisted above the emission mutual block so `emitLet` can use it (the other
+    `peelLams` lives after the block and is not visible here). -/
+private partial def peelLamsLocal : Expr → List Var × Expr
+  | .lam v body =>
+    let (vs, b) := peelLamsLocal body
+    (v :: vs, b)
+  | other       => ([], other)
+
 /-! ## Expr emission -/
 
 mutual
-  partial def emitExpr (top : List Name) : Expr → String
-    | .var v   => emitVar top v
+  partial def emitExpr (mm : List (Name × Name)) (top : List Name) : Expr → String
+    | .var v   => emitVar mm top v
     | .lit l   => emitLiteral l
     | .app f a =>
       match appHeadName f with
       | some n => if isBottomName n then "default"
-                  else s!"({emitExpr top f}) ({emitExpr top a})"
-      | none   => s!"({emitExpr top f}) ({emitExpr top a})"
+                  else s!"({emitExpr mm top f}) ({emitExpr mm top a})"
+      | none   => s!"({emitExpr mm top f}) ({emitExpr mm top a})"
     | .lam v body =>
-      s!"(fun {localId v} => {emitExpr top body})"
+      s!"(fun {localId v} => {emitExpr mm top body})"
     | .let_ b body =>
-      s!"({emitLet top b}\n{emitExpr top body})"
-    | .case_ scr _cb _ty alts =>
+      s!"({emitLet mm top b}\n{emitExpr mm top body})"
+    | .case_ scr cb _ty alts =>
       let alts'   := reorderAlts alts
-      let altsStr := alts'.map (emitAlt top)
-      let header  := s!"(match {emitExpr top scr} with"
+      let altsStr := alts'.map (emitAlt mm top)
+      let scrStr  := emitExpr mm top scr
       let body    := String.intercalate "\n" altsStr
-      s!"{header}\n{body})"
-    | .cast e  => emitExpr top e
-    | .tick e  => emitExpr top e
+      -- GHC binds the case binder to the scrutinee; alts may reference it.
+      -- When used, bind it once and match *on the binder* — single evaluation
+      -- of the scrutinee, matching Core's semantics. When unused, match the
+      -- scrutinee directly.
+      let usesCb  := alts.any (fun (.mk _ _ r) => occursInExpr cb.name r)
+      if usesCb then
+        s!"(let {localId cb} := {scrStr}\n(match {localId cb} with\n{body}))"
+      else
+        s!"(match {scrStr} with\n{body})"
+    | .cast e  => emitExpr mm top e
+    | .tick e  => emitExpr mm top e
     | .type_ _ => "(GHCCore.typeArg : GHCCore.GHCType)"
 
-  partial def emitAlt (top : List Name) : Alt → String
+  partial def emitAlt (mm : List (Name × Name)) (top : List Name) : Alt → String
     | .mk con bndrs rhs =>
-      s!"| {emitAltPattern con bndrs} => {emitExpr top rhs}"
+      s!"| {emitAltPattern con bndrs} => {emitExpr mm top rhs}"
 
-  partial def emitLet (top : List Name) : Bind → String
+  /-- Emit a single `let rec` binding: peel lambdas into parameters and emit
+      `let rec {id} {params} := {body}`. (Lean's `let rec` has no `decreasing_by`,
+      so only structurally-decreasing recursion elaborates; non-structural local
+      rec is a documented follow-up.) -/
+  partial def emitLetRecBinding (mm : List (Name × Name)) (top : List Name) (v : Var) (e : Expr) : String :=
+    let (params, body) := peelLamsLocal e
+    let paramStr := String.intercalate " " (params.map (fun p => s!"({localId p})"))
+    let head := if paramStr.isEmpty then s!"let rec {localId v} :="
+                else s!"let rec {localId v} {paramStr} :="
+    s!"{head} {emitExpr mm top body}"
+
+  partial def emitLet (mm : List (Name × Name)) (top : List Name) : Bind → String
     | .nonRec v e =>
-      s!"let {localId v} := {emitExpr top e}"
+      -- A `where`-style recursive helper can arrive tagged NonRec while its RHS
+      -- references the binder. A plain Lean `let` can't self-reference, so route
+      -- self-recursive NonRec bindings through `let rec` too.
+      if occursInExpr v.name e then emitLetRecBinding mm top v e
+      else s!"let {localId v} := {emitExpr mm top e}"
     | .rec_ pairs =>
-      let lines := pairs.map fun (v, e) =>
-        s!"  {localId v} := {emitExpr top e}"
-      let body := String.intercalate "\n" lines
-      s!"-- TODO: local Rec let unsupported, emitted as opaque\n{body}"
+      -- Local recursion → `let rec`. Multiple bindings emit as consecutive lines.
+      String.intercalate "\n" (pairs.map (fun (v, e) => emitLetRecBinding mm top v e))
 end
 
 /-! ## Def-header construction -/
@@ -248,6 +306,21 @@ private partial def peelLams : Expr → List Var × Expr
     let (vs, b) := peelLams body
     (v :: vs, b)
   | other       => ([], other)
+
+/-- Peel leading class-constraint arrows (`C t → …` where `C ∈ classNames`) off a
+    def signature, returning the `[C t]` instance-implicit binder strings and the
+    remaining (constraint-stripped) type. `∀`-binders are skipped (their tyvars
+    are handled by `collectTyVars`). The term-level dict binder is already erased
+    by `Lower`, so stripping the dict arrow from the *type* realigns the value
+    args / result with the term binders. Stops at the first non-constraint arrow. -/
+private partial def stripClassConstraints (classNames : List Name) : GHCType → List String × GHCType
+  | .forAll _ b => stripClassConstraints classNames b
+  | .tyFun (.tyCon c [.tyVar t]) r =>
+    if classNames.contains c then
+      let (cs, rest) := stripClassConstraints classNames r
+      (s!"[{sanitize c} {tyVarId t}]" :: cs, rest)
+    else ([], .tyFun (.tyCon c [.tyVar t]) r)
+  | t => ([], t)
 
 private partial def stripFunTys : Nat → GHCType → GHCType
   | 0,     t            => t
@@ -287,10 +360,15 @@ private def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
 private def defNameId (v : Var) : String :=
   if isClassMethodName v.name then localId v else sanitize v.name
 
-private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
+private def emitDefHeader (mm : List (Name × Name)) (classNames : List Name) (top : List Name)
+                          (v : Var) (args : List Var)
                           (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
   let name     := defNameId v
-  let argTys   := headerArgTys args v.ty
+  -- Strip class-constraint arrows (`C a =>`) from the signature → `[C a]`
+  -- instance-implicit binders; the remaining type aligns with the term binders
+  -- (the dict term-binder is already erased by Lower).
+  let (constraints, strippedTy) := stripClassConstraints classNames v.ty
+  let argTys   := headerArgTys args strippedTy
   let argStrs  := (args.zip argTys).map (fun (a, t) => s!"({localId a} : {emitType t})")
   let argStr   := String.intercalate " " argStrs
   -- Implicit `{t : Type}` binders for every free type variable in the
@@ -303,9 +381,10 @@ private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
     let tv := tyVarId t
     if needInhab then s!"\{{tv} : Type} [Inhabited {tv}]"
     else s!"\{{tv} : Type}"))
-  let binders  := String.intercalate " " (List.filter (· != "") [implStr, argStr])
+  let constraintStr := String.intercalate " " constraints
+  let binders  := String.intercalate " " (List.filter (· != "") [implStr, constraintStr, argStr])
   let resStr   := emitType resTy
-  let body     := emitExpr top rhsBody
+  let body     := emitExpr mm top rhsBody
   let head     :=
     if binders.isEmpty then s!"def {name} : {resStr} :="
     else s!"def {name} {binders} : {resStr} :="
@@ -316,25 +395,29 @@ private def emitDefHeader (top : List Name) (v : Var) (args : List Var)
 
 /-! ## Top-level binds -/
 
-private def emitBind (top : List Name) (b : Bind) : String :=
+def emitBind (mm : List (Name × Name)) (classNames : List Name) (top : List Name) (b : Bind) : String :=
+  -- Result type is computed from the constraint-stripped signature so the
+  -- erased dict arrow isn't mistaken for a value arg.
+  let resTyOf (v : Var) (nargs : Nat) : GHCType :=
+    stripFunTys nargs (stripClassConstraints classNames v.ty).2
   match b with
   | .nonRec v e =>
     let (args, body) := peelLams e
-    let resTy        := stripFunTys args.length v.ty
+    let resTy        := resTyOf v args.length
     let rec?         := occursInExpr v.name e
-    emitDefHeader top v args resTy body rec?
+    emitDefHeader mm classNames top v args resTy body rec?
   | .rec_ pairs =>
     match pairs with
     | [(v, e)] =>
       let (args, body) := peelLams e
-      let resTy        := stripFunTys args.length v.ty
+      let resTy        := resTyOf v args.length
       let rec?         := occursInExpr v.name e
-      emitDefHeader top v args resTy body rec?
+      emitDefHeader mm classNames top v args resTy body rec?
     | _        =>
       let defs := pairs.map fun (v, e) =>
         let (args, body) := peelLams e
-        let resTy        := stripFunTys args.length v.ty
-        emitDefHeader top v args resTy body true
+        let resTy        := resTyOf v args.length
+        emitDefHeader mm classNames top v args resTy body true
       let body := String.intercalate "\n" defs
       s!"mutual\n{body}\nend"
 
@@ -344,18 +427,18 @@ private def collectTopNames (p : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc
 
-def emitProgram (p : CoreProgram) : String :=
+def emitProgram (mm : List (Name × Name)) (classNames : List Name) (p : CoreProgram) : String :=
   let top      := collectTopNames p
-  let bindStrs := p.map (emitBind top)
+  let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
 
 /-- Like `emitProgram`, but extends the "top-level names" set with extra
     names that should NOT get a `_unique` suffix when emitted as Var refs.
     The intended use is to splice in user-declared data constructors so
     `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
-def emitProgramWith (p : CoreProgram) (extraTopNames : List Name) : String :=
+def emitProgramWith (mm : List (Name × Name)) (classNames : List Name) (p : CoreProgram) (extraTopNames : List Name) : String :=
   let top      := extraTopNames ++ collectTopNames p
-  let bindStrs := p.map (emitBind top)
+  let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
 
 /-! ## Data type declarations and instances -/
@@ -366,7 +449,7 @@ def emitProgramWith (p : CoreProgram) (extraTopNames : List Name) : String :=
     body post-passes rewrite Haskell-style refs to the qualified `T.C` form.
     Field selectors GHC auto-generates are emitted alongside as regular
     defs. -/
-def emitDataDecl (d : DataDecl) : String :=
+def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
   let leanName := sanitize d.name
   let ctorLines := d.ctors.map fun c =>
     let argTys := c.fields.map (emitType ·.ty)
@@ -374,21 +457,152 @@ def emitDataDecl (d : DataDecl) : String :=
     s!"  | {sanitize c.name} : {arrows}"
   let body := String.intercalate "\n" ctorLines
   -- `Inhabited` so emitted `default` bottoms whose result is this type elaborate.
-  s!"inductive {leanName} where\n{body}\nderiving Repr, Inhabited"
+  -- A *derived* Eq/Ord (whose GHC `$c==`/`$ccompare` body uses untranslatable
+  -- tag primops) is reconstructed structurally here via Lean `deriving`, which
+  -- matches GHC's derived semantics. `Ord` additionally needs `LE`/`LT`/`Min`/
+  -- `Max` (Lean's `Ord` doesn't supply them) so the transpiler's lowered
+  -- `decide (a ≤ b)` / `Min.min` / … resolve.
+  let derivs := "Repr, Inhabited"
+    ++ (if derivedEq || hasOrd then ", DecidableEq" else "")
+    ++ (if hasOrd then ", Ord" else "")
+  let ordInsts :=
+    if hasOrd then
+      s!"\n\ninstance : LE {leanName} := leOfOrd\ninstance : LT {leanName} := ltOfOrd"
+        ++ s!"\ninstance : Min {leanName} := minOfLe\ninstance : Max {leanName} := maxOfLe"
+    else ""
+  s!"inductive {leanName} where\n{body}\nderiving {derivs}{ordInsts}"
+
+/-- Emit a single-parameter user class as a Lean `class`. -/
+def emitClassDecl (c : ClassDecl) : String :=
+  let methodLines := c.methods.map fun m =>
+    s!"  {sanitize m.name} : {emitType m.ty}"
+  s!"class {sanitize c.name} ({tyVarId c.tyVar} : Type) where\n" ++
+    String.intercalate "\n" methodLines
 
 private partial def firstValArgTy : GHCType → Option GHCType
   | .forAll _ b => firstValArgTy b
   | .tyFun a _  => some a
   | _           => none
 
-/-- Find the `$c==` binding belonging to the instance whose head type matches,
-    returning its emitted (unique-suffixed) def name. Multiple `Eq` instances
-    each produce a `$c==` binding; they collide after sanitization, so the def
-    names are unique-suffixed (see `defNameId`) and we disambiguate here by
-    matching the method's first argument type against the instance head. -/
-private def findEqMethod (binds : CoreProgram) (headTyStr : String) : Option String :=
+/-- Does the expression reference a constructor-tag primop (`dataToTag#` /
+    `tagToEnum#`)? Such a body is a GHC *derived* Eq/Ord we cannot translate —
+    those types are routed through Lean `deriving` instead. Hand-written
+    instances (e.g. Ratio's cross-multiply `==`) never use these primops, so
+    they keep their normal body-translation. -/
+private partial def usesTagPrim : Expr → Bool
+  | .var v       => v.name.endsWith "dataToTag#" || v.name.endsWith "tagToEnum#"
+  | .lit _       => false
+  | .app f a     => usesTagPrim f || usesTagPrim a
+  | .lam _ b     => usesTagPrim b
+  | .let_ bnd b  =>
+    (match bnd with
+     | .nonRec _ e => usesTagPrim e
+     | .rec_ ps    => ps.any (fun p => usesTagPrim p.2))
+      || usesTagPrim b
+  | .case_ s _ _ alts =>
+    usesTagPrim s || alts.any (fun (.mk _ _ r) => usesTagPrim r)
+  | .cast e      => usesTagPrim e
+  | .tick e      => usesTagPrim e
+  | .type_ _     => false
+
+/-- Class-method binder names, by class. Used both to detect derived instances
+    and to suppress their (untranslatable) method defs. -/
+private def eqMethodNames  : List Name := ["$c==", "$c/="]
+private def ordMethodNames : List Name := ["$ccompare", "$c<", "$c<=", "$c>", "$c>=", "$cmax", "$cmin"]
+
+/-- Head-type string of a class-method `Var` (its first value argument's type,
+    emitted), matching the strings `emitInstance`/`emitDataDecl` compare against. -/
+private def methodHeadStr (v : Var) : Option String :=
+  (firstValArgTy v.ty).map emitType
+
+/-- Scan binds for *derived* Eq methods (`$c==`/`$c/=` whose body uses the tag
+    primops `dataToTag#`/`tagToEnum#`) and return their head-type strings. Such
+    Eq instances can't be body-translated and are routed through Lean
+    `deriving DecidableEq` instead. Hand-written Eq (e.g. Ratio's cross-multiply
+    `==`) never uses tag primops, so it keeps its body-translation. (Ord is
+    handled by instance-existence, not this scan — see `emitFullProgram` — since
+    a derived `compare` on a small enum is case-based and indistinguishable from
+    a hand-written one.) -/
+private def derivedEqTypes (binds : CoreProgram) : List String :=
+  let step (acc : List String) (v : Var) (e : Expr) : List String :=
+    if usesTagPrim e && eqMethodNames.contains v.name then
+      match methodHeadStr v with | some hs => hs :: acc | none => acc
+    else acc
+  binds.foldl (init := []) fun acc b => match b with
+    | .nonRec v e => step acc v e
+    | .rec_ pairs => pairs.foldl (init := acc) (fun acc (v, e) => step acc v e)
+
+/-- Names of `$c…` class-method `Var`s referenced anywhere in an expression. -/
+private partial def collectCMethodRefs : Expr → List Name
+  | .var v       => if v.name.startsWith "$c" then [v.name] else []
+  | .app f a     => collectCMethodRefs f ++ collectCMethodRefs a
+  | .lam _ b     => collectCMethodRefs b
+  | .let_ bnd b  =>
+    (match bnd with
+     | .nonRec _ e => collectCMethodRefs e
+     | .rec_ ps    => ps.flatMap (fun p => collectCMethodRefs p.2))
+      ++ collectCMethodRefs b
+  | .case_ s _ _ alts => collectCMethodRefs s ++ alts.flatMap (fun (.mk _ _ r) => collectCMethodRefs r)
+  | .cast e      => collectCMethodRefs e
+  | .tick e      => collectCMethodRefs e
+  | _            => []
+
+/-- Look up a top-level binding by name. -/
+private def findBind (binds : CoreProgram) (n : Name) : Option (Var × Expr) :=
+  binds.findSome? fun b => match b with
+    | .nonRec v e => if v.name == n then some (v, e) else none
+    | .rec_ pairs => pairs.find? (fun (v, _) => v.name == n)
+
+/-- Replace every `tyCon headName []` occurrence with `tyVar tv` (generalize an
+    instance-specialized method type back to the class-parameter form). -/
+private partial def generalizeTy (headName tv : Name) : GHCType → GHCType
+  | .tyCon n args => if n == headName && args.isEmpty then .tyVar tv
+                     else .tyCon n (args.map (generalizeTy headName tv))
+  | .tyApp f x    => .tyApp (generalizeTy headName tv f) (generalizeTy headName tv x)
+  | .tyFun a r    => .tyFun (generalizeTy headName tv a) (generalizeTy headName tv r)
+  | .forAll v b   => .forAll v (generalizeTy headName tv b)
+  | t             => t
+
+/-- Built-in classes handled elsewhere (Eq→BEq, Ord→deriving, Show skipped) or
+    with no Lean image — never reconstructed as user classes. -/
+private def builtinClasses : List Name :=
+  ["Eq", "Ord", "Show", "Read", "Num", "Integral", "Real", "Fractional",
+   "Floating", "Enum", "Bounded", "Functor", "Applicative", "Monad",
+   "Foldable", "Traversable", "Semigroup", "Monoid"]
+
+/-- Reconstruct `ClassDecl`s + a `(method, class)` map from the program's
+    instance dict-builders (which reference their `$c<method>` bindings) and the
+    `$c<method>` binding types (generalized to the class parameter). No GHC-plugin
+    support is needed: the dfun (`$f…`) body names the instance's methods. -/
+def reconstructClasses (binds : CoreProgram) (insts : List Instance)
+    : List ClassDecl × List (Name × Name) :=
+  let tv := "a"
+  let perInstance (i : Instance) : Option (ClassDecl × List (Name × Name)) := do
+    if builtinClasses.contains i.className then none else
+    let (_, dfunRhs) ← findBind binds i.dfunName
+    let headName ← match i.headTypes.head? with | some (.tyCon n _) => some n | _ => none
+    let cmethods := (collectCMethodRefs dfunRhs).eraseDups
+    let methods := cmethods.filterMap fun cm => do
+      let (mv, _) ← findBind binds cm
+      let mname := cm.drop 2   -- strip "$c"
+      some ({ name := mname, ty := generalizeTy headName tv mv.ty } : ClassMethod)
+    let pairs := methods.map (fun m => (m.name, i.className))
+    some ({ name := i.className, tyVar := tv, methods }, pairs)
+  let results := insts.filterMap perInstance
+  let classes := results.foldl (init := ([] : List ClassDecl)) fun acc (cd, _) =>
+    if acc.any (·.name == cd.name) then acc else acc ++ [cd]
+  let methodMap := (results.flatMap (·.2)).eraseDups
+  (classes, methodMap)
+
+/-- Find the `$c<method>` binding belonging to the instance whose head type
+    matches `headTyStr`, returning its emitted (unique-suffixed) def name.
+    Generalizes the former `findEqMethod`: multiple instances of a class each
+    produce a `$c<method>` binding that collides after sanitization, so we
+    disambiguate by matching the method's first value-argument type against the
+    instance head. -/
+private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
   let matchesHead (v : Var) : Bool :=
-    v.name == "$c==" &&
+    v.name == method &&
       (match firstValArgTy v.ty with
        | some t => emitType t == headTyStr
        | none   => false)
@@ -396,17 +610,47 @@ private def findEqMethod (binds : CoreProgram) (headTyStr : String) : Option Str
     | .nonRec v _ => if matchesHead v then some (localId v) else none
     | .rec_ pairs => (pairs.find? (fun (v, _) => matchesHead v)).map (fun (v, _) => localId v)
 
-/-- Emit a Lean `instance` block. Only `Eq` → Lean `BEq` is wired for now.
-    Returns `none` for classes we don't model (Show, Read, etc.) so the
-    caller can skip them entirely. -/
-def emitInstance (binds : CoreProgram) (i : Instance) : Option String :=
+/-- Emit a user-class instance: for each class method, find the matching
+    `$c<method>` binding for this instance's head type and wire it as a field.
+    Returns `none` if any method can't be resolved (skip rather than emit broken). -/
+def emitInstanceUser (classes : List ClassDecl) (binds : CoreProgram) (i : Instance) : Option String := do
+  let cd ← classes.find? (·.name == i.className)
+  let tyStr := i.headTypes.map emitType |> String.intercalate " "
+  let fields := cd.methods.filterMap fun m =>
+    match findClassMethod binds ("$c" ++ m.name) tyStr with
+    | some ref => some s!"  {sanitize m.name} := {ref}"
+    | none     => none
+  if fields.length == cd.methods.length && !fields.isEmpty then
+    some (s!"instance : {sanitize i.className} {tyStr} where\n" ++ String.intercalate "\n" fields)
+  else none
+
+/-- Emit a Lean `instance` block. `Eq` → Lean `BEq`, `Ord` → Lean `Ord` (the
+    latter via `deriving` in the data block), and user classes via
+    `emitInstanceUser`. Returns `none` for classes we don't model (Show, Read). -/
+def emitInstance (classes : List ClassDecl) (derivedEq : List String) (binds : CoreProgram) (i : Instance) : Option String :=
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
   match i.className with
   | "Eq" =>
-    match findEqMethod binds tyStr with
+    -- A *derived* Eq is handled by the type's `deriving DecidableEq` (its
+    -- `$c==` body uses untranslatable tag primops); skip the body-translation.
+    -- Hand-written Eq still translates to a `BEq` instance from its body.
+    if derivedEq.contains tyStr then none
+    else match findClassMethod binds "$c==" tyStr with
     | some methodRef => some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
     | none           => none
-  | _ => none
+  | "Ord" =>
+    -- Ord is reconstructed via `deriving Ord` + `leOfOrd`/… in the data block
+    -- (emitted by `emitDataDecl`), so instances precede the binds that use
+    -- `≤`/`<`/`min`/`max` (Lean instances are not forward-visible). Nothing to
+    -- emit here. The GHC `$ccompare`/`$c<=`/… method defs are suppressed in
+    -- `emitFullProgram`.
+    none
+  -- Show is deliberately not translated: GHC's `$cshowsPrec` body is string
+  -- plumbing that rarely matches Lean's `ToString`, and emitted data decls
+  -- already `derive Repr`, which Blaster uses to print counterexamples.
+  -- Translating Show would risk a *wrong* printer; skipping is sound.
+  | "Show" => none
+  | _ => emitInstanceUser classes binds i
 
 /-- Build a user-data-constructor-name map from the typeDecls. This lets
     the Lean emitter rewrite `case x of CustomRatio …` patterns to use the
@@ -483,16 +727,55 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   -- set so App-position refs to them emit bare, not as `Name_<unique>`.
   let ctorNames : List Name :=
     p.typeDecls.flatMap fun d => d.ctors.map (·.name)
-  let datas := p.typeDecls.map emitDataDecl
-  let binds := emitProgramWith p.binds ctorNames
-  let insts := p.instances.filterMap (emitInstance p.binds)
-  let bodyRaw :=
-    (if binds.isEmpty then "" else binds)
-      ++ (if insts.isEmpty then "" else "\n\n" ++ String.intercalate "\n\n" insts)
+  -- Eq: detect *derived* Eq (tag-primop `$c==`) → route through `deriving
+  -- DecidableEq` and suppress the untranslatable method defs; hand-written Eq
+  -- keeps body-translation. Ord: any type with an Ord instance is reconstructed
+  -- via `deriving Ord` + `leOfOrd`/… in the data block (so the instances precede
+  -- the binds that use `≤`/`<`/`min`/`max` — Lean instances aren't forward-
+  -- visible); its GHC `$ccompare`/`$c<=`/… method defs are all dead boilerplate
+  -- and suppressed.
+  let derivedEq : List String := derivedEqTypes p.binds
+  let ordTypes  : List String :=
+    p.instances.filterMap fun i =>
+      if i.className == "Ord" then some (i.headTypes.map emitType |> String.intercalate " ") else none
+  let headMatches (v : Var) (s : List String) : Bool :=
+    match methodHeadStr v with | some hs => s.contains hs | none => false
+  let isSuppressedMethod (v : Var) : Bool :=
+    (eqMethodNames.contains v.name  && headMatches v derivedEq)
+    || (ordMethodNames.contains v.name && headMatches v ordTypes)
+  let keptBinds : CoreProgram := p.binds.filterMap fun b => match b with
+    | .nonRec v e => if isSuppressedMethod v then none else some (.nonRec v e)
+    | .rec_ pairs =>
+      let kept := pairs.filter (fun (v, _) => !isSuppressedMethod v)
+      if kept.isEmpty then none else some (.rec_ kept)
+  -- Reconstruct user classes → class decls + method→class map (selector rewrite).
+  let (userClasses, methodMap) := reconstructClasses p.binds p.instances
+  let classNames := userClasses.map (·.name)
+  let datas := p.typeDecls.map fun d =>
+    let hs := emitType (.tyCon d.name [])
+    emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
+  let classDecls := userClasses.map emitClassDecl
+  -- Partition kept binds for forward-visibility-safe ordering. Drop instance
+  -- dict-builders (`$f…`) and Typeable junk; `$c…` method defs precede the
+  -- instances (which reference them) which precede user binds (which use the
+  -- instances). Classes go in the data block (before everything).
+  let bindHeadName : Bind → Name
+    | .nonRec v _ => v.name
+    | .rec_ ps    => (ps.head?.map (·.1.name)).getD ""
+  let isJunkName (n : Name) : Bool :=
+    n.startsWith "$f" || n.startsWith "$tc" || n.startsWith "$tr" || n.startsWith "$kr"
+  let methodDefs := keptBinds.filter (fun b => (bindHeadName b).startsWith "$c")
+  let userBinds  := keptBinds.filter (fun b =>
+    let n := bindHeadName b; !(n.startsWith "$c") && !(isJunkName n))
+  let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames
+  let userStr   := emitProgramWith methodMap classNames userBinds ctorNames
+  let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
+  let instStr := String.intercalate "\n\n" insts
+  let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
                     |> resolveUserCtors p.typeDecls
   let dataBlock :=
-    if datas.isEmpty then "" else String.intercalate "\n\n" datas
+    String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
   -- External-type resolution runs over the whole output (data fields included);
   -- it only rewrites imported types, so local inductive names are untouched.

@@ -18,6 +18,15 @@ addRatio :: CustomRatio -> CustomRatio -> CustomRatio
 addRatio (CustomRatio n1 d1) (CustomRatio n2 d2) =
     CustomRatio (n1 * d2 + n2 * d1) (d1 * d2)
 
+
+[lean|
+theorem falty_addRatio_commutative :
+    ∀ (n1 d1 n2 d2 : Int), d1 > 0 → d2 > 0 →
+    addRatio (CustomRatio.CustomRatio n1 d1) (CustomRatio.CustomRatio n2 d2)
+      = addRatio (CustomRatio.CustomRatio n2 d2) (CustomRatio.CustomRatio n1 d1) := by blaster
+|]
+
+
 subRatio :: CustomRatio -> CustomRatio -> CustomRatio
 subRatio (CustomRatio n1 d1) (CustomRatio n2 d2) =
     CustomRatio (n1 * d2 - n2 * d1) (d1 * d2)
@@ -244,11 +253,4 @@ safeRecipRatio :: CustomRatio -> CustomRatio
 safeRecipRatio (CustomRatio n d) =
     if n == 0 then error "safeRecipRatio: zero numerator"
     else normalizeRatio (CustomRatio d n)
-
-[lean|
-theorem addRatio_correct :
-    ∀ (n1 d1 n2 d2 : Int), d1 > 0 → d2 > 0 →
-    addRatio (CustomRatio.CustomRatio n1 d1) (CustomRatio.CustomRatio n2 d2)
-      = CustomRatio.CustomRatio (n1 * d2 + n2 * d1) (d1 * d2) := by blaster
-|]
 
