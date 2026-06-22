@@ -22,5 +22,5 @@ module UserClass where
     [lean|
     theorem boxTotal_correct :
         ∀ (boxes : List Box),
-        boxTotal boxes = total boxes := by blaster
+        boxTotal boxes = total boxes + 1 := by blaster
     |]
