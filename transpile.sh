@@ -23,6 +23,12 @@
 
 set -euo pipefail
 
+# Ensure the Haskell/Lean toolchains are on PATH even when launched from a GUI
+# process (e.g. the VS Code extension), which does not inherit the login-shell
+# profile — otherwise `cabal`/`python3`/`lake` are "command not found".
+[ -f "$HOME/.ghcup/env" ] && . "$HOME/.ghcup/env" || true
+export PATH="$HOME/.ghcup/bin:$HOME/.cabal/bin:$HOME/.elan/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 SRC="${1:-}"
 if [[ -z "$SRC" ]]; then
   echo "usage: $(basename "$0") <Source.hs> [output.lean]" >&2
