@@ -258,4 +258,19 @@ def totalBind : Bind :=
 #guard ((emitBind [] ["Sized"] [] totalBind).splitOn "[Sized a]").length == 2
 #guard ((emitBind [] ["Sized"] [] totalBind).splitOn "tyConOpaque \"Sized\"").length == 1
 
+-- M1 Task 2: 3-/4-tuple construction. Ctors are eta-expanded lambdas so plain
+-- left-application works at any saturation.
+#guard dataConMap "(,,)"            == some "(fun a b c => (a, b, c))"
+#guard dataConMap "GHC.Tuple.(,,)"  == some "(fun a b c => (a, b, c))"
+#guard dataConMap "(,,,)"           == some "(fun a b c d => (a, b, c, d))"
+#guard dataConMap "GHC.Tuple.(,,,)" == some "(fun a b c d => (a, b, c, d))"
+#guard typeConMap "(,,,)" ["Int", "Int", "Int", "Int"] == some "(Int × Int × Int × Int)"
+#guard typeConMap "GHC.Tuple.(,,,)" ["Int", "Int", "Int", "Int"] == some "(Int × Int × Int × Int)"
+#guard emitAltPattern (.dataCon "(,,,)")
+         [ {name := "a", unique := 1, ty := .tyCon "Int" [], role := .id},
+           {name := "b", unique := 2, ty := .tyCon "Int" [], role := .id},
+           {name := "c", unique := 3, ty := .tyCon "Int" [], role := .id},
+           {name := "d", unique := 4, ty := .tyCon "Int" [], role := .id} ]
+       == "(a_1, b_2, c_3, d_4)"
+
 end GhcCoreToLean.Tests

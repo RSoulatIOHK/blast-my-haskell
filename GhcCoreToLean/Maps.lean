@@ -153,6 +153,8 @@ def typeConMap : String → List String → Option String
   | "GHC.Tuple.(,)", [a, b] => some s!"({a} × {b})"
   | "(,,)",  [a, b, c] => some s!"({a} × {b} × {c})"
   | "GHC.Tuple.(,,)", [a, b, c] => some s!"({a} × {b} × {c})"
+  | "(,,,)", [a, b, c, d]           => some s!"({a} × {b} × {c} × {d})"
+  | "GHC.Tuple.(,,,)", [a, b, c, d] => some s!"({a} × {b} × {c} × {d})"
   | "Ordering", []    => some "Ordering"
   | _,         _      => none
 
@@ -168,11 +170,12 @@ def dataConMap : String → Option String
   | "()"      => some "Unit.unit"
   -- 2-tuple construction → `Prod.mk a b`. Both the bare pattern-position name
   -- `(,)` and the qualified value-position name `GHC.Tuple.(,)` resolve here.
-  -- NOTE: 3-tuple construction is intentionally NOT mapped: `Prod.mk` is binary,
-  -- and `emitExpr` left-applies, so `(,,) a b c` would emit `((Prod.mk a) b) c`,
-  -- which is ill-typed. Tracked as a follow-up (see TupleBasics report). The
-  -- type (`a × b × c`) and pattern (`(x, y, z)`) paths DO support 3-tuples.
   | "(,)"     | "GHC.Tuple.(,)" => some "Prod.mk"
+  -- 3-/4-tuple construction. Eta-expanded lambdas, NOT `Prod.mk` (which is
+  -- binary — left-applying it to 3 args is ill-typed): `(fun a b c => (a,b,c))`
+  -- left-applies correctly at any saturation. 5+-tuples remain unmapped (loud).
+  | "(,,)"  | "GHC.Tuple.(,,)"  => some "(fun a b c => (a, b, c))"
+  | "(,,,)" | "GHC.Tuple.(,,,)" => some "(fun a b c d => (a, b, c, d))"
   -- Ordering constructors. Core delivers the qualified `GHC.Types.*` forms
   -- (confirmed via Generated/NumOrd.lean); bare forms kept as a hedge.
   | "LT" | "GHC.Types.LT" => some "Ordering.lt"

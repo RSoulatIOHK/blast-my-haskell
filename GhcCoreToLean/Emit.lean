@@ -159,8 +159,9 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
     -- Tuple patterns use Lean's anonymous-tuple syntax `(x, y, …)`, which
     -- right-nests for any arity (so 3-tuples are fine here). The pattern-
     -- position ctor name is bare `(,)`/`(,,)`; qualified forms covered too.
-    if name == "(,)" || name == "(,,)"
-       || name == "GHC.Tuple.(,)" || name == "GHC.Tuple.(,,)" then
+    if name == "(,)" || name == "(,,)" || name == "(,,,)"
+       || name == "GHC.Tuple.(,)" || name == "GHC.Tuple.(,,)"
+       || name == "GHC.Tuple.(,,,)" then
       let bs := String.intercalate ", " (bndrs.map localId)
       s!"({bs})"
     else
