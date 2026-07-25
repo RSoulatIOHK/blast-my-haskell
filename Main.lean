@@ -133,7 +133,7 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- `import` lines for transpiled dependencies precede the namespace.
     let imports    ← loadLeanImports
     let depImports := String.join (imports.map (s!"import {·}\n"))
-    let header     := s!"import Lean\nimport Blaster\n{depImports}\n"
+    let header     := s!"import Lean\nimport Blaster\nimport GhcCoreToLean.Runtime\n{depImports}\n"
     let pre := header ++ nsOpen ++ crib ++ body ++ "\n"
     let specs ← loadSpecs moduleName
     let mut out := pre
