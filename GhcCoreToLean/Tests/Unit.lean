@@ -260,6 +260,14 @@ def totalBind : Bind :=
 
 -- M1 Task 2: 3-/4-tuple construction. Ctors are eta-expanded lambdas so plain
 -- left-application works at any saturation.
+-- Names observed from Generated/TupleTriple.lean and its shim JSON
+-- (/tmp/transpile-TupleTriple.json, GHC 9.2.7) — same split as the 2-tuple
+-- block above:
+--   type tycon       : "(,,)" / "(,,,)"                     (bare, in binder types)
+--   value-pos ctor   : "GHC.Tuple.(,,)" / "GHC.Tuple.(,,,)" (qualified; resolved to the
+--                      eta-expanded lambdas in the generated file, so the arms fired)
+--   pattern-pos ctor : "(,,)" / "(,,,)"                     (bare; emitted as
+--                      `(a_…, b_…, c_…)` tuple patterns)
 #guard dataConMap "(,,)"            == some "(fun a b c => (a, b, c))"
 #guard dataConMap "GHC.Tuple.(,,)"  == some "(fun a b c => (a, b, c))"
 #guard dataConMap "(,,,)"           == some "(fun a b c d => (a, b, c, d))"
@@ -272,5 +280,9 @@ def totalBind : Bind :=
            {name := "c", unique := 3, ty := .tyCon "Int" [], role := .id},
            {name := "d", unique := 4, ty := .tyCon "Int" [], role := .id} ]
        == "(a_1, b_2, c_3, d_4)"
+
+-- 5+-tuples must stay unmapped (loud compile failure), as the Maps comment promises.
+#guard dataConMap "(,,,,)" == none
+#guard typeConMap "(,,,,)" ["Int", "Int", "Int", "Int", "Int"] == none
 
 end GhcCoreToLean.Tests
