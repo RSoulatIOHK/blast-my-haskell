@@ -285,4 +285,16 @@ def totalBind : Bind :=
 #guard dataConMap "(,,,,)" == none
 #guard typeConMap "(,,,,)" ["Int", "Int", "Int", "Int", "Int"] == none
 
+-- M1 Task 3: list literals. `[a,b,c]` desugars to `build (\c n -> c a (c b (c c n)))`
+-- with `build g = g (:) []`; `augment g xs = g (:) xs` (literal ++ xs fusion form).
+-- Type args/binders on `g` are already erased by Lower; emitted lambdas carry
+-- no binder type annotations, so the rank-2 type cannot dangle.
+-- Names observed from Generated/ListLiterals.lean and its shim JSON
+-- (/tmp/transpile-ListLiterals.json, GHC 9.2.7): "GHC.Base.build" (×2, both
+-- `smallList = [1,2,3]` and the literal in `withPrefix`). `augment` did NOT
+-- appear — `[1,2] ++ xs` desugared to `++ (build ...) xs`, i.e. List.append
+-- over an inner build — but the arm is kept as a hedge for fusion forms.
+#guard valueMap "GHC.Base.build"   == some "(fun g => g List.cons List.nil)"
+#guard valueMap "GHC.Base.augment" == some "(fun g xs => g List.cons xs)"
+
 end GhcCoreToLean.Tests

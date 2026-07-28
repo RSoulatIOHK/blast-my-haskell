@@ -49,6 +49,11 @@ def valueMap : String → Option String
   -- hijacked here. Core qualifies these names anyway, so nothing is lost. Bare
   -- *operator* forms (`++`, `&&`, …) stay, since users can't shadow them.
   | "GHC.Base.++"      | "++"      => some "List.append"
+  -- List literals. `[a,b,c]` desugars to `GHC.Base.build (\c n -> c a (c b (c c n)))`
+  -- where `build g = g (:) []`; `augment g xs = g (:) xs` appears for
+  -- `[literal] ++ xs` fusion forms. Lower erases the rank-2 type application.
+  | "GHC.Base.build"   => some "(fun g => g List.cons List.nil)"
+  | "GHC.Base.augment" => some "(fun g xs => g List.cons xs)"
   | "GHC.Base.map"                => some "List.map"
   | "GHC.List.filter"             => some "List.filter"
   | "GHC.List.reverse"            => some "List.reverse"
