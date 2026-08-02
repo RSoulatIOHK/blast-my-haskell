@@ -57,6 +57,10 @@ def valueMap : String → Option String
   -- moves, NOT a live `++` path (observed: 0 occurrences at pass-0000).
   | "GHC.Base.build"   => some "(fun g => g List.cons List.nil)"
   | "GHC.Base.augment" => some "(fun g xs => g List.cons xs)"
+  -- Int ranges (Enum dict is erased by Lower). `enumFrom`/`enumFromThen`
+  -- (infinite) are intentionally NOT mapped — loud fail.
+  | "GHC.Enum.enumFromTo"     => some "Hs.enumFromTo"
+  | "GHC.Enum.enumFromThenTo" => some "Hs.enumFromThenTo"
   | "GHC.Base.map"                => some "List.map"
   | "GHC.List.filter"             => some "List.filter"
   | "GHC.List.reverse"            => some "List.reverse"

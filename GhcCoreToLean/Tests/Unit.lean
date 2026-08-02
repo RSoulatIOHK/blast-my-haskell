@@ -1,6 +1,7 @@
 import GhcCoreToLean.Maps
 import GhcCoreToLean.Emit
 import GhcCoreToLean.AST
+import GhcCoreToLean.Runtime
 
 namespace GhcCoreToLean.Tests
 open GHCCore GHCCore.Maps GHCCore.Emit
@@ -305,5 +306,39 @@ def totalBind : Bind :=
 -- (it is unreachable at pass-0000).
 #guard ((fun g => g List.cons List.nil) (fun c n => c (1:Int) (c 2 (c 3 n)))) == [1,2,3]
 #guard ((fun g xs => g List.cons xs) (fun c n => c (1:Int) (c 2 n)) [7]) == [1,2,7]
+
+-- M1 Task 4: Int ranges. Semantics pinned against GHC:
+--   [1..5]=[1,2,3,4,5]  [3..3]=[3]  [3..1]=[]
+--   [1,3..9]=[1,3,5,7,9]  [1,3..8]=[1,3,5,7]  [10,8..5]=[10,8,6]
+--   [5,7..4]=[]  [5,3..6]=[]  [1,1..0]=[]  ([1,1..5] is infinite ⇒ default=[])
+-- Names observed in this pipeline from Generated/ListLiterals.lean and its shim
+-- JSON (/tmp/transpile-ListLiterals.json, GHC 9.2.7), same as the Task 2/3
+-- blocks above:
+--   "GHC.Enum.enumFromTo"      (×1, from `rangeList = [1 .. 5]`)
+--   "GHC.Enum.enumFromThenTo"  (×1, from `countdown = [10, 8 .. 5]`)
+--   "GHC.Enum.$fEnumInt"       (×2, the Enum dict — erased by Lower)
+-- The specialised `GHC.Enum` workers `eftInt`/`efdtInt` do NOT appear at
+-- pass-0000 (they come from RULES in simplifier passes ≥ 1), so the class-method
+-- names above are the live path. Both mapped names fired: the generated file
+-- contains `Hs.enumFromTo` / `Hs.enumFromThenTo` with no unmapped residue.
+#guard Hs.enumFromTo 1 5 == [1, 2, 3, 4, 5]
+#guard Hs.enumFromTo 3 3 == [3]
+#guard Hs.enumFromTo 3 1 == []
+#guard Hs.enumFromTo (-2) 1 == [-2, -1, 0, 1]
+#guard Hs.enumFromThenTo 1 3 9 == [1, 3, 5, 7, 9]
+#guard Hs.enumFromThenTo 1 3 8 == [1, 3, 5, 7]
+#guard Hs.enumFromThenTo 10 8 5 == [10, 8, 6]
+#guard Hs.enumFromThenTo 5 7 4 == []
+#guard Hs.enumFromThenTo 5 3 6 == []
+#guard Hs.enumFromThenTo 1 1 0 == []
+-- Soundness pin for the documented ⊥ → `default` convention: `[1,1..5]` is an
+-- INFINITE list in GHC, so every total observation of it is ⊥ and it lowers to
+-- `default` (= `[]`). The `1 1 0` guard above cannot distinguish this branch
+-- from the finite-empty one — they share the `d = 0` arm — so this line is the
+-- only tested record that the `default` arm is deliberate, not an oversight.
+#guard Hs.enumFromThenTo 1 1 5 == []
+
+#guard valueMap "GHC.Enum.enumFromTo"     == some "Hs.enumFromTo"
+#guard valueMap "GHC.Enum.enumFromThenTo" == some "Hs.enumFromThenTo"
 
 end GhcCoreToLean.Tests
