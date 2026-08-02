@@ -49,7 +49,7 @@ def valueMap : String → Option String
   -- hijacked here. Core qualifies these names anyway, so nothing is lost. Bare
   -- *operator* forms (`++`, `&&`, …) stay, since users can't shadow them.
   | "GHC.Base.++"      | "++"      => some "List.append"
-  -- List literals. `[a,b,c]` desugars to `GHC.Base.build (\c n -> c a (c b (c x3 n)))`
+  -- List literals. `[a,b,x3]` desugars to `GHC.Base.build (\c n -> c a (c b (c x3 n)))`
   -- where `build g = g (:) []` (Lower erases both the rank-2 type application
   -- AND the type binder on g). `augment g xs = g (:) xs` is introduced by the
   -- "++" RULE in simplifier passes ≥ 1, which the pass-0000 dump this pipeline
