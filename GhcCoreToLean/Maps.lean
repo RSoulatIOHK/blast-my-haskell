@@ -49,9 +49,12 @@ def valueMap : String → Option String
   -- hijacked here. Core qualifies these names anyway, so nothing is lost. Bare
   -- *operator* forms (`++`, `&&`, …) stay, since users can't shadow them.
   | "GHC.Base.++"      | "++"      => some "List.append"
-  -- List literals. `[a,b,c]` desugars to `GHC.Base.build (\c n -> c a (c b (c c n)))`
-  -- where `build g = g (:) []`; `augment g xs = g (:) xs` appears for
-  -- `[literal] ++ xs` fusion forms. Lower erases the rank-2 type application.
+  -- List literals. `[a,b,c]` desugars to `GHC.Base.build (\c n -> c a (c b (c x3 n)))`
+  -- where `build g = g (:) []` (Lower erases both the rank-2 type application
+  -- AND the type binder on g). `augment g xs = g (:) xs` is introduced by the
+  -- "++" RULE in simplifier passes ≥ 1, which the pass-0000 dump this pipeline
+  -- reads never reaches — the arm is a forward hedge in case the dump point
+  -- moves, NOT a live `++` path (observed: 0 occurrences at pass-0000).
   | "GHC.Base.build"   => some "(fun g => g List.cons List.nil)"
   | "GHC.Base.augment" => some "(fun g xs => g List.cons xs)"
   | "GHC.Base.map"                => some "List.map"

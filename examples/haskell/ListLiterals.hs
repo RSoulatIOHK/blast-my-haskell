@@ -12,5 +12,5 @@ theorem smallList_val : smallList = [1, 2, 3] := by blaster
 -}
 
 {- @lean
-theorem withPrefix_example : withPrefix [7] = [1, 2, 7] := by blaster
+theorem withPrefix_example : ∀ (x : Int), withPrefix [x] = [1, 2, x] := by blaster
 -}

@@ -297,4 +297,11 @@ def totalBind : Bind :=
 #guard valueMap "GHC.Base.build"   == some "(fun g => g List.cons List.nil)"
 #guard valueMap "GHC.Base.augment" == some "(fun g xs => g List.cons xs)"
 
+-- Semantic pins: the mapped lambdas applied to a real cons-builder must
+-- produce the literal list. Catches a wrong-but-intended mapping, which the
+-- string guards above cannot; also the only coverage augment can ever get
+-- (it is unreachable at pass-0000).
+#guard ((fun g => g List.cons List.nil) (fun c n => c (1:Int) (c 2 (c 3 n)))) == [1,2,3]
+#guard ((fun g xs => g List.cons xs) (fun c n => c (1:Int) (c 2 n)) [7]) == [1,2,7]
+
 end GhcCoreToLean.Tests
