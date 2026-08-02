@@ -321,6 +321,9 @@ def totalBind : Bind :=
 -- pass-0000 (they come from RULES in simplifier passes ≥ 1), so the class-method
 -- names above are the live path. Both mapped names fired: the generated file
 -- contains `Hs.enumFromTo` / `Hs.enumFromThenTo` with no unmapped residue.
+#guard valueMap "GHC.Enum.enumFromTo"     == some "Hs.enumFromTo"
+#guard valueMap "GHC.Enum.enumFromThenTo" == some "Hs.enumFromThenTo"
+
 #guard Hs.enumFromTo 1 5 == [1, 2, 3, 4, 5]
 #guard Hs.enumFromTo 3 3 == [3]
 #guard Hs.enumFromTo 3 1 == []
@@ -337,8 +340,5 @@ def totalBind : Bind :=
 -- from the finite-empty one — they share the `d = 0` arm — so this line is the
 -- only tested record that the `default` arm is deliberate, not an oversight.
 #guard Hs.enumFromThenTo 1 1 5 == []
-
-#guard valueMap "GHC.Enum.enumFromTo"     == some "Hs.enumFromTo"
-#guard valueMap "GHC.Enum.enumFromThenTo" == some "Hs.enumFromThenTo"
 
 end GhcCoreToLean.Tests
