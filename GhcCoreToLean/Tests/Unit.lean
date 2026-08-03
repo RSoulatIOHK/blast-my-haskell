@@ -388,4 +388,55 @@ def totalBind : Bind :=
 #guard ((fun (n : Int) (x : Int) => List.replicate n.toNat x) 3 9) == [9,9,9]
 #guard ((fun (n : Int) (x : Int) => List.replicate n.toNat x) (-3) 9) == []
 
+/-! ## M1 Task 6 — zip family (zip, zipWith, unzip) -/
+
+-- Names observed from /tmp/transpile-ListLibrary.json (GHC 9.2.7, pass-0000)
+-- and Generated/ListLibrary.lean:
+--   "GHC.List.zip"  "GHC.List.zipWith"  "GHC.List.unzip"   (×1 each)
+-- A bare grep for `zip` over the dump found NOTHING else — in particular no
+-- `Data.OldList.unzip` and no `GHC.Base.zip`, so no alternative keys are needed
+-- (`Data.OldList` only re-exports these; the desugarer names the GHC.List
+-- originals). Unlike `length`/`null`/`foldr`, none of the three is a Foldable
+-- method post-FTP, so there is no `Data.Foldable.*` form either.
+-- Semantics: Haskell's `zip`/`zipWith` truncate to the SHORTER list
+-- (`zipWith f (a:as) (b:bs) = f a b : zipWith f as bs; zipWith _ _ _ = []`) and
+-- so do Lean's. Lean's `List.zip` is `zipWith Prod.mk`, structurally recursive
+-- on both lists — NOT an accumulator, so unlike `List.splitAt` (which is why
+-- `Hs.splitAt` exists above) it reduces the same way Haskell's does in proofs
+-- and needs no `Hs.*` wrapper. Haskell's `unzip` is a `foldr` with a lazy
+-- pattern `~(as,bs)` and seed `([],[])`; it agrees with `List.unzip` on every
+-- FINITE list, which is the transpiler's domain.
+-- Emission shapes both elaborate: GHC eta-reduces `pairUp xs ys = zip xs ys` to
+-- `pairUp = zip` (point-free `(fun xs ys => …)`), while `addWise = zipWith (+)`
+-- keeps binders and emits the APPLIED form `(((fun f xs ys => …) (· + ·)) xs) ys`.
+-- Eta-wrapped to pin Haskell arg order (f, xs, ys).
+#guard valueMap "GHC.List.zip"     == some "(fun xs ys => List.zip xs ys)"
+#guard valueMap "GHC.List.zipWith" == some "(fun f xs ys => List.zipWith f xs ys)"
+#guard valueMap "GHC.List.unzip"   == some "List.unzip"
+-- Semantic pins: catch a Lean-side signature/arg-order surprise at build time.
+-- `List Int` ascriptions for the same reason as the Task 5 block: unannotated
+-- numeric list literals default to `Nat`, but `Int` is what the transpiler emits.
+-- Arg order must be pinned with a NON-commutative op — `(· + ·)` would pass even
+-- if `List.zipWith`'s two list args were swapped.
+#guard List.zipWith (· - ·) ([10, 20] : List Int) [1, 2] == [9, 18]
+-- Truncation to the shorter list, pinned in BOTH directions (Haskell's
+-- `zip (x:xs) (y:ys) = …; zip _ _ = []` truncates either way; so does Lean's).
+#guard List.zip ([1, 2] : List Int) [10, 20, 30] == [(1, 10), (2, 20)]
+#guard List.zip ([1, 2, 3] : List Int) [10, 20] == [(1, 10), (2, 20)]
+#guard List.zipWith (· - ·) ([10, 20, 30] : List Int) [1, 2] == [9, 18]
+#guard List.unzip ([(1, 10), (2, 20)] : List (Int × Int)) == ([1, 2], [10, 20])
+-- Base case: Haskell `unzip [] = ([], [])` (its `foldr` seed is `([], [])`).
+#guard List.unzip ([] : List (Int × Int)) == ([], [])
+-- Empty-list cases on both sides — the ground instances of the `pairUp_nil`
+-- theorem in examples/haskell/ListLibrary.hs. Note `zipWith f l [] = []` is NOT
+-- definitional in Lean (core proves it `by simp [zipWith]`, not `rfl`, because
+-- it needs a case split on `l`); Blaster discharges the quantified form anyway.
+#guard List.zip ([1, 2, 3] : List Int) ([] : List Int) == []
+#guard List.zip ([] : List Int) ([1, 2, 3] : List Int) == []
+-- The APPLIED form GHC emits for `addWise = zipWith (+)` (a partial application
+-- of the unannotated lambda, which does NOT eta-reduce to point-free the way
+-- `pairUp`/`split2` do) really does elaborate: the binder types are postponed
+-- and resolved from the argument types. Load-bearing for the claim above.
+#guard ((((fun f xs ys => List.zipWith f xs ys)) ((· - ·))) ([10, 20] : List Int)) [1, 2] == [9, 18]
+
 end GhcCoreToLean.Tests
