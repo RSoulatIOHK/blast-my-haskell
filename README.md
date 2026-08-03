@@ -218,6 +218,9 @@ Development Host.)
   `GHCCore.tyConOpaque` binder); monomorphic code — e.g. the same function at
   `Int` — is unaffected. (User-defined classes *are* supported; see the bullet
   above.)
-  Theorems over lists/recursion need a user-written `induction` proof — bare
-  `by blaster` (SMT) discharges only quantifier-free arithmetic goals;
-  concrete-value list properties close with `by decide`.
+  Goals that genuinely require induction over an unbounded list need a
+  user-written `induction` proof. Bare `by blaster` (SMT) discharges
+  quantifier-free arithmetic plus fixed-shape list/Bool goals — including ones
+  quantified over element variables (`sumList [a] = a`) or over a list whose
+  shape the statement fixes (`pairUp xs [] = []`). Concrete-value properties
+  also close with `by decide`.

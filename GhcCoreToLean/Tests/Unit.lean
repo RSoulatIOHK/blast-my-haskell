@@ -777,4 +777,16 @@ def mkPartialBind (nm : String) : Bind :=
 -- a := -1, b := 0; `maxOf [a, b] = a` → a := -1, b := 0), so the ✅s are not
 -- vacuous — its Option/max? encoding is genuinely modelling the fold.
 
+/-! ## M1 loud-fail boundary — infinite list producers stay unmapped -/
+
+-- The README promises these are loud compile errors by design. Pin it, so a
+-- future well-meaning "let's map iterate" breaks this guard and has to face
+-- the infinity question deliberately. (`enumFromThenTo`'s zero-stride corner
+-- is the one deliberate exception — ⊥ → `default`, see Runtime.lean.)
+#guard valueMap "GHC.List.iterate"    == none
+#guard valueMap "GHC.List.repeat"     == none
+#guard valueMap "GHC.List.cycle"      == none
+#guard valueMap "GHC.Enum.enumFrom"     == none
+#guard valueMap "GHC.Enum.enumFromThen" == none
+
 end GhcCoreToLean.Tests
