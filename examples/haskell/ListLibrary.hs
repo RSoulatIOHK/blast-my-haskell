@@ -1,6 +1,8 @@
 {-# OPTIONS_GHC -fplugin GhcDump.Plugin #-}
 module ListLibrary where
 
+import Data.Maybe (fromMaybe)
+
 -- M1 Task 5: Int-indexed ops (take / drop / splitAt / replicate).
 -- Haskell clamps a negative count to 0; the mapped Lean forms clamp with
 -- `Int.toNat`, so the semantics match on the whole domain. Ground goals are
@@ -157,4 +159,60 @@ theorem conj_disj_nonempty : ∀ (b c : Bool), conj [b, c] = (b && c) ∧ disj [
 -- rather than a term-by-term syntactic match against the emitted body.
 {- @lean
 theorem doubled_example : ∀ (x y : Int), doubled [x + y, y, x] = [2 * (x + y), 2 * y, x + x] := by blaster
+-}
+
+-- M1 Task 8: search and flatten (elem / notElem / lookup / concat / concatMap),
+-- plus a MULTI-generator comprehension. Haskell semantics being imaged:
+-- `elem`/`notElem`/`lookup` compare with `Eq` (→ the project's `BEq`);
+-- `lookup k [] = Nothing`; `concat [] = []`; `concatMap f = concat . map f`.
+-- `lookupOr` also re-exercises the existing `fromMaybe` mapping, and
+-- `dupEach`'s lambda body `[x, x]` routes through `GHC.Base.build`.
+
+hasZero :: [Int] -> Bool
+hasZero xs = elem 0 xs
+
+misses :: Int -> [Int] -> Bool
+misses x xs = notElem x xs
+
+lookupOr :: Int -> [(Int, Int)] -> Int
+lookupOr k ps = fromMaybe 0 (lookup k ps)
+
+flattenAll :: [[Int]] -> [Int]
+flattenAll xss = concat xss
+
+dupEach :: [Int] -> [Int]
+dupEach xs = concatMap (\x -> [x, x]) xs
+
+pairsUpTo :: Int -> [(Int, Int)]
+pairsUpTo n = [(x, y) | x <- [1 .. n], y <- [1 .. x]]
+
+{- @lean
+theorem hasZero_example : hasZero [1, 0] = true ∧ hasZero [1, 2] = false := by decide
+-}
+
+{- @lean
+theorem misses_example : misses 3 [1, 2] = true := by decide
+-}
+
+-- The quantified companion: `decide` only ever exercises `contains` on concrete
+-- Int literals, so this is what covers the cons arm with a symbolic element
+-- (and confirms Blaster unfolds the `contains`/`elem` abbrev chain).
+{- @lean
+theorem misses_notElem : ∀ (x : Int), misses x [x] = false := by blaster
+-}
+
+{- @lean
+theorem lookupOr_example : lookupOr 2 [(1, 10), (2, 20)] = 20 ∧ lookupOr 9 [(1, 10)] = 0 := by decide
+-}
+
+{- @lean
+theorem flattenAll_example : flattenAll [[1], [2, 3]] = [1, 2, 3] := by decide
+-}
+
+{- @lean
+theorem dupEach_example : dupEach [1, 2] = [1, 1, 2, 2] := by decide
+-}
+
+{- @lean
+theorem pairsUpTo_example : pairsUpTo 3 = [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)] := by decide
 -}

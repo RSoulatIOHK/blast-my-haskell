@@ -114,6 +114,20 @@ def valueMap : String → Option String
   | "Data.Foldable.any"     | "GHC.List.any"     => some "(fun p xs => List.any xs p)"
   | "Data.Foldable.and"     | "GHC.List.and"     => some "Hs.and"
   | "Data.Foldable.or"      | "GHC.List.or"      => some "Hs.or"
+  -- Search & flatten. elem/notElem/lookup are Eq-constrained; the project's
+  -- image of Haskell `Eq` is `BEq` (hand-written Eq instances become BEq
+  -- instances), which is exactly what Lean's `List.contains`/`List.lookup`
+  -- require. The elem/notElem/lookup wraps are LOAD-BEARING adapters, not
+  -- legibility wraps: Haskell's arg order is (x, xs) / (k, ps) with the
+  -- searched-for value FIRST, whereas Lean's `List.contains`/`List.lookup` are
+  -- reached receiver-first via dot notation. `concat` needs no wrap
+  -- (`List.flatten : List (List α) → List α` is already point-free-compatible);
+  -- `concatMap` does, since Haskell's is (f, xs).
+  | "Data.Foldable.elem"    | "GHC.List.elem"    => some "(fun x xs => xs.contains x)"
+  | "Data.Foldable.notElem" | "GHC.List.notElem" => some "(fun x xs => !(xs.contains x))"
+  | "GHC.List.lookup"       | "Data.List.lookup" => some "(fun k ps => ps.lookup k)"
+  | "Data.Foldable.concat"  | "GHC.List.concat"  => some "List.flatten"
+  | "Data.Foldable.concatMap" | "GHC.List.concatMap" => some "(fun f xs => xs.flatMap f)"
   -- Boolean / Prelude combinators.
   | "GHC.Classes.&&"   | "&&"      => some "(· && ·)"
   | "GHC.Classes.||"   | "||"      => some "(· || ·)"
@@ -180,6 +194,28 @@ def valueMap : String → Option String
   | "Data.Either.either"   => some "(fun f g e => Sum.elim f g e)"
   | _                      => none
 
+/-- Parenthesize an already-emitted type string for APPLICATION-ARGUMENT
+    position. Needed by the arms below that splice their args by juxtaposition
+    (`List a`, `Option a`, `Sum a b`): without it, `[[Int]]` emits the ill-typed
+    `List List Int`. The defect is wider than nested lists — `Maybe [Int]` gave
+    `Option List Int` and `[Maybe Int]` gave `List Option Int`. Earlier M1
+    fixtures dodged it by only using `[Int]`, `[(Int, Int)]` and tuples-of-lists
+    (safe because `×` is `infixr:35`, BELOW application, so `List Int × Int`
+    already parses as `(List Int) × Int` — which is why the tuple arms below
+    need no `parenArg`).
+
+    The `!startsWith "("` test rests on an invariant of `Emit.emitType`, whose
+    producers are a closed set: every one is either ATOMIC (tyVar, nullary
+    tyCon, nat literal) or FULLY BRACKETED (tyFun `(a → r)`, tyApp `(f x)`,
+    forAll `(∀ …)`, the tuple arms `(a × b)`, opaque tyCon
+    `((GHCCore.tyConOpaque "T") (a))`). So a leading `(` implies fully
+    bracketed, and the ONLY space-containing non-bracketed producers are the
+    four juxtaposition arms below. A future arm that splices args by
+    juxtaposition must use `parenArg` too; one that emits a new
+    space-containing UNBRACKETED shape would break this invariant. -/
+private def parenArg (s : String) : String :=
+  if s.contains ' ' && !s.startsWith "(" then s!"({s})" else s
+
 /-- GHC type constructor name + args → Lean type expression (as a string,
     with arg strings already emitted). Returns `none` when the ctor is opaque. -/
 def typeConMap : String → List String → Option String
@@ -195,10 +231,11 @@ def typeConMap : String → List String → Option String
   | "Char#",   []     => some "Char"
   | "GHC.Prim.Char#", [] => some "Char"
   | "()",      []     => some "Unit"
-  | "List",    [a]    => some s!"List {a}"
-  | "[]",      [a]    => some s!"List {a}"
-  | "Maybe",   [a]    => some s!"Option {a}"
-  | "Either",  [a, b] => some s!"Sum {a} {b}"
+  -- Juxtaposition arms — args go through `parenArg` (see its doc comment).
+  | "List",    [a]    => some s!"List {parenArg a}"
+  | "[]",      [a]    => some s!"List {parenArg a}"
+  | "Maybe",   [a]    => some s!"Option {parenArg a}"
+  | "Either",  [a, b] => some s!"Sum {parenArg a} {parenArg b}"
   -- Tuples. Lean's `×` is right-nested: `a × b × c = a × (b × c)`. Both the
   -- bare GHC tycon `(,)` (what the shim emits inside `tyConOpaque`) and any
   -- qualified form resolve here.

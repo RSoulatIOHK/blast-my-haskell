@@ -545,4 +545,111 @@ def totalBind : Bind :=
 #guard ((fun f z xs => List.foldr f z xs)
           (fun a b => List.cons (2 * a) b) ([] : List Int) ([1,2,3] : List Int)) == [2,4,6]
 
+/-! ## M1 Task 8 — search and flatten (elem, notElem, lookup, concat, concatMap) -/
+
+-- Names observed from /tmp/transpile-ListLibrary.json (GHC 9.2.7, pass-0000):
+--   Data.Foldable.elem / .notElem / .concat / .concatMap   (post-FTP Foldable)
+--   GHC.List.lookup                                        (not a Foldable method)
+-- NEGATIVES, all checked by extracting every qualified `GHC.*`/`Data.*` name in
+-- the JSON: ZERO occurrences of `GHC.List.elem`, `GHC.List.notElem`,
+-- `GHC.List.concat`, `GHC.List.concatMap` or `Data.List.lookup`. Those five keys
+-- are therefore UNOBSERVED hedges, kept per the never-remove-a-hedge rule
+-- (matching the length/null/sum/all family above). Core spines verbatim (`@ty`
+-- = an erased type application), dicts and all:
+--   hasZero    = \xs -> elem @ty Data.Foldable.$fFoldable[] @ty
+--                            GHC.Classes.$fEqInt (I# 0) xs
+--   misses     = \x xs -> notElem @ty @ty Data.Foldable.$fFoldable[]
+--                                 GHC.Classes.$fEqInt x xs
+--   lookupOr   = \k ps -> Data.Maybe.fromMaybe @ty (I# 0)
+--                           (GHC.List.lookup @ty @ty GHC.Classes.$fEqInt k ps)
+--   flattenAll = \xss -> concat @ty @ty Data.Foldable.$fFoldable[] xss
+--   dupEach    = \xs -> concatMap @ty @ty @ty Data.Foldable.$fFoldable[]
+--                         (\x -> build @ty (\a c n -> c x (c x n))) xs
+-- Note the DICT INTERLEAVING is not uniform: `elem` puts the Foldable dict
+-- BETWEEN its two type args, while `notElem` (same arity, same two classes)
+-- puts both type args first. Nothing in this pipeline may assume a fixed
+-- dict/type-arg order — Lower erases each `@ty`/dict wherever it sits, which is
+-- why both land at the mapped arity regardless. `concatMap` carries THREE type
+-- args and `concat` two, also erased.
+-- elem/notElem/lookup use BEq (the project's Eq image — hand-written Haskell
+-- `Eq` instances become `BEq` instances, and `$fEqInt` is erased by Lower along
+-- with `$fFoldable[]`, so the mapping lands at the mapped arity). Dot-notation
+-- binds the receiver by type; these wraps are LOAD-BEARING adapters: Haskell
+-- `elem` is `(x, xs)` with the element FIRST, whereas Lean's `List.contains` is
+-- receiver-first (`contains as a = elem a as`, an `abbrev`, Basic.lean:862).
+-- `List.lookup k ps` and `List.flatten` need no adapter beyond arg order, and
+-- `List.flatMap f xs` already matches Haskell's `concatMap f xs`.
+-- SCOPE NOTE (unverified, out of scope): every fixture def here is at `Int`, so
+-- whether a POLYMORPHIC Haskell def with an `Eq a` constraint transpiles is
+-- untested — it would need `emitDefHeader` to synthesize a `[BEq t]` binder the
+-- way it already does `[Inhabited t]` for the partial-default names.
+#guard valueMap "Data.Foldable.elem"    == some "(fun x xs => xs.contains x)"
+#guard valueMap "GHC.List.elem"         == some "(fun x xs => xs.contains x)"
+#guard valueMap "Data.Foldable.notElem" == some "(fun x xs => !(xs.contains x))"
+#guard valueMap "GHC.List.notElem"      == some "(fun x xs => !(xs.contains x))"
+#guard valueMap "GHC.List.lookup"       == some "(fun k ps => ps.lookup k)"
+#guard valueMap "Data.List.lookup"      == some "(fun k ps => ps.lookup k)"
+#guard valueMap "Data.Foldable.concat"  == some "List.flatten"
+#guard valueMap "GHC.List.concat"       == some "List.flatten"
+#guard valueMap "Data.Foldable.concatMap" == some "(fun f xs => xs.flatMap f)"
+#guard valueMap "GHC.List.concatMap"      == some "(fun f xs => xs.flatMap f)"
+-- Semantic pins. `List Int` ascriptions for the same reason as the Task 5/6
+-- blocks: unannotated numeric list literals elaborate at `Nat`, but `Int` is
+-- what the transpiler emits.
+#guard (([1, 2, 3] : List Int).contains 2) == true
+#guard (([1, 2, 3] : List Int).contains 9) == false
+#guard (([(1, 10), (2, 20)] : List (Int × Int)).lookup 2) == some 20
+#guard (([(1, 10)] : List (Int × Int)).lookup 9) == none
+#guard (([[1], [2, 3]] : List (List Int)).flatten) == [1, 2, 3]
+#guard (([] : List (List Int)).flatten) == []
+#guard (([1, 2] : List Int).flatMap (fun x => [x, x])) == [1, 1, 2, 2]
+-- APPLIED-shape guards, the load-bearing analogue of the Task 6 `zipWith` one
+-- at line 466. The pins above use dot notation on a literal, where the
+-- receiver type is already known; the EMITTED code applies the mapping lambda
+-- with UNANNOTATED binders (`((fun x xs => xs.contains x) 0 xs_123)`), where
+-- the binder type is still a metavariable when the field notation is
+-- elaborated. These guards are the only ones that pin that that postponement
+-- resolves — the dot-notation pins above pass either way.
+#guard ((fun x xs => xs.contains x) (2 : Int) [1, 2, 3]) == true
+#guard ((fun x xs => !(xs.contains x)) (9 : Int) [1, 2, 3]) == true
+#guard ((fun k ps => ps.lookup k) (2 : Int) [(1, 10), (2, 20)]) == some 20
+#guard ((fun f xs => xs.flatMap f) (fun x => [x, x]) ([1, 2] : List Int)) == [1, 1, 2, 2]
+
+-- MULTI-GENERATOR comprehension probe (`pairsUpTo n = [(x, y) | x <- [1 .. n],
+-- y <- [1 .. x]]`). A prior reviewer warned the Task-7 single-generator
+-- observation might not generalize. It does, and it needed ZERO new mappings:
+-- pass-0000 desugars the nested generators to ONE `GHC.Base.build` wrapping TWO
+-- nested `GHC.Base.foldr`s, the inner fold's seed being the outer fold's
+-- accumulator, with the ranges as `GHC.Enum.enumFromTo` and the tuple as
+-- `GHC.Tuple.(,)` (transcribed from the emitted Lean, with the erased type
+-- binder on `build`'s argument dropped):
+--   pairsUpTo = \n -> build (\c n' ->
+--     foldr (\ds ds' -> foldr (\dt dt' -> c (ds, dt) dt') ds' (enumFromTo 1 ds))
+--           n' (enumFromTo 1 n))
+-- Every head there was already mapped (build / GHC.Base.foldr / enumFromTo /
+-- Prod.mk), so no arm was added for it.
+-- This also STRENGTHENS the "observed: 0 occurrences at pass-0000" claim on the
+-- `GHC.Base.augment` arm (Maps.lean): a nested comprehension was the most
+-- plausible way that claim could have gone stale, and `augment` still does not
+-- appear (grep of the JSON: 0).
+
+-- Nested tycon applications in TYPE position. `flattenAll :: [[Int]] -> [Int]`
+-- is the first M1 fixture to nest one tycon inside another, and it exposed a
+-- PRE-EXISTING defect: the juxtaposition arms spliced their args unparenthesized,
+-- so `[[Int]]` emitted the ill-typed `List List Int` (loud fail — an
+-- "Application type mismatch", never silent-wrong). `Maybe [Int]` → `Option List
+-- Int` and `[Maybe Int]` → `List Option Int` were broken the same way. Fixed by
+-- routing those arms through `Maps.parenArg`. Both branches of that helper are
+-- pinned below, because the zero-churn property (atomic and already-bracketed
+-- args are left ALONE) matters as much as the fix: it is what keeps every
+-- previously-emitted annotation byte-identical.
+#guard typeConMap "List"   ["Int"]              == some "List Int"          -- atomic: unchanged
+#guard typeConMap "[]"     ["List Int"]         == some "List (List Int)"   -- the fix
+#guard typeConMap "Maybe"  ["List Int"]         == some "Option (List Int)"
+#guard typeConMap "List"   ["(Int × Int)"]      == some "List (Int × Int)"  -- bracketed: unchanged
+#guard typeConMap "Either" ["List Int", "Int"]  == some "Sum (List Int) Int"
+-- Tuple arms need no `parenArg`: `×` is `infixr:35`, BELOW application, so a
+-- juxtaposed arg already binds tighter than the `×` around it.
+#guard typeConMap "(,)"    ["List Int", "Int"]  == some "(List Int × Int)"
+
 end GhcCoreToLean.Tests
