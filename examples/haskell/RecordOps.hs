@@ -39,3 +39,8 @@ theorem resize_area : ∀ (w h : Int), area (resize w h (Rect (Point 0 0) 1 1)) 
 {- @lean
 theorem xs_example : xs [mkPoint 1 2, mkPoint 3 4] = [1, 3] := by decide
 -}
+
+{- @lean
+theorem topLeft_resize : ∀ (w h : Int),
+    px (topLeft (resize w h (Rect (Point 3 4) 1 1))) = 3 := by blaster
+-}

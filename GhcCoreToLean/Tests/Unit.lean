@@ -829,10 +829,18 @@ def mkPartialBind (nm : String) : Bind :=
 --  6. Nested record FIELD of user type: `Rect`'s `topLeft :: Point`.
 --
 -- NEGATIVES worth recording (later M2 tasks rest on them):
---   * TAG CENSUS of this dump — the 25th: `"tag":"Cast"` ×0, `"tag":"Coercion"`
---     ×0, `"tag":"Let"` ×0 (Type ×7, Case ×7, Lam ×14, App ×73). Records never
---     produce a coercion at pass-0000, so M2 Task 2's `ECoercion` plumbing is
---     still unexercised by any fixture — as that task's plan states.
+--   * TAG CENSUS — every `"tag"` PRESENT in this dump, with counts: TyCon ×177,
+--     Var ×78, App ×73, NonRec ×23, Lit ×18, Lam ×14, TyFun ×14, LitWord ×8,
+--     Case ×7, DataAlt ×7, Type ×7, LitString ×6, LitInt ×4 (13 distinct tags).
+--     ABSENT: `"tag":"Cast"` ×0, `"tag":"Coercion"` ×0, `"tag":"Let"` ×0.
+--     Scope of the coercion negative: none of the record shapes in THIS dump
+--     produced one, so M2 Task 2's `ECoercion` plumbing is unexercised *here*.
+--     That is not a claim about records in general — newtype fields, strict
+--     fields and GND-derived selectors are Task 2-3's probes for it.
+--     The LitString ×6 and LitWord ×8 sit ENTIRELY in the Typeable binds that
+--     `isJunkName` drops: `$trModule` (2 × LitString) and `$tcPoint`/`$tcRect`/
+--     `$tc'Point`/`$tc'Rect` (1 × LitString + 2 × LitWord each). No value bind
+--     carries either tag.
 --   * `.transpile-sandbox/.decls/RecordOps.decls.json` gives BOTH decls
 --     `"kind": "data"` (the field Task 4 filters newtypes on), each ctor
 --     carrying named `fields` (`topLeft`/`width`/`height`, `px`/`py`) — so
@@ -865,24 +873,30 @@ def mkPartialBind (nm : String) : Bind :=
 --     (`CustomRatio (-numerator r2) (denominator r2)`). Fix: `replaceCtorApps`,
 --     a boundary-aware application-position rewrite.
 --
--- For any shape in the mapped surface, fix (B) is loud in both directions: a
--- false positive puts a TERM where a type is expected (`BEq Point.Point`) and a
--- false negative leaves a type where a function is expected — both are
--- elaboration errors.
+-- For every shape the fixtures exercise, fix (B) is loud in both directions —
+-- a false positive puts a TERM where a type is expected (`BEq Point.Point`), a
+-- false negative leaves a type where a function is expected, both elaboration
+-- errors — EXCEPT inside a hand-written string literal, the one silent-rewrite
+-- hedge below.
 --
--- KNOWN HEDGE (not silent-wrong-free): the rewrite is textual, so a ctor name
--- followed by args inside a hand-written STRING LITERAL in a spec block is
+-- KNOWN HEDGE (the single non-loud exposure): the rewrite is textual, so a ctor
+-- name followed by args inside a hand-written STRING LITERAL in a spec block is
 -- rewritten too — `"s = \"Point 1\""` becomes `Point.Point 1` inside the
 -- literal. That is pre-existing exposure of the ` Ctor (` needle as well, not
--- new to `replaceCtorApps`. No fixture emits a string literal, and nothing in
--- today's maps produces one: Core spells a Haskell literal
--- `unpackCString# "…"#`, and `unpackCString#` has no `valueMap` arm, so outside
--- the `error`/`undefined` spine (where the whole application collapses to
--- `default`) it emits as a loud unknown identifier. (Note the narrower claim:
--- the string TYPE is mapped — `String` is `[Char]` in Core, which `typeConMap`
--- sends to `List Char`. It is literal PRODUCTION that cannot compile today, not
--- String-typed code in general.) So the residual risk is a hand-authored
--- literal in theorem text — rare, and reviewable in the spec block itself.
+-- new to `replaceCtorApps`. No fixture emits a `LitString` outside the dropped
+-- `$tr`/`$tc` binds (6 there, see the census above), and no Haskell string
+-- literal can reach the emitter at all — the AIRTIGHT reason is upstream of
+-- `valueMap`: the shim DISCARDS string payloads entirely (`shim/Main.hs:291`
+-- emits `"value": "<bs>"` for `MachStr`), so a string literal cannot round-trip
+-- regardless of what the maps do. (Belt and braces: Core spells the literal
+-- `unpackCString# "…"#` and `unpackCString#` has no `valueMap` arm, so outside
+-- the `error`/`undefined` spine — where the whole application collapses to
+-- `default` — it would emit as a loud unknown identifier anyway. And note the
+-- narrower claim: the string TYPE is mapped — `String` is `[Char]` in Core,
+-- which `typeConMap` sends to `List Char`. It is literal PRODUCTION that cannot
+-- compile today, not String-typed code in general.) So the residual risk is a
+-- hand-authored literal in theorem text — rare, and reviewable in the spec
+-- block itself.
 
 def pointDecl : DataDecl :=
   {name := "Point", kind := "data",
@@ -964,6 +978,18 @@ def rectMaybeDecl : DataDecl :=
 #guard (sortDataDecls [rectListDecl, pointDecl]).map (·.name) == ["Point", "RectList"]
 #guard (sortDataDecls [rectMaybeDecl, pointDecl]).map (·.name) == ["Point", "RectMaybe"]
 
+-- `dataDeclDeps` DEDUPLICATES. Consumers only test membership, so duplicates are
+-- harmless today — this pins the docstring's claim so it stays true. Without the
+-- `dedup` wrapper this returns `["Point", "Point"]`; every other guard in this
+-- block has at most one dependency per decl and so passes either way.
+def segDecl : DataDecl :=
+  {name := "Seg", kind := "data",
+   ctors := [ {name := "Seg",
+               fields := [ {name := "a", ty := .tyCon "Point" []},
+                           {name := "b", ty := .tyCon "Point" []} ]} ]}
+#guard dataDeclDeps ["Point"] segDecl == ["Point"]
+#guard (sortDataDecls [segDecl, pointDecl]).map (·.name) == ["Point", "Seg"]
+
 -- A self-recursive decl is NOT a dependency (Lean inductives are self-recursive
 -- by construction), so it must not deadlock the sort.
 def intListDecl : DataDecl :=
@@ -995,15 +1021,15 @@ def mutBDecl : DataDecl :=
 -- other is silently gone. GHC cannot emit two decls with one name; the guard is
 -- what makes the docstring's "always exactly the input decls" TRUE rather than
 -- merely claimed.
-def ptDeclDupA : DataDecl :=
+def dupDeclA : DataDecl :=
   {name := "Dup", kind := "data",
    ctors := [ {name := "DupA", fields := [ {name := "ax", ty := .tyCon "Int" []} ]} ]}
-def ptDeclDupB : DataDecl :=
+def dupDeclB : DataDecl :=
   {name := "Dup", kind := "data",
    ctors := [ {name := "DupB", fields := [ {name := "bx", ty := .tyCon "Bool" []} ]} ]}
-#guard (sortDataDecls [ptDeclDupA, ptDeclDupB]).length == 2
+#guard (sortDataDecls [dupDeclA, dupDeclB]).length == 2
 -- …and the fallback hands back the INPUT, so both ctors survive in dump order.
-#guard (sortDataDecls [ptDeclDupA, ptDeclDupB]).flatMap (·.ctors.map (·.name))
+#guard (sortDataDecls [dupDeclA, dupDeclB]).flatMap (·.ctors.map (·.name))
        == ["DupA", "DupB"]
 
 -- Whole-program pin for fix (A), with a manifest entry for the module's OWN
@@ -1012,6 +1038,13 @@ def ptDeclDupB : DataDecl :=
 -- before the `Rect` that uses it.
 def recordProg : Program :=
   {binds := [], typeDecls := [rectDecl, pointDecl], instances := []}
+-- This guard also pins the INVARIANT "`resolveUserCtors` never runs on the data
+-- block" (pipeline step 3 in Emit.lean's Name-resolution post-passes header). The
+-- ctor `Rect` shares its type's name, and the `| Ctor ` needle matches the
+-- inductive's own constructor line verbatim — so if the ctor pass were ever
+-- applied to the data block, this line would come out
+-- `| Rect.Rect : Point → …` (and `Point` in field position would become
+-- `Point.Point`), splitting into 1 piece instead of 2.
 #guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn
           "| Rect : Point → Int → Int → Rect").length == 2
 #guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "RecordOps.Point").length == 1
@@ -1019,9 +1052,18 @@ def recordProg : Program :=
 #guard (((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "inductive Rect").head!
           |>.splitOn "inductive Point").length == 2
 
--- BLASTER DATA POINT (recorded after the two fixes, from
--- `lake build GhcCoreToLean.Generated.RecordOps`): see the report/commit — the
--- four quantified record goals and the `decide` list goal are the end-to-end
--- evidence that the audited shapes verify, not just compile.
+-- BLASTER DATA POINT (from `lake build GhcCoreToLean.Generated.RecordOps` after
+-- the two fixes): all FIVE quantified record goals go through on the first try —
+-- `mkPoint_px`, `shiftX_moves`, `shiftX_keeps_py`, `resize_area`, and
+-- `topLeft_resize` (`px (topLeft (resize w h (Rect (Point 3 4) 1 1))) = 3`, the
+-- nested selector-through-update path, which also re-exercises fix (B) on a
+-- MULTI-LINE spec) — plus the `decide` list goal `xs_example`. Blaster also
+-- FALSIFIES the near-miss variants with real counterexamples (checked:
+-- `px (shiftX d (mkPoint x y)) = x` → d := 1; `py (mkPoint x y) = x` → x := 1,
+-- y := 0; `area (resize w h (Rect (Point 0 0) 1 1)) = w + h` → w := -1, h := 0;
+-- and `px (topLeft (resize w h (Rect (Point 3 4) 1 1))) = 4` → falsified with no
+-- variable assignment needed, since it is false for every w and h). So the ✅s
+-- are not vacuous: blaster is genuinely modelling construction, update and
+-- selection rather than discharging everything by reflexivity.
 
 end GhcCoreToLean.Tests

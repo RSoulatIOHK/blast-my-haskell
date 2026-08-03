@@ -672,6 +672,37 @@ def userDataConMap (decls : List DataDecl) : Name → Option String := fun n =>
           some (sanitize c.name)
       else none
 
+/-! ## Name-resolution post-passes
+
+Emitted text passes through an ORDERED pipeline of textual resolution passes.
+Both the order and each pass's site list are load-bearing.
+
+  1. `resolveUserTypes`      opaque local tycon → bare       — bodies, data block,
+                                                               spec text (3 sites)
+  2. `resolveNewtypes`       (M2 Task 4) newtype → underlying — after 1, before 3,
+                                                               SAME 3 sites
+  3. `resolveUserCtors`      ctor in application position → `T.C`
+                                                             — bodies + spec text
+                                                               ONLY, never the
+                                                               data block
+  4. `resolveExternalTypes`  remaining opaque → `M.T`        — whole output, last;
+                                                               requires 1 to have
+                                                               run on EVERY section
+
+Pass 1's three sites are, concretely: `emitFullProgram`'s `bodyResolved`
+(bodies + instances), its `dataBlock`, and `resolveSpecText` (user `@lean` theorem
+text). Passes 3 and 4 run at the first and third of those — pass 4 covering the
+whole joined output rather than the body section alone. Pass 3 must never see the
+data block: it would rewrite the inductive's own `| Ctor ` lines. Pass 4 must run
+last, and pass 1 must have reached every section before it, or a local type still
+spelled opaque gets rewritten to `M.T` for its OWN module `M`.
+
+Constraint for Task 4: keep newtypes IN `sortDataDecls`' input (dependency chains
+thread through them transitively, e.g. `Point` → `Wrapper`(newtype) → `Q`); filter
+them out only at the emission map — filtering before the sort loses the chain and
+reintroduces the forward-reference bug.
+-/
+
 /-- Rewrite occurrences of `(GHCCore.tyConOpaque "X")` to the bare name `X`
     for every user-declared type. The Core dump types user types as opaque
     (since the shim doesn't know the lakefile's type-ctor map); after the
@@ -714,19 +745,24 @@ def replaceCtorApps (bare qual : String) (src : String) : String :=
   | []              => src
   | first :: pieces =>
     -- `pieces` are the gaps AFTER each occurrence; occurrence `i` sits between
-    -- gap `i-1` (`prev`, or `first`) and gap `i` (`next`).
-    let rec go (atStart : Bool) (prev : String) (pieces : List String)
-        (acc : String) : String :=
+    -- gap `i-1` and gap `i` (`next`). The LEFT boundary is read straight off the
+    -- output built so far, which is always the text immediately preceding this
+    -- occurrence: a non-empty preceding gap ends `acc`, and an EMPTY one means
+    -- the previous occurrence was adjacent — that one's `appOK` was then false
+    -- (its gap started with `bare`, not an arg), so it emitted `bare` and left
+    -- `acc` ending identifier-ish, correctly blocking this one too. `acc` starts
+    -- as `first`, so `acc.isEmpty` also covers the start-of-string case.
+    let rec go (pieces : List String) (acc : String) : String :=
       match pieces with
       | []           => acc
       | next :: more =>
-        let leftOK  := if prev.isEmpty then atStart else !isIdentish prev.back
+        let leftOK  := acc.isEmpty || !isIdentish acc.back
         let rightOK := next.isEmpty || !isIdentish next.front
         let after   := next.dropWhile (· == ' ')
         let appOK   := !after.isEmpty && isArgStart after.front
         let repl    := if leftOK && rightOK && appOK then qual else bare
-        go false next more (acc ++ repl ++ next)
-    go true first pieces first
+        go more (acc ++ repl ++ next)
+    go pieces first
 
 /-- Qualify user-defined data constructors in any position where Lean's
     elaborator would otherwise be ambiguous (type vs. ctor under the same
@@ -773,28 +809,32 @@ private partial def tyConNames : GHCType → List Name
   | .tyVar _      => []
   | .tyLit _      => []
 
-/-- Locally-declared types that a decl's constructor fields refer to
-    (self-references dropped: `data T = C T` needs no ordering, Lean
-    inductives are self-recursive by construction). -/
+/-- Locally-declared types that a decl's constructor fields refer to, deduplicated
+    in first-occurrence order (self-references dropped: `data T = C T` needs no
+    ordering, Lean inductives are self-recursive by construction). Consumers only
+    test membership, but two fields of the same type — `data L = L Point Point` —
+    would otherwise report `Point` twice. -/
 def dataDeclDeps (localNames : List Name) (d : DataDecl) : List Name :=
   let mentioned := d.ctors.flatMap fun c => c.fields.flatMap fun f => tyConNames f.ty
-  mentioned.filter fun n => n != d.name && localNames.contains n
+  dedup (mentioned.filter fun n => n != d.name && localNames.contains n)
 
 /-- Order data decls so that a decl using another local type as a field type is
-    emitted AFTER it. Lean has no forward references, and the decl-plugin dumps
-    types in `tcg_tcs` order (observed: *reverse* source order for
-    `RecordOps`'s `Point`/`Rect`), which is not dependency order — so
-    `inductive Rect` would reference a not-yet-declared `Point`.
+    emitted AFTER it. Lean has no forward references and the decl-plugin's
+    `tcg_tcs` dump order is not dependency order, so `inductive Rect` would
+    otherwise reference a not-yet-declared `Point`.
 
-    The result is always exactly the input decls, reordered: elements only move
-    from `pending` to `acc`, never duplicate, so preserved length implies a
-    permutation. If the reordering ever DOES change the length — reachable only
-    when two decls share a name, since `pending.filter (·.name != d.name)` then
-    drops both, and GHC cannot produce that — the input is returned unchanged in
-    dump order. Likewise on a dependency CYCLE (mutually recursive records,
-    which would need a Lean `mutual` block) the remaining decls are appended in
-    dump order. Either way Lean fails loud on a forward reference instead of a
-    decl silently vanishing from the output. -/
+    CONSTRAINT: the result is always exactly the input decls, reordered. Elements
+    only move from `pending` to `acc` and never duplicate, so a preserved length
+    implies a permutation; the closing length check is the totality fallback for
+    the one input GHC cannot emit — two decls sharing a name, where
+    `pending.filter (·.name != d.name)` drops both while placing one. On a
+    dependency CYCLE (mutually recursive records, which would need a Lean
+    `mutual` block) the remaining decls are appended in dump order. Either way
+    Lean fails loud on a forward reference instead of a decl silently vanishing.
+
+    The `| 0, pending` arm is DEAD: `go` starts at `fuel = ds.length` and every
+    step consumes one fuel while removing one decl from `pending`, so `pending`
+    empties first. It exists only to satisfy the termination checker. -/
 def sortDataDecls (ds : List DataDecl) : List DataDecl :=
   let names := ds.map (·.name)
   let rec go (fuel : Nat) (pending : List DataDecl) (placed : List Name)
@@ -818,10 +858,14 @@ def resolveSpecText (typeDecls : List DataDecl) (extTypes : List (String × Stri
   resolveExternalTypes extTypes (resolveUserCtors typeDecls (resolveUserTypes typeDecls s))
 
 /-- Top-level entry: emit a full Program (data decls, value defs, instances).
-    The user-type and user-ctor post-passes are applied only to the
-    value-binding / instance sections; the data declarations themselves
-    must keep their original names. `extTypes` maps imported type names to
-    their defining module so cross-module references resolve. -/
+    Name resolution runs as the pipeline documented under "Name-resolution
+    post-passes" above: the TYPE pass (`resolveUserTypes`) runs on ALL sections —
+    bodies/instances, the data block, and user spec text (via `resolveSpecText`)
+    — because a local type used as another decl's FIELD type arrives opaque in the
+    data block exactly as it does in a body. The CTOR pass (`resolveUserCtors`)
+    runs on bodies and spec text ONLY, never the data block, where it would
+    corrupt the inductive's own `| Ctor ` lines. `extTypes` maps imported type
+    names to their defining module so cross-module references resolve. -/
 def emitFullProgram (extTypes : List (String × String)) (p : Program) : String :=
   -- User-declared ctors (e.g. `CustomRatio`) participate in the top-name
   -- set so App-position refs to them emit bare, not as `Name_<unique>`.
