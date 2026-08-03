@@ -49,9 +49,37 @@ def valueMap : String → Option String
   -- hijacked here. Core qualifies these names anyway, so nothing is lost. Bare
   -- *operator* forms (`++`, `&&`, …) stay, since users can't shadow them.
   | "GHC.Base.++"      | "++"      => some "List.append"
+  -- List literals. `[a,b,x3]` desugars to `GHC.Base.build (\c n -> c a (c b (c x3 n)))`
+  -- where `build g = g (:) []` (Lower erases both the rank-2 type application
+  -- AND the type binder on g). `augment g xs = g (:) xs` is introduced by the
+  -- "++" RULE in simplifier passes ≥ 1, which the pass-0000 dump this pipeline
+  -- reads never reaches — the arm is a forward hedge in case the dump point
+  -- moves, NOT a live `++` path (observed: 0 occurrences at pass-0000).
+  | "GHC.Base.build"   => some "(fun g => g List.cons List.nil)"
+  | "GHC.Base.augment" => some "(fun g xs => g List.cons xs)"
   | "GHC.Base.map"                => some "List.map"
   | "GHC.List.filter"             => some "List.filter"
   | "GHC.List.reverse"            => some "List.reverse"
+  -- Int ranges (Enum dict is erased by Lower). `enumFrom`/`enumFromThen`
+  -- (infinite) are intentionally NOT mapped — loud fail.
+  | "GHC.Enum.enumFromTo"     => some "Hs.enumFromTo"
+  | "GHC.Enum.enumFromThenTo" => some "Hs.enumFromThenTo"
+  -- Int-indexed list ops. Haskell clamps negative counts to "empty/unchanged";
+  -- `Int.toNat` clamps negatives to 0 — the semantics match exactly.
+  | "GHC.List.take"      => some "(fun n xs => List.take n.toNat xs)"
+  | "GHC.List.drop"      => some "(fun n xs => List.drop n.toNat xs)"
+  | "GHC.List.splitAt"   => some "Hs.splitAt"
+  | "GHC.List.replicate" => some "(fun n x => List.replicate n.toNat x)"
+  -- Zip family. Eta-wrapped for arity legibility ONLY — these lambdas are
+  -- definitionally equal to the bare names and pin nothing; arg order is
+  -- pinned by the (· - ·) guards in Tests/Unit.lean, the only thing that
+  -- catches a flip. Truncation to the shorter list matches Haskell.
+  | "GHC.List.zip"     => some "(fun xs ys => List.zip xs ys)"
+  | "GHC.List.zipWith" => some "(fun f xs ys => List.zipWith f xs ys)"
+  -- Asymmetry is deliberate: only `unzip` carries a `Data.List` hedge, because
+  -- the M1 plan mandated exactly that key. `zip`/`zipWith` were observed as
+  -- `GHC.List.*` only and the plan lists no hedge for them, so none is added.
+  | "GHC.List.unzip" | "Data.List.unzip" => some "List.unzip"
   -- Foldable methods (post-FTP). The desugarer resolves these through
   -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
   -- mapping fires regardless of which name appears.
@@ -59,8 +87,47 @@ def valueMap : String → Option String
   -- to `Int` (like `gcd`/`lcm`) so it composes with Int arithmetic.
   | "Data.Foldable.length" | "GHC.List.length"  => some "(fun xs => (List.length xs : Int))"
   | "Data.Foldable.null"   | "GHC.List.null"    => some "List.isEmpty"
-  | "Data.Foldable.foldr"  | "GHC.List.foldr"   => some "(fun f z xs => List.foldr f z xs)"
+  -- `GHC.Base.foldr` is the third alternative because list COMPREHENSIONS
+  -- desugar through it, not through the Foldable method: `[2*x | x <- xs]`
+  -- becomes `build (\c n -> GHC.Base.foldr (\ds ds' -> c (2*ds) ds') n xs)`.
+  -- It is the list-specialised `foldr :: (a->b->b) -> b -> [a] -> b` — two
+  -- type args then `(f) (z) (xs)` and NO dict (observed in the JSON), so it
+  -- has the same shape as the dict-erased Foldable form and shares this arm.
+  -- The foldl arm below has no matching `GHC.Base.*` alternative on purpose:
+  -- `GHC.Base` exports `foldr` (it is the fusion partner of `build`, which is
+  -- why comprehensions desugar to it) but exports no `foldl` at all — checked
+  -- against GHC 9.2.7, where `import GHC.Base (foldl)` is a hard export error.
+  | "Data.Foldable.foldr"  | "GHC.List.foldr" | "GHC.Base.foldr"
+                                               => some "(fun f z xs => List.foldr f z xs)"
   | "Data.Foldable.foldl"  | "GHC.List.foldl"   => some "(fun f z xs => List.foldl f z xs)"
+  -- Folds & predicates (Foldable methods post-FTP; GHC.List hedged).
+  -- sum/product are hand-rolled as explicit foldl for two concrete reasons:
+  -- (a) v4.24 core has NO `List.product` whatsoever, so `product` must be
+  -- hand-rolled regardless, and symmetry argues for hand-rolling `sum` too;
+  -- (b) core's `List.sum` is `foldr (· + ·) 0` while GHC's is `foldl (+) 0`,
+  -- so the explicit foldl is the more faithful image of the source.
+  -- The all/any wraps are LOAD-BEARING adapters (Haskell arg order is (p, xs);
+  -- Lean's List.all/any take the list first) — not legibility wraps.
+  | "Data.Foldable.sum"     | "GHC.List.sum"     => some "(fun xs => List.foldl (· + ·) 0 xs)"
+  | "Data.Foldable.product" | "GHC.List.product" => some "(fun xs => List.foldl (· * ·) 1 xs)"
+  | "Data.Foldable.all"     | "GHC.List.all"     => some "(fun p xs => List.all xs p)"
+  | "Data.Foldable.any"     | "GHC.List.any"     => some "(fun p xs => List.any xs p)"
+  | "Data.Foldable.and"     | "GHC.List.and"     => some "Hs.and"
+  | "Data.Foldable.or"      | "GHC.List.or"      => some "Hs.or"
+  -- Search & flatten. elem/notElem/lookup are Eq-constrained; the project's
+  -- image of Haskell `Eq` is `BEq` (hand-written Eq instances become BEq
+  -- instances), which is exactly what Lean's `List.contains`/`List.lookup`
+  -- require. The elem/notElem/lookup wraps are LOAD-BEARING adapters, not
+  -- legibility wraps: Haskell's arg order is (x, xs) / (k, ps) with the
+  -- searched-for value FIRST, whereas Lean's `List.contains`/`List.lookup` are
+  -- reached receiver-first via dot notation. `concat` needs no wrap
+  -- (`List.flatten : List (List α) → List α` is already point-free-compatible);
+  -- `concatMap` does, since Haskell's is (f, xs).
+  | "Data.Foldable.elem"    | "GHC.List.elem"    => some "(fun x xs => xs.contains x)"
+  | "Data.Foldable.notElem" | "GHC.List.notElem" => some "(fun x xs => !(xs.contains x))"
+  | "GHC.List.lookup"       | "Data.List.lookup" => some "(fun k ps => ps.lookup k)"
+  | "Data.Foldable.concat"  | "GHC.List.concat"  => some "List.flatten"
+  | "Data.Foldable.concatMap" | "GHC.List.concatMap" => some "(fun f xs => xs.flatMap f)"
   -- Boolean / Prelude combinators.
   | "GHC.Classes.&&"   | "&&"      => some "(· && ·)"
   | "GHC.Classes.||"   | "||"      => some "(· || ·)"
@@ -69,12 +136,15 @@ def valueMap : String → Option String
   | "GHC.Base.flip"               => some "(fun f a b => f b a)"
   | "GHC.Base.$"       | "$"       => some "(fun f x => f x)"
   | "GHC.Base.otherwise"          => some "true"
-  -- Partial functions. Haskell `head`/`last`/`!!`/`fromJust` are ⊥ ONLY on the
-  -- empty list / `Nothing`; they are faithful on the rest of their domain. So
-  -- they must NOT collapse to `default` everywhere (that breaks the defined
-  -- domain, e.g. `head [1,2,3]`). We map to Lean's total `*D`/`getD` forms:
+  -- Partial functions. Haskell `head`/`last`/`fromJust` are ⊥ ONLY on the
+  -- empty list / `Nothing`; `!!` is ⊥ on ANY out-of-range index (a negative
+  -- index reads position 0 after `Int.toNat` — still sound: ⊥ may be refined
+  -- by any value). All are faithful on the rest of their domain, so they must
+  -- NOT collapse to `default` everywhere (that breaks the defined domain,
+  -- e.g. `head [1,2,3]`). We map to Lean's total `*D`/`getD` forms:
   -- faithful where Haskell is defined, and `default` (an arbitrary inhabitant)
-  -- exactly where Haskell is ⊥ — the documented partial-correctness tradeoff.
+  -- where Haskell is ⊥ — the documented partial-correctness tradeoff (see the
+  -- README partial-functions bullet for the full per-function statement).
   -- `default` needs `[Inhabited t]`, which `emitDefHeader` adds for polymorphic
   -- defs (Emit recognises these names via `isPartialDefaultName`). `tail`/`init`
   -- map to Lean totals that need no default. Qualified only (don't shadow a
@@ -85,6 +155,12 @@ def valueMap : String → Option String
   | "GHC.List.last"       => some "(fun xs => xs.getLastD default)"
   | "GHC.List.!!"         => some "(fun xs i => xs.getD i.toNat default)"
   | "Data.Maybe.fromJust" => some "(fun m => m.getD default)"
+  -- maximum/minimum: ⊥ only on []. Same getD-default partial-correctness
+  -- route as head/last (registered in Emit.isPartialDefaultName so
+  -- polymorphic defs get an [Inhabited t] binder). Foldable-qualified
+  -- names observed (like sum/elem); GHC.List.* hedged.
+  | "Data.Foldable.maximum" | "GHC.List.maximum" => some "(fun xs => (List.max? xs).getD default)"
+  | "Data.Foldable.minimum" | "GHC.List.minimum" => some "(fun xs => (List.min? xs).getD default)"
   -- Tuple projections. Qualified only (a user could define `fst`/`snd`); the
   -- desugarer resolves these through `Data.Tuple.*`.
   | "Data.Tuple.fst"              => some "Prod.fst"
@@ -127,6 +203,41 @@ def valueMap : String → Option String
   | "Data.Either.either"   => some "(fun f g e => Sum.elim f g e)"
   | _                      => none
 
+/-- Parenthesize an already-emitted type string for APPLICATION-ARGUMENT
+    position. Needed by the arms below that splice their args by juxtaposition
+    (`List a`, `Option a`, `Sum a b`): without it, `[[Int]]` emits the ill-typed
+    `List List Int`. The defect is wider than nested lists — `Maybe [Int]` gave
+    `Option List Int` and `[Maybe Int]` gave `List Option Int`. Earlier M1
+    fixtures dodged it by only using `[Int]`, `[(Int, Int)]` and tuples-of-lists
+    (safe because `×` is `infixr:35`, BELOW application, so `List Int × Int`
+    already parses as `(List Int) × Int` — which is why the tuple arms below
+    need no `parenArg`).
+
+    The `!startsWith "("` test rests on an invariant of `Emit.emitType`, whose
+    producers are a closed set, in three buckets:
+    * ATOMIC (space-free): tyVar, nat literal, and MAPPED nullary tyCon. Note
+      "nullary tyCon ⇒ atomic" holds only for the MAPPED ones — every nullary
+      arm below returns a single word (Int / Nat / Bool / Char / Unit /
+      Ordering).
+    * FULLY BRACKETED: tyFun `(a → r)`, tyApp `(f x)`, forAll `(∀ …)`, the
+      tuple arms `(a × b)`, and BOTH opaque-tyCon shapes — the applied
+      `((GHCCore.tyConOpaque "T") (a))` and the NULLARY
+      `(GHCCore.tyConOpaque "T")`. The latter DOES contain a space, so it
+      belongs in this bucket rather than with the atoms; being bracketed, it is
+      correctly left alone.
+    * SPACE-CONTAINING and UNBRACKETED: the four juxtaposition arms below — the
+      case `parenArg` exists for — plus one benign outlier, a string type
+      literal `.tyLit (.str s)` whose payload has a space, which emits `"a b"`
+      and so gets wrapped to `("a b")`. Harmless: parens around a literal are
+      inert.
+    So a leading `(` still implies fully bracketed, and the juxtaposition arms
+    are the only place the wrapping is load-bearing. A future arm that splices
+    args by juxtaposition must use `parenArg` too; one that emits a new
+    space-containing UNBRACKETED shape in which parens are NOT inert would
+    break this invariant. -/
+private def parenArg (s : String) : String :=
+  if s.contains ' ' && !s.startsWith "(" then s!"({s})" else s
+
 /-- GHC type constructor name + args → Lean type expression (as a string,
     with arg strings already emitted). Returns `none` when the ctor is opaque. -/
 def typeConMap : String → List String → Option String
@@ -142,10 +253,11 @@ def typeConMap : String → List String → Option String
   | "Char#",   []     => some "Char"
   | "GHC.Prim.Char#", [] => some "Char"
   | "()",      []     => some "Unit"
-  | "List",    [a]    => some s!"List {a}"
-  | "[]",      [a]    => some s!"List {a}"
-  | "Maybe",   [a]    => some s!"Option {a}"
-  | "Either",  [a, b] => some s!"Sum {a} {b}"
+  -- Juxtaposition arms — args go through `parenArg` (see its doc comment).
+  | "List",    [a]    => some s!"List {parenArg a}"
+  | "[]",      [a]    => some s!"List {parenArg a}"
+  | "Maybe",   [a]    => some s!"Option {parenArg a}"
+  | "Either",  [a, b] => some s!"Sum {parenArg a} {parenArg b}"
   -- Tuples. Lean's `×` is right-nested: `a × b × c = a × (b × c)`. Both the
   -- bare GHC tycon `(,)` (what the shim emits inside `tyConOpaque`) and any
   -- qualified form resolve here.
@@ -153,6 +265,8 @@ def typeConMap : String → List String → Option String
   | "GHC.Tuple.(,)", [a, b] => some s!"({a} × {b})"
   | "(,,)",  [a, b, c] => some s!"({a} × {b} × {c})"
   | "GHC.Tuple.(,,)", [a, b, c] => some s!"({a} × {b} × {c})"
+  | "(,,,)", [a, b, c, d]           => some s!"({a} × {b} × {c} × {d})"
+  | "GHC.Tuple.(,,,)", [a, b, c, d] => some s!"({a} × {b} × {c} × {d})"
   | "Ordering", []    => some "Ordering"
   | _,         _      => none
 
@@ -168,11 +282,12 @@ def dataConMap : String → Option String
   | "()"      => some "Unit.unit"
   -- 2-tuple construction → `Prod.mk a b`. Both the bare pattern-position name
   -- `(,)` and the qualified value-position name `GHC.Tuple.(,)` resolve here.
-  -- NOTE: 3-tuple construction is intentionally NOT mapped: `Prod.mk` is binary,
-  -- and `emitExpr` left-applies, so `(,,) a b c` would emit `((Prod.mk a) b) c`,
-  -- which is ill-typed. Tracked as a follow-up (see TupleBasics report). The
-  -- type (`a × b × c`) and pattern (`(x, y, z)`) paths DO support 3-tuples.
   | "(,)"     | "GHC.Tuple.(,)" => some "Prod.mk"
+  -- 3-/4-tuple construction. Eta-expanded lambdas, NOT `Prod.mk` (which is
+  -- binary — left-applying it to 3 args is ill-typed): `(fun a b c => (a,b,c))`
+  -- left-applies correctly at any saturation. 5+-tuples remain unmapped (loud).
+  | "(,,)"  | "GHC.Tuple.(,,)"  => some "(fun a b c => (a, b, c))"
+  | "(,,,)" | "GHC.Tuple.(,,,)" => some "(fun a b c d => (a, b, c, d))"
   -- Ordering constructors. Core delivers the qualified `GHC.Types.*` forms
   -- (confirmed via Generated/NumOrd.lean); bare forms kept as a hedge.
   | "LT" | "GHC.Types.LT" => some "Ordering.lt"

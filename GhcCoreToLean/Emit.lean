@@ -159,8 +159,9 @@ def emitAltPattern (con : AltCon) (bndrs : List Var) : String :=
     -- Tuple patterns use Lean's anonymous-tuple syntax `(x, y, …)`, which
     -- right-nests for any arity (so 3-tuples are fine here). The pattern-
     -- position ctor name is bare `(,)`/`(,,)`; qualified forms covered too.
-    if name == "(,)" || name == "(,,)"
-       || name == "GHC.Tuple.(,)" || name == "GHC.Tuple.(,,)" then
+    if name == "(,)" || name == "(,,)" || name == "(,,,)"
+       || name == "GHC.Tuple.(,)" || name == "GHC.Tuple.(,,)"
+       || name == "GHC.Tuple.(,,,)" then
       let bs := String.intercalate ", " (bndrs.map localId)
       s!"({bs})"
     else
@@ -187,15 +188,20 @@ private def isBottomName : Name → Bool
   | _ => false
 
 /-- Partial functions whose *faithful* `valueMap` image uses `default` on the
-    ⊥ part of their domain (`head`/`last`/`!!`/`fromJust`). They are NOT bottoms
+    ⊥ part of their domain (`head`/`last`/`!!`/`fromJust`, and
+    `maximum`/`minimum`, which are ⊥ only on `[]`). They are NOT bottoms
     — they do not collapse to `default` everywhere (that would be unsound on the
     defined domain, e.g. `head [1,2,3]`). But because their emitted term mentions
     `default`, a polymorphic def using one needs an `[Inhabited t]` binder, so
     `exprHasBottom` must see through to them. (`tail`→`List.tail` and
-    `init`→`List.dropLast` are total with no `default`, so they're not listed.) -/
+    `init`→`List.dropLast` are total with no `default`, so they're not listed.)
+    Both members of each hedged name pair are listed: a one-sided registration
+    would silently skip the binder for whichever key Core actually delivers. -/
 private def isPartialDefaultName : Name → Bool
   | "GHC.List.head" | "GHC.List.last" | "GHC.List.!!"
-  | "Data.Maybe.fromJust" => true
+  | "Data.Maybe.fromJust"
+  | "Data.Foldable.maximum" | "GHC.List.maximum"
+  | "Data.Foldable.minimum" | "GHC.List.minimum" => true
   | _ => false
 
 private partial def appHeadName : Expr → Option Name
@@ -207,9 +213,9 @@ private partial def appHeadName : Expr → Option Name
 
 /-- Does any subexpression emit a `default`? True for an applied bottom
     (`error`/`undefined`) or an applied partial whose faithful image uses
-    `default` (`head`/`last`/`!!`/`fromJust`). Used to decide whether a def's
-    polymorphic result needs an `[Inhabited t]` binder so the emitted `default`
-    elaborates. -/
+    `default` (`head`/`last`/`!!`/`fromJust`/`maximum`/`minimum`). Used to
+    decide whether a def's polymorphic result needs an `[Inhabited t]` binder so
+    the emitted `default` elaborates. -/
 private partial def exprHasBottom : Expr → Bool
   | .var _   => false
   | .lit _   => false
