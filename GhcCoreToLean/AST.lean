@@ -56,6 +56,12 @@ mutual
     | case_  : Expr → Var → GHCType → List Alt → Expr
     | cast   : Expr → Expr
     | type_  : GHCType → Expr
+    -- A coercion in expression position (GHC `Coercion`). Payload-free: it
+    -- exists only so `Lower` can erase it in argument position, exactly like
+    -- `.type_`. Never valid in head position (a coercion is not a function) —
+    -- if one survives lowering, `Emit` produces an undefined identifier so the
+    -- generated file fails loud rather than silently meaning something.
+    | coercion : Expr
     | tick   : Expr → Expr
 
   inductive Bind where

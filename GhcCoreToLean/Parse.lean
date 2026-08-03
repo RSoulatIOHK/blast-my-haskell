@@ -139,9 +139,24 @@ mutual
       let altsA ← (← getField j "alts").getArr?
       let alts  ← altsA.toList.mapM parseAlt
       .ok (.case_ scr bnd ty alts)
+    | "Coercion" => .ok .coercion
     | "Cast" => do
-      let e ← parseExpr (← getField j "expr")
-      .ok (.cast e)
+      -- LEGACY tag. ghc-dump has no `ECast` node (`Convert.hs`:
+      -- `Cast x _ -> cvtExpr x` erases the cast before we see it), so the only
+      -- producer this arm ever had was the pre-M2 shim's
+      -- `ECoercion -> {"tag":"Cast","expr":{}}` — whose empty `expr` this arm
+      -- could not parse, aborting the whole dump. A payload-free / tagless
+      -- `expr` is therefore read as the coercion atom; a *tagged* nested `expr`
+      -- is still parsed as `.cast` (and still errors loud if malformed), so an
+      -- older dump with a real nested expression keeps working.
+      match getField j "expr" with
+      | .error _ => .ok .coercion
+      | .ok ej   =>
+        match getTag ej with
+        | .error _ => .ok .coercion
+        | .ok _    => do
+          let e ← parseExpr ej
+          .ok (.cast e)
     | "Tick" => do
       let e ← parseExpr (← getField j "expr")
       .ok (.tick e)

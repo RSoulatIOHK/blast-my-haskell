@@ -1,6 +1,8 @@
 import GhcCoreToLean.Maps
 import GhcCoreToLean.Emit
 import GhcCoreToLean.AST
+import GhcCoreToLean.Parse
+import GhcCoreToLean.Lower
 import GhcCoreToLean.Runtime
 
 namespace GhcCoreToLean.Tests
@@ -1065,5 +1067,109 @@ def recordProg : Program :=
 -- variable assignment needed, since it is false for every w and h). So the ✅s
 -- are not vacuous: blaster is genuinely modelling construction, update and
 -- selection rather than discharging everything by reflexivity.
+
+/-! ## M2 Task 2 — coercion token -/
+
+-- OBSERVATIONS (read out of ghc-dump-core-0.2.1.0 and shim/Main.hs; NOT from a
+-- dump — no fixture produces a coercion yet, see the coverage note at the end).
+--
+--  1. There is NO `Cast` node in ghc-dump's AST at all. `GhcDump/Ast.hs` `Expr'`
+--     lists exactly EVar/EVarGlobal/ELit/EApp/ETyLam/ELam/ELet/ECase/ETick/
+--     EType/ECoercion, and `GhcDump/Convert.hs:233` is `Cast x _ -> cvtExpr x`
+--     — the cast is thrown away, only its body survives. So the shim can only
+--     ever see `ECoercion` (`Convert.hs:239`, `Coercion _ -> ECoercion`), and
+--     Parse.lean's `"Cast"` arm was never reachable from a real coercion; the
+--     one thing that DID reach it was the old shim's own
+--     `{"tag":"Cast","expr":{}}`, whose empty `expr` it could not parse (hard
+--     abort of the entire dump). Hence: shim now emits `{"tag":"Coercion"}`,
+--     and the legacy `"Cast"` arm degrades to `.coercion` instead of aborting.
+--  2. `ECoercion` carries NO payload (nullary constructor) — there is nothing to
+--     round-trip, which is why `Expr.coercion` is an atom rather than wrapping a
+--     type or a pair of types.
+--  3. COERCION BINDERS arrive with role `.id`, i.e. they are NOT erased today.
+--     Chain: `Convert.cvtBinder` (Convert.hs:113) branches on `Var.isId`, and a
+--     GHC CoVar IS an Id → it emits `Binder{…}`, not `TyBinder{…}`;
+--     `cvtIdDetails` (Convert.hs:177) maps `IdInfo.CoVarId{} -> Ast.CoVarId`;
+--     `shim/Main.hs` `binderRole` (~line 150) only recognises `DFunId` plus a
+--     `$d`/`$f` NAME prefix, so `CoVarId` falls through to `"id"`. Therefore
+--     `Lower.isTypeOrDictBinder` says false, `\(co :: a ~R# b) -> …` survives
+--     lowering, and `emitExpr` produces `(fun co_N => …)`: a Lean abstraction
+--     over a value that does not exist. NOT IMPLEMENTED HERE (would be
+--     speculative — no dump exhibits it). Candidate Task 3 fix: teach
+--     `binderRole` about `CoVarId` (either `-> "dict"` or a new `"coercion"`
+--     role), which makes BOTH `isTypeOrDictBinder` and `isTypeOrDictArg` erase
+--     it for free. The guard below pins today's non-erasing behaviour and is
+--     EXPECTED TO FLIP if Task 3 does that — read its failure as progress.
+
+-- A Coercion in ARGUMENT position erases like a type/dict arg: `f co` → `f`.
+-- `Expr` derives no `BEq` (see the deriving-free mutual block in AST.lean), so
+-- these compare emitted strings, like the `headApp`/`maximumApp` guards above.
+def coF : Var := {name := "f", unique := 1, ty := .tyCon "Int" [], role := .id}
+#guard emitExpr [] [] (Lower.lowerExpr (.app (.var coF) .coercion))
+       == emitExpr [] [] (Expr.var coF)
+#guard emitExpr [] [] (Lower.lowerExpr (.app (.var coF) .coercion)) == "f_1"
+-- …and it is erased, not merely emitted-as-nothing: the residue name is absent.
+#guard ((emitExpr [] [] (Lower.lowerExpr (.app (.var coF) .coercion))).splitOn
+          "coercionResidue").length == 1
+
+-- A SURVIVING bare coercion must be LOUD. `GHCCore.coercionResidue` is defined
+-- NOWHERE (Runtime.lean is namespace `Hs`), exactly like `GHCCore.typeArg`, so
+-- the generated file fails to elaborate rather than silently picking a value.
+#guard emitExpr [] [] Expr.coercion == "GHCCore.coercionResidue"
+
+-- Coercion BINDER, pinning observation 3: role `.id` ⇒ the lambda SURVIVES.
+def coBinder : Var := {name := "co", unique := 9, ty := .tyCon "~R#" [], role := .id}
+#guard emitExpr [] [] (Lower.lowerExpr (.lam coBinder .coercion))
+       == "(fun co_9 => GHCCore.coercionResidue)"
+
+-- PARSE (pure, `Except String Expr`, so guard-testable — no IO involved).
+def coTyJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "TyCon"), ("name", .str "Int"), ("args", .arr #[])]
+def coVarJson : Lean.Json :=
+  Lean.Json.mkObj [("name", .str "f"), ("unique", .num 1),
+                   ("type", coTyJson), ("role", .str "id")]
+def coercionJson : Lean.Json := Lean.Json.mkObj [("tag", .str "Coercion")]
+def legacyCastJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"), ("expr", Lean.Json.mkObj [])]
+-- Note the two levels: the nested `expr` of a `Cast` is an *Expr* object
+-- (`{"tag":"Lit", …}`), whose `lit` field is the *Literal* object.
+def litExprJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Lit"),
+                   ("lit", Lean.Json.mkObj [("tag", .str "LitInt"), ("value", .num 7)])]
+def nestedCastJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"), ("expr", litExprJson)]
+-- `f <arg>` as the shim would deliver it, for the COMPOSED parse→lower→emit path.
+def appCoJson (argJ : Lean.Json) : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "App"),
+                   ("fun", Lean.Json.mkObj [("tag", .str "Var"), ("var", coVarJson)]),
+                   ("arg", argJ)]
+-- Errors are folded into the string so a parse failure reports WHY, not just "≠".
+def parseEmit (j : Lean.Json) : String :=
+  match parseExpr j with
+  | .ok e    => emitExpr [] [] e
+  | .error m => s!"ERR: {m}"
+def parseLowerEmit (j : Lean.Json) : String :=
+  match parseExpr j with
+  | .ok e    => emitExpr [] [] (Lower.lowerExpr e)
+  | .error m => s!"ERR: {m}"
+
+#guard parseEmit coercionJson == "GHCCore.coercionResidue"
+-- The legacy `{"tag":"Cast","expr":{}}` no longer ABORTS (it used to fail with
+-- an "expected tag" error that killed the whole dump); it degrades to the atom.
+#guard parseEmit legacyCastJson == "GHCCore.coercionResidue"
+-- A well-formed TAGGED nested `expr` still parses as `.cast` (transparent in
+-- emission) — backwards compatibility for any dump that does carry one.
+#guard parseEmit nestedCastJson == "(7 : Int)"
+-- COMPOSED path, the guard that piecewise ones cannot replace: parse ∘ lower
+-- must erase the argument. `isTypeOrDictArg` has no `.cast` arm, so if Parse
+-- ever yielded `.cast .coercion` here instead of a bare `.coercion` the arg
+-- would NOT be erased and this would read `(f_1) (GHCCore.coercionResidue)`.
+#guard parseLowerEmit (appCoJson coercionJson) == "f_1"
+#guard parseLowerEmit (appCoJson legacyCastJson) == "f_1"
+
+-- COVERAGE NOTE: no fixture reaches any of this yet — 0 `"Cast"`/`"Coercion"`
+-- tags across all existing dumps, and the Ratio/RecordOps regression exercises
+-- none of the lines above (it only proves nothing else broke). These guards are
+-- the SOLE coverage of the new path until Task 3's newtype fixture triggers it.
 
 end GhcCoreToLean.Tests

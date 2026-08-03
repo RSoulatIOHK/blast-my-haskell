@@ -80,6 +80,7 @@ mutual
     | .cast e      => occursInExpr n e
     | .tick e      => occursInExpr n e
     | .type_ _     => false
+    | .coercion    => false
 
   partial def occursInBind (n : Name) : Bind → Bool
     | .nonRec _ e => occursInExpr n e
@@ -277,6 +278,12 @@ mutual
     | .cast e  => emitExpr mm top e
     | .tick e  => emitExpr mm top e
     | .type_ _ => "(GHCCore.typeArg : GHCCore.GHCType)"
+    -- LOUD residue. `Lower` erases coercion arguments, and a coercion cannot
+    -- occur in head position, so reaching here means an unhandled shape (e.g. a
+    -- coercion *binder*, see the M2 Task 2 notes in Tests/Unit.lean). Like
+    -- `GHCCore.typeArg`, this identifier is deliberately not defined anywhere:
+    -- the generated file must fail to elaborate rather than pick some value.
+    | .coercion => "GHCCore.coercionResidue"
 
   partial def emitAlt (mm : List (Name × Name)) (top : List Name) : Alt → String
     | .mk con bndrs rhs =>
@@ -510,6 +517,7 @@ private partial def usesTagPrim : Expr → Bool
   | .cast e      => usesTagPrim e
   | .tick e      => usesTagPrim e
   | .type_ _     => false
+  | .coercion    => false
 
 /-- Class-method binder names, by class. Used both to detect derived instances
     and to suppress their (untranslatable) method defs. -/
