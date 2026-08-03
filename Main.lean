@@ -57,8 +57,15 @@ private def emitNamesCrib (prog : Program) : String :=
     let bindLines := names.map fun n =>
       let lean := Emit.sanitize n
       if n == lean then s!"--   {n}" else s!"--   {n}  →  {lean}"
-    let typeLines := prog.typeDecls.map fun d =>
-      s!"--   data {d.name}"
+    -- Dependency order, matching the order `emitFullProgram` emits the decls in
+    -- (`sortDataDecls`) rather than the dump order. Newtypes appear here even
+    -- though they emit no decl — the crib is the record of what the module
+    -- declared, and the annotation is where a reader learns the type is gone.
+    let nts := Emit.newtypeSubsts prog.typeDecls
+    let typeLines := (Emit.sortDataDecls prog.typeDecls).map fun d =>
+      match nts.find? (·.1 == d.name) with
+      | some (_, u) => s!"--   newtype {d.name} (erased → {u})"
+      | none        => s!"--   data {d.name}"
     let instLines := prog.instances.filterMap fun i =>
       if i.className == "Eq" then
         let head := i.headTypes.map (Emit.emitType) |> String.intercalate " "

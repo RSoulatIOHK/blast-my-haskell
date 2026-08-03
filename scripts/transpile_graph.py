@@ -20,7 +20,9 @@ Two subcommands, both line-oriented so bash can consume them:
           <TypeName>\t<DefiningModule>
 
       one per declared data type. Used to resolve cross-module type refs
-      (the transpiler reads this via EXT_TYPES_MANIFEST).
+      (the transpiler reads this via EXT_TYPES_MANIFEST). `newtype` decls are
+      skipped: they are erased to their underlying type and have no Lean name to
+      qualify.
 """
 
 from __future__ import annotations
@@ -104,6 +106,14 @@ def manifest(decls_dir: str, mods: list[str]) -> int:
         d = json.load(open(p))
         defining = d.get("module", mod)
         for t in d.get("typeDecls", []):
+            # Newtypes are erased to their underlying type and emit no Lean decl
+            # (Emit.resolveNewtypes), so a manifest entry would rewrite `Age` to
+            # a `Module.Age` that does not exist. Note the manifest is shared
+            # across the graph, so this also kills the CURRENT module's own
+            # self-entry, which goes live the moment newtypes leave the
+            # transpiler's user-type set.
+            if t.get("kind") == "newtype":
+                continue
             name = t.get("name")
             if name:
                 print(f"{name}\t{defining}")

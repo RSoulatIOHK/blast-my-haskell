@@ -687,7 +687,7 @@ Both the order and each pass's site list are load-bearing.
 
   1. `resolveUserTypes`      opaque local tycon → bare       — bodies, data block,
                                                                spec text (3 sites)
-  2. `resolveNewtypes`       (M2 Task 4) newtype → underlying — after 1, before 3,
+  2. `resolveNewtypes`       newtype → underlying type       — after 1, before 3,
                                                                SAME 3 sites
   3. `resolveUserCtors`      ctor in application position → `T.C`
                                                              — bodies + spec text
@@ -705,22 +705,113 @@ data block: it would rewrite the inductive's own `| Ctor ` lines. Pass 4 must ru
 last, and pass 1 must have reached every section before it, or a local type still
 spelled opaque gets rewritten to `M.T` for its OWN module `M`.
 
-Constraint for Task 4: keep newtypes IN `sortDataDecls`' input (dependency chains
-thread through them transitively, e.g. `Point` → `Wrapper`(newtype) → `Q`); filter
-them out only at the emission map — filtering before the sort loses the chain and
-reintroduces the forward-reference bug.
+Newtype erasure (pass 2) adds two constraints of its own, both live:
+
+* Passes 1 and 3 take `keptTypeDecls`, NOT `p.typeDecls`. Pass 1 on the full set
+  would consume the `(GHCCore.tyConOpaque "Age")` needle and rewrite it to a bare
+  `Age` that pass 2 can no longer see (and that no `inductive` declares).
+* Newtypes stay IN `sortDataDecls`' input (dependency chains thread through them
+  transitively, e.g. `Point` → `Wrapper`(newtype) → `Q`); they are filtered out
+  only at the emission map — filtering before the sort loses the chain and
+  reintroduces the forward-reference bug. Pass 2's substituted STRINGS are
+  themselves pre-resolved (`newtypeSubsts`) for the same chain reason: a newtype
+  wrapping a local type must not splice a needle back in after pass 1 has run.
 -/
 
 /-- Rewrite occurrences of `(GHCCore.tyConOpaque "X")` to the bare name `X`
     for every user-declared type. The Core dump types user types as opaque
     (since the shim doesn't know the lakefile's type-ctor map); after the
     transpiler emits `inductive X where …`, opaque references should resolve
-    to that inductive directly. -/
+    to that inductive directly.
+
+    Takes the KEPT decls (`keptTypeDecls`), not every `typeDecls` entry: an
+    erased newtype must keep its opaque spelling through this pass so that
+    `resolveNewtypes` (pass 2) still finds its needle. -/
 def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     let needle := s!"(GHCCore.tyConOpaque \"{d.name}\")"
     let replacement := sanitize d.name
     s.replace needle replacement
+
+/-! ### Newtype erasure (pass 2)
+
+A `newtype` has no Lean image at all: Core already identifies it with its
+underlying type (GHC erases wrap/unwrap into `Cast`s that never reach the shim —
+see the M2 Task 3 observation in `Tests/Unit.lean`), so the emitted VALUES are
+plain identities and only the emitted TYPES still mention it. Erasing the type
+makes those values typecheck.
+-/
+
+/-- Newtypes that erase, as (declared name, underlying type as `emitType` gives
+    it — the single ctor's single field).
+
+    A "newtype" with ≠1 ctor or ≠1 field is a MALFORMED dump (Haskell admits
+    neither shape), so it is not erased: it is absent from this list and every
+    consumer below therefore treats it exactly like a `data` decl — emitted as
+    an `inductive`, its ctors qualified. That is loud downstream rather than
+    silent, because GHC has already erased the value level: identity bodies
+    against a surviving one-field-per-ctor inductive are type MISMATCHES. No
+    `panic!`, no invented recovery. -/
+def newtypeDecls (decls : List DataDecl) : List (Name × String) :=
+  decls.filterMap fun d =>
+    if d.kind != "newtype" then none
+    else match d.ctors with
+      | [c] => match c.fields with
+        | [f] => some (d.name, emitType f.ty)
+        | _   => none
+      | _   => none
+
+/-- The decls that keep a Lean image: everything except the newtypes
+    `newtypeDecls` erases. THE key for every newtype suppression site
+    (`resolveUserTypes`, `resolveUserCtors`, `ctorNames`, the `datas` emission
+    map), so a malformed newtype is uniformly treated as data. -/
+def keptTypeDecls (decls : List DataDecl) : List DataDecl :=
+  let erased := (newtypeDecls decls).map (·.1)
+  decls.filter fun d => !erased.contains d.name
+
+/-- Wrap an underlying type string for substitution into the fully-bracketed
+    hole a nullary opaque tycon leaves. `(GHCCore.tyConOpaque "Ages")` may sit in
+    application-argument position (`List (GHCCore.tyConOpaque "Ages")`), so an
+    unbracketed juxtaposition like `List Int` has to become `(List Int)` or
+    `List List Int` results. Same rule (and the same closed set of `emitType`
+    shapes) as `Maps.parenArg`. -/
+private def newtypeArg (u : String) : String :=
+  if u.contains ' ' && !u.startsWith "(" then s!"({u})" else u
+
+/-- Rewrite `(GHCCore.tyConOpaque "N")` → the underlying type of newtype `N`.
+    Runs AFTER `resolveUserTypes` (whose decl set excludes these newtypes, so
+    the needle survives) and BEFORE `resolveUserCtors`. The needle is the whole
+    opaque form, so there is no substring bleed between related names (`Age` vs.
+    `Wage`: the needle's `"` delimiters block it).
+
+    The underlying strings must already be pipeline-resolved — use
+    `newtypeSubsts`, never `newtypeDecls` directly. -/
+def resolveNewtypes (nts : List (Name × String)) (src : String) : String :=
+  nts.foldl (init := src) fun s (n, u) =>
+    let needle := s!"(GHCCore.tyConOpaque \"{n}\")"
+    s.replace needle (newtypeArg u)
+
+/-- The substitution list the pipeline actually applies: `newtypeDecls` with each
+    underlying string put through the passes that have ALREADY run on the text it
+    gets spliced into, so no substitution can reintroduce a stale needle.
+
+    * other newtypes erased — `newtype A = A B` where `B` is itself a newtype;
+      fuel-bounded (a chain of n newtypes needs n-1 rounds) and self-references
+      are excluded, so the legal-but-useless `newtype A = A A` cannot diverge (it
+      stays opaque → loud). Saturating the MAP rather than re-scanning the source
+      also makes the result independent of dump order.
+    * then local opaque tycons made bare — `newtype Wrapper = Wrapper Q` for a
+      local `data Q` yields `(GHCCore.tyConOpaque "Q")` from `emitType`, and pass
+      1 has already run over the source; splicing that raw would leave a live
+      needle for `resolveExternalTypes` to rewrite to a nonexistent `M.Q`. -/
+def newtypeSubsts (decls : List DataDecl) : List (Name × String) :=
+  let raw := newtypeDecls decls
+  let rec saturate (fuel : Nat) (nts : List (Name × String)) : List (Name × String) :=
+    match fuel with
+    | 0        => nts
+    | fuel + 1 => saturate fuel (nts.map fun (n, u) =>
+                    (n, resolveNewtypes (nts.filter (·.1 != n)) u))
+  (saturate raw.length raw).map fun (n, u) => (n, resolveUserTypes (keptTypeDecls decls) u)
 
 /-- Characters that continue (or qualify) a Lean identifier. A ctor-name
     occurrence flanked by one of these is part of a LONGER name — `mkPoint`,
@@ -859,11 +950,19 @@ def sortDataDecls (ds : List DataDecl) : List DataDecl :=
   if result.length != ds.length then ds else result
 
 /-- Apply the same name-resolution post-passes used on emitted bodies to a
-    single user spec string: local types → bare, imported types → `M.T`,
-    user ctors → `T.C`. -/
+    single user spec string: local types → bare, newtypes → underlying, imported
+    types → `M.T`, user ctors → `T.C`.
+
+    Only the transpiler-emitted OPAQUE spelling of a newtype erases here; a user
+    spec that writes the newtype's name by hand (`∀ (a : Age)`) is left alone and
+    fails loud (unknown identifier) — newtype properties are written against the
+    underlying type. -/
 def resolveSpecText (typeDecls : List DataDecl) (extTypes : List (String × String))
     (s : String) : String :=
-  resolveExternalTypes extTypes (resolveUserCtors typeDecls (resolveUserTypes typeDecls s))
+  let kept := keptTypeDecls typeDecls
+  resolveExternalTypes extTypes
+    (resolveUserCtors kept
+      (resolveNewtypes (newtypeSubsts typeDecls) (resolveUserTypes kept s)))
 
 /-- Top-level entry: emit a full Program (data decls, value defs, instances).
     Name resolution runs as the pipeline documented under "Name-resolution
@@ -872,13 +971,23 @@ def resolveSpecText (typeDecls : List DataDecl) (extTypes : List (String × Stri
     — because a local type used as another decl's FIELD type arrives opaque in the
     data block exactly as it does in a body. The CTOR pass (`resolveUserCtors`)
     runs on bodies and spec text ONLY, never the data block, where it would
-    corrupt the inductive's own `| Ctor ` lines. `extTypes` maps imported type
-    names to their defining module so cross-module references resolve. -/
+    corrupt the inductive's own `| Ctor ` lines. The NEWTYPE pass
+    (`resolveNewtypes`) runs between them on both sections; newtypes emit no decl
+    at all. `extTypes` maps imported type names to their defining module so
+    cross-module references resolve. -/
 def emitFullProgram (extTypes : List (String × String)) (p : Program) : String :=
+  -- Newtypes have no Lean image: they are erased at the type level (pass 2) and
+  -- suppressed from every decl/ctor site. `kept` is the single suppression key.
+  let kept := keptTypeDecls p.typeDecls
+  let nts  := newtypeSubsts p.typeDecls
   -- User-declared ctors (e.g. `CustomRatio`) participate in the top-name
   -- set so App-position refs to them emit bare, not as `Name_<unique>`.
+  -- A newtype ctor is NOT in this set: at pass-0000 it never reaches the emitter
+  -- (M2 Task 3's positional census: 0 Var/DataAlt occurrences), and if a future
+  -- compiler ever emits one, `Age_<unique>` / `| Age …` is an unknown identifier
+  -- — loud, never a silent identity.
   let ctorNames : List Name :=
-    p.typeDecls.flatMap fun d => d.ctors.map (·.name)
+    kept.flatMap fun d => d.ctors.map (·.name)
   -- Eq: detect *derived* Eq (tag-primop `$c==`) → route through `deriving
   -- DecidableEq` and suppress the untranslatable method defs; hand-written Eq
   -- keeps body-translation. Ord: any type with an Ord instance is reconstructed
@@ -905,7 +1014,11 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   let classNames := userClasses.map (·.name)
   -- Dependency order: a decl with another local type as a field type must come
   -- after it (Lean has no forward references; the dump order is not topological).
-  let datas := (sortDataDecls p.typeDecls).map fun d =>
+  -- Newtypes stay in the SORT's input — chains thread through them transitively
+  -- (`Point` → `Wrapper`(newtype) → `Q`), and filtering first loses the edge —
+  -- and are dropped only here, at the emission map.
+  let datas := ((sortDataDecls p.typeDecls).filter fun d =>
+      kept.any (·.name == d.name)).map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
   let classDecls := userClasses.map emitClassDecl
@@ -926,16 +1039,18 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
   let instStr := String.intercalate "\n\n" insts
   let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
-  let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
-                    |> resolveUserCtors p.typeDecls
+  let bodyResolved := resolveUserTypes kept bodyRaw
+                    |> resolveNewtypes nts
+                    |> resolveUserCtors kept
   -- `resolveUserTypes` (opaque → bare) must run on the data block too: a local
   -- type used as another decl's FIELD type arrives as
   -- `(GHCCore.tyConOpaque "Point")` there, exactly as in a body. Only the
   -- *type* pass runs here — `resolveUserCtors` would rewrite the `| Ctor `
   -- lines of the inductive itself.
   let dataBlock :=
-    resolveUserTypes p.typeDecls
-      (String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls)))
+    resolveNewtypes nts
+      (resolveUserTypes kept
+        (String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))))
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
   -- External-type resolution runs over the whole output (data fields included).
   -- It is safe because `resolveUserTypes` has already made every LOCAL type bare

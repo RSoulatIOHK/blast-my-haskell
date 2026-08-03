@@ -1327,19 +1327,18 @@ example : CoreProgram → CoreProgram := Lower.lowerProgram
 
 -- HEDGE. The whole negative result rests on GHC + ghc-dump doing the erasure
 -- for us, so pin what happens if a future compiler/flag combination stops. Both
--- unimplemented positions already route through `ctorNames` + `resolveUserCtors`
--- and today (type-level `Age` still an `inductive`) produce CORRECT code; once
--- Task 4 erases the type they produce an unknown `Age.Age` instead. Loud in
--- both worlds, silently-wrong in neither — which is also the concrete reason
--- the plan's "no global `dataConMap` arm" rule costs nothing.
--- NOTE FOR TASK 4 — the two `emitFullProgram` guards below encode TODAY's
--- value, so BOTH must be updated there (the `emitDataDecl` one after them does
--- NOT: Task 4 suppresses at `emitFullProgram`'s `datas` map, not inside
--- `emitDataDecl`). Dropping newtypes from `ctorNames` and from
--- `resolveUserCtors`' decl set makes the value-position one read `(Age_9)
--- (n_2135)` — or `id`/`(fun x => x)` if the plan's identity arm lands — and the
--- pattern one read `| Age n_2135 =>`. If they fire, that is Task 4 working, not
--- a regression; re-point them at the new strings and keep the loudness claim.
+-- unimplemented positions route through `ctorNames` + `resolveUserCtors`, and
+-- Task 4 removed newtypes from BOTH sets, so a surviving newtype ctor now emits
+-- as an ordinary unknown reference: `Age_9` (a Var that is no longer a top-level
+-- name, hence the `_<unique>` suffix) in value position, bare `| Age …` in
+-- pattern position. Neither identifier exists — the `inductive` is suppressed —
+-- so both are loud, and no identity arm was invented for either. That is also
+-- the concrete reason the plan's "no global `dataConMap` arm" rule costs nothing.
+-- RE-POINTED BY TASK 4 (the pre-erasure strings were `(Age.Age) (n_2135)` and
+-- `| Age.Age n_2135 =>`, both produced by qualification against a then-emitted
+-- `inductive Age`). The `emitDataDecl` guard after them was NOT re-pointed:
+-- suppression lives at `emitFullProgram`'s `datas` map, not inside
+-- `emitDataDecl`, which still renders any decl it is handed.
 def ageNewtypeDecl : DataDecl :=
   {name := "Age", kind := "newtype",
    ctors := [ {name := "Age", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
@@ -1350,7 +1349,7 @@ def mkAgeV : Var :=
 def hypValueProg : Program :=
   { binds := [.nonRec mkAgeV (.lam ntN (.app (.var ageCtorV) (.var ntN)))],
     typeDecls := [ageNewtypeDecl], instances := [] }
-#guard ((emitFullProgram [] hypValueProg).splitOn "(Age.Age) (n_2135)").length == 2
+#guard ((emitFullProgram [] hypValueProg).splitOn "(Age_9) (n_2135)").length == 2
 def ntWild  : Var := {name := "wild", unique := 0, ty := .tyCon "Age" [], role := .id}
 def getAgeV : Var :=
   {name := "getAge", unique := 2132,
@@ -1361,11 +1360,17 @@ def hypPatBody : Expr :=
 def hypPatProg : Program :=
   { binds := [.nonRec getAgeV hypPatBody],
     typeDecls := [ageNewtypeDecl], instances := [] }
-#guard ((emitFullProgram [] hypPatProg).splitOn "| Age.Age n_2135 => n_2135").length == 2
+#guard ((emitFullProgram [] hypPatProg).splitOn "| Age n_2135 => n_2135").length == 2
 
--- The DECL side, i.e. Task 4's starting point: `kind` is read NOWHERE today, so
--- a `newtype` emits as a plain `inductive`. Task 4 flips this to suppression.
+-- The DECL side. `emitDataDecl` still reads no `kind` — hand it a newtype and it
+-- renders an `inductive` — because Task 4's suppression is a FILTER on the decls
+-- reaching it (`emitFullProgram`'s `datas` map), not a case inside it. The Task 4
+-- section's emission guard pins the other half: that filter never hands it one.
 #guard ((emitDataDecl false false ageNewtypeDecl).splitOn "inductive Age where").length == 2
+
+-- E2E RESOLUTION of the status recorded above: with Task 4's erasure in place
+-- `GhcCoreToLean.Generated.NewtypeBasic` builds and `addAges_sum` is `✅ Valid`,
+-- which confirms hand-check (i) of error 4's cascade diagnosis.
 
 -- E2E STATUS — `lake build GhcCoreToLean.Generated.NewtypeBasic` FAILS, exactly
 -- as the plan stages it. ALL FOUR errors, verbatim, against the generated file
@@ -1405,5 +1410,165 @@ def hypPatProg : Program :=
 -- drops newtypes from the user decl set, that entry goes LIVE and rewrites
 -- `Age` → `NewtypeBasic.Age` (a type that no longer exists) — which is exactly
 -- why Task 4 Step 3's manifest suppression is not optional.
+
+/-! ## M2 Task 4 — newtype erasure -/
+
+-- The pass itself. `resolveNewtypes` rewrites the OPAQUE spelling of a newtype
+-- tycon to its underlying type, running after `resolveUserTypes` (whose decl set
+-- excludes newtypes precisely so this needle survives) and before
+-- `resolveUserCtors`.
+#guard resolveNewtypes [("Age", "Int")] "(x : (GHCCore.tyConOpaque \"Age\"))" == "(x : Int)"
+-- NO SUBSTRING BLEED: the needle is the whole opaque form, so a name that merely
+-- CONTAINS the newtype's name is untouched (the `"` delimiter does the work).
+#guard resolveNewtypes [("Age", "Int")] "(GHCCore.tyConOpaque \"Wage\")"
+       == "(GHCCore.tyConOpaque \"Wage\")"
+-- …and the reverse containment (`Age` a suffix of `Wage`) is equally blocked, so
+-- neither direction depends on which name is declared.
+#guard resolveNewtypes [("Wage", "Int")] "(GHCCore.tyConOpaque \"Age\")"
+       == "(GHCCore.tyConOpaque \"Age\")"
+-- Every occurrence in a string is rewritten (a signature mentions the newtype
+-- once per argument), and a type with no newtype in it is returned unchanged.
+#guard resolveNewtypes [("Age", "Int")]
+         "((GHCCore.tyConOpaque \"Age\") → (GHCCore.tyConOpaque \"Age\"))"
+       == "(Int → Int)"
+#guard resolveNewtypes [] "(x : Int)" == "(x : Int)"
+
+-- EXTRACTION, well-formed branch: one ctor, one field, underlying type as
+-- `emitType` renders it. The field NAME is the decl-plugin's `_` placeholder for
+-- an unnamed field (M2 Task 3 observation (d)) and is deliberately not read.
+#guard newtypeDecls [ageNewtypeDecl] == [("Age", "Int")]
+#guard newtypeDecls [pointDecl] == []          -- `kind == "data"` ⇒ never erased
+-- (`DataDecl` derives no `BEq`, so the kept set is compared by name.)
+#guard (keptTypeDecls [ageNewtypeDecl, pointDecl]).map (·.name) == ["Point"]
+
+-- EXTRACTION, malformed branch. Haskell admits neither shape, so only a corrupt
+-- sidecar reaches here; both are left UNERASED, which means `keptTypeDecls` keeps
+-- them and every suppression site treats them as ordinary data. That is loud
+-- rather than silent: GHC has already erased the value level, so identity bodies
+-- against a surviving inductive are type mismatches (exactly the pre-Task-4
+-- failure recorded in the Task 3 block above). No `panic!`, no invented recovery.
+def badNewtypeTwoCtors : DataDecl :=
+  {name := "Bad2", kind := "newtype",
+   ctors := [ {name := "B1", fields := [ {name := "_", ty := .tyCon "Int" []} ]},
+              {name := "B2", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
+def badNewtypeTwoFields : DataDecl :=
+  {name := "BadF", kind := "newtype",
+   ctors := [ {name := "BadF", fields := [ {name := "_", ty := .tyCon "Int" []},
+                                           {name := "_", ty := .tyCon "Bool" []} ]} ]}
+def badNewtypeNoFields : DataDecl :=
+  {name := "BadN", kind := "newtype", ctors := [ {name := "BadN", fields := []} ]}
+#guard newtypeDecls [badNewtypeTwoCtors]  == []
+#guard newtypeDecls [badNewtypeTwoFields] == []
+#guard newtypeDecls [badNewtypeNoFields]  == []
+#guard (keptTypeDecls [badNewtypeTwoCtors, ageNewtypeDecl]).map (·.name) == ["Bad2"]
+-- The malformed decl therefore still emits its `inductive` — pre-Task-4 behavior
+-- verbatim — while a well-formed newtype beside it is suppressed.
+#guard ((emitFullProgram []
+          {binds := [], typeDecls := [badNewtypeTwoCtors, ageNewtypeDecl],
+           instances := []}).splitOn "inductive Bad2 where").length == 2
+
+-- NESTED underlying type. `emitType` renders `[Int]` by JUXTAPOSITION (`List
+-- Int`, unbracketed — see `Maps.parenArg`), and the hole the opaque needle leaves
+-- can be an application ARGUMENT, so the substitution must bracket it or
+-- `List (GHCCore.tyConOpaque "Ages")` becomes the ill-typed `List List Int`.
+#guard emitType (.tyCon "List" [.tyCon "Int" []]) == "List Int"
+def agesNewtypeDecl : DataDecl :=
+  {name := "Ages", kind := "newtype",
+   ctors := [ {name := "Ages",
+               fields := [ {name := "_", ty := .tyCon "List" [.tyCon "Int" []] } ]} ]}
+#guard newtypeDecls [agesNewtypeDecl] == [("Ages", "List Int")]
+#guard resolveNewtypes [("Ages", "List Int")] "(xs : (GHCCore.tyConOpaque \"Ages\"))"
+       == "(xs : (List Int))"
+#guard resolveNewtypes [("Ages", "List Int")] "(List (GHCCore.tyConOpaque \"Ages\"))"
+       == "(List (List Int))"
+-- An underlying type `emitType` ALREADY brackets is not double-bracketed
+-- (`(Int × Int)`, `(Int → Int)`) — the same closed-set invariant `parenArg` rests on.
+#guard emitType (.tyCon "(,)" [.tyCon "Int" [], .tyCon "Int" []]) == "(Int × Int)"
+#guard resolveNewtypes [("Pair", "(Int × Int)")] "(p : (GHCCore.tyConOpaque \"Pair\"))"
+       == "(p : (Int × Int))"
+
+-- EMISSION MAP: a program whose only type decl is a newtype emits NO inductive
+-- for it, and its ctor is not qualified (both halves of the suppression).
+#guard ((emitFullProgram [] hypValueProg).splitOn "inductive").length == 1
+#guard ((emitFullProgram [] hypValueProg).splitOn "Age.Age").length == 1
+-- …and the erasure reaches the SIGNATURE, which is the whole point: `mkAge`'s
+-- `Int → Age` becomes `Int → Int`. (The body is the loud `Age_9` hedge above —
+-- this guard is about the type, which no longer mentions `Age` at all.)
+#guard ((emitFullProgram [] hypValueProg).splitOn "(n_2135 : Int) : Int").length == 2
+#guard ((emitFullProgram [] hypValueProg).splitOn "tyConOpaque").length == 1
+
+-- SORT-INPUT CONSTRAINT (the pipeline header's chain, `Point` → `Wrapper`
+-- (newtype) → `Q`): the newtype must stay in `sortDataDecls`' input or the
+-- `Point`-needs-`Q` edge is lost and `Point` can be emitted before `Q`.
+def qDecl : DataDecl :=
+  {name := "Q", kind := "data",
+   ctors := [ {name := "Q", fields := [ {name := "qv", ty := .tyCon "Int" []} ]} ]}
+def wrapperNtDecl : DataDecl :=
+  {name := "Wrapper", kind := "newtype",
+   ctors := [ {name := "Wrapper", fields := [ {name := "_", ty := .tyCon "Q" []} ]} ]}
+def pointWrapDecl : DataDecl :=
+  {name := "PointW", kind := "data",
+   ctors := [ {name := "PointW", fields := [ {name := "w", ty := .tyCon "Wrapper" []} ]} ]}
+-- The sort sees the chain transitively, from the dump order that breaks naively.
+#guard (sortDataDecls [pointWrapDecl, wrapperNtDecl, qDecl]).map (·.name)
+       == ["Q", "Wrapper", "PointW"]
+-- `newtypeSubsts` pre-resolves the underlying string through `resolveUserTypes`:
+-- `emitType` gives `(GHCCore.tyConOpaque "Q")` for a LOCAL data type, and pass 1
+-- has already run over the text this gets spliced into, so splicing it raw would
+-- leave a live needle for `resolveExternalTypes` to rewrite to a nonexistent `M.Q`.
+#guard newtypeDecls  [pointWrapDecl, wrapperNtDecl, qDecl]
+       == [("Wrapper", "(GHCCore.tyConOpaque \"Q\")")]
+#guard newtypeSubsts [pointWrapDecl, wrapperNtDecl, qDecl] == [("Wrapper", "Q")]
+-- End to end over the chain: `Q` and `PointW` emit (in dependency order), the
+-- newtype does not, `PointW`'s field is the erased `Q`, and no needle survives.
+def chainProg : Program :=
+  { binds := [], typeDecls := [pointWrapDecl, wrapperNtDecl, qDecl], instances := [] }
+#guard ((emitFullProgram [] chainProg).splitOn "inductive").length == 3
+#guard ((emitFullProgram [] chainProg).splitOn "inductive Wrapper").length == 1
+#guard ((emitFullProgram [] chainProg).splitOn "| PointW : Q → PointW").length == 2
+#guard ((emitFullProgram [] chainProg).splitOn "tyConOpaque").length == 1
+#guard (emitFullProgram [] chainProg).splitOn "inductive Q where" |>.head!.isEmpty  -- Q first
+
+-- CHAINED NEWTYPES (`newtype A = A B` where `B` is itself a newtype).
+-- `newtypeSubsts` saturates the MAP with fuel = #newtypes, so the result is the
+-- same for either dump order — a single fold over the source would resolve `A`
+-- only when it happened to precede `B`.
+def ntBDecl : DataDecl :=
+  {name := "NB", kind := "newtype",
+   ctors := [ {name := "NB", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
+def ntADecl : DataDecl :=
+  {name := "NA", kind := "newtype",
+   ctors := [ {name := "NA", fields := [ {name := "_", ty := .tyCon "NB" []} ]} ]}
+#guard newtypeSubsts [ntADecl, ntBDecl] == [("NA", "Int"), ("NB", "Int")]
+#guard newtypeSubsts [ntBDecl, ntADecl] == [("NB", "Int"), ("NA", "Int")]
+-- A recursive newtype (`newtype R = R R`) is legal Haskell and has no underlying
+-- type to erase to; self-references are excluded from the saturation, so it
+-- terminates and leaves the needle in place — loud, not divergent.
+def ntRDecl : DataDecl :=
+  {name := "R", kind := "newtype",
+   ctors := [ {name := "R", fields := [ {name := "_", ty := .tyCon "R" []} ]} ]}
+#guard newtypeSubsts [ntRDecl] == [("R", "(GHCCore.tyConOpaque \"R\")")]
+
+-- SPEC TEXT (pass site 3): the transpiler-emitted opaque form erases there too,
+-- while a hand-written `Age` in theorem text is NOT rewritten — properties on a
+-- newtype are written against the underlying type, and anything else fails loud.
+#guard resolveSpecText [ageNewtypeDecl] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int"
+       == "(a : Int) → Int"
+#guard resolveSpecText [ageNewtypeDecl] [] "∀ (a : Age), getAge (mkAge a) = a"
+       == "∀ (a : Age), getAge (mkAge a) = a"
+-- The ext-types manifest carries no entry for an erased newtype
+-- (`scripts/transpile_graph.py` skips `kind == "newtype"`), but even if a stale
+-- one is passed in, pass 2 has already consumed the needle — this pins that the
+-- self-entry hazard recorded in the Task 3 block is closed at BOTH ends.
+#guard resolveSpecText [ageNewtypeDecl] [("Age", "NewtypeBasic")]
+         "(a : (GHCCore.tyConOpaque \"Age\")) → Int"
+       == "(a : Int) → Int"
+
+-- ZERO CHURN for newtype-free programs: with no newtype decl, `newtypeSubsts` is
+-- empty and every pass is the identity it was before Task 4.
+#guard newtypeSubsts [pointDecl, rectDecl] == []
+#guard resolveSpecText [rectDecl, pointDecl] []
+         "area (resize w h (Rect (Point 0 0) 1 1)) = w * h"
+       == "area (resize w h (Rect.Rect (Point.Point 0 0) 1 1)) = w * h"
 
 end GhcCoreToLean.Tests
