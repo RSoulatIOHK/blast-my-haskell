@@ -136,12 +136,15 @@ def valueMap : String → Option String
   | "GHC.Base.flip"               => some "(fun f a b => f b a)"
   | "GHC.Base.$"       | "$"       => some "(fun f x => f x)"
   | "GHC.Base.otherwise"          => some "true"
-  -- Partial functions. Haskell `head`/`last`/`!!`/`fromJust` are ⊥ ONLY on the
-  -- empty list / `Nothing`; they are faithful on the rest of their domain. So
-  -- they must NOT collapse to `default` everywhere (that breaks the defined
-  -- domain, e.g. `head [1,2,3]`). We map to Lean's total `*D`/`getD` forms:
+  -- Partial functions. Haskell `head`/`last`/`fromJust` are ⊥ ONLY on the
+  -- empty list / `Nothing`; `!!` is ⊥ on ANY out-of-range index (a negative
+  -- index reads position 0 after `Int.toNat` — still sound: ⊥ may be refined
+  -- by any value). All are faithful on the rest of their domain, so they must
+  -- NOT collapse to `default` everywhere (that breaks the defined domain,
+  -- e.g. `head [1,2,3]`). We map to Lean's total `*D`/`getD` forms:
   -- faithful where Haskell is defined, and `default` (an arbitrary inhabitant)
-  -- exactly where Haskell is ⊥ — the documented partial-correctness tradeoff.
+  -- where Haskell is ⊥ — the documented partial-correctness tradeoff (see the
+  -- README partial-functions bullet for the full per-function statement).
   -- `default` needs `[Inhabited t]`, which `emitDefHeader` adds for polymorphic
   -- defs (Emit recognises these names via `isPartialDefaultName`). `tail`/`init`
   -- map to Lean totals that need no default. Qualified only (don't shadow a
