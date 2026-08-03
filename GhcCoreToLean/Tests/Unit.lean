@@ -259,6 +259,8 @@ def totalBind : Bind :=
 #guard ((emitBind [] ["Sized"] [] totalBind).splitOn "[Sized a]").length == 2
 #guard ((emitBind [] ["Sized"] [] totalBind).splitOn "tyConOpaque \"Sized\"").length == 1
 
+/-! ## M1 Task 2: tuples — 3- and 4-tuple construction, types, patterns -/
+
 -- M1 Task 2: 3-/4-tuple construction. Ctors are eta-expanded lambdas so plain
 -- left-application works at any saturation.
 -- Names observed from Generated/TupleTriple.lean and its shim JSON
@@ -286,6 +288,8 @@ def totalBind : Bind :=
 #guard dataConMap "(,,,,)" == none
 #guard typeConMap "(,,,,)" ["Int", "Int", "Int", "Int", "Int"] == none
 
+/-! ## M1 Task 3: list literals (`build` / `augment`) -/
+
 -- M1 Task 3: list literals. `[a,b,x3]` desugars to `build (\c n -> c a (c b (c x3 n)))`
 -- with `build g = g (:) []`.
 -- Type args/binders on `g` are already erased by Lower; emitted lambdas carry
@@ -306,6 +310,8 @@ def totalBind : Bind :=
 -- (it is unreachable at pass-0000).
 #guard ((fun g => g List.cons List.nil) (fun c n => c (1:Int) (c 2 (c 3 n)))) == [1,2,3]
 #guard ((fun g xs => g List.cons xs) (fun c n => c (1:Int) (c 2 n)) [7]) == [1,2,7]
+
+/-! ## M1 Task 4: Int ranges (`enumFromTo` / `enumFromThenTo`) -/
 
 -- M1 Task 4: Int ranges. Semantics pinned against GHC:
 --   [1..5]=[1,2,3,4,5]  [3..3]=[3]  [3..1]=[]
@@ -341,6 +347,8 @@ def totalBind : Bind :=
 -- only tested record that the `default` arm is deliberate, not an oversight.
 #guard Hs.enumFromThenTo 1 1 5 == []
 
+/-! ## M1 Task 5: Int-indexed ops (`take` / `drop` / `splitAt` / `replicate`) -/
+
 -- M1 Task 5: Int-indexed ops. Haskell take/drop/replicate/splitAt treat a
 -- negative count as 0 (`take n _ | n <= 0 = []`, `drop n xs | n <= 0 = xs`,
 -- `replicate = take n (repeat x)`, `splitAt n xs = (take n xs, drop n xs)`);
@@ -361,9 +369,15 @@ def totalBind : Bind :=
 #guard valueMap "GHC.List.drop"      == some "(fun n xs => List.drop n.toNat xs)"
 #guard valueMap "GHC.List.splitAt"   == some "Hs.splitAt"
 #guard valueMap "GHC.List.replicate" == some "(fun n x => List.replicate n.toNat x)"
-#guard Hs.splitAt 1 [5, 6, 7] == ([5], [6, 7])
-#guard Hs.splitAt (-2) [1] == ([], [1])
-#guard Hs.splitAt 9 [1] == ([1], [])
+-- `List Int` ascriptions: unannotated numeric list literals default to `Nat`,
+-- but `Int` is the element type the transpiler actually emits.
+#guard Hs.splitAt 1 ([5, 6, 7] : List Int) == ([5], [6, 7])
+#guard Hs.splitAt (-2) ([1] : List Int) == ([], [1])
+#guard Hs.splitAt 9 ([1] : List Int) == ([1], [])
+-- The unannotated APPLIED form really does elaborate (binder types postponed,
+-- then resolved from the argument types) — this is the load-bearing check for
+-- the claim in the block comment above, not just prose.
+#guard ((fun n xs => List.take n.toNat xs) (2 : Int) ([1,2,3] : List Int)) == [1,2]
 -- Semantic pins for the inline lambdas (negative-clamp + arg order):
 #guard ((fun (n : Int) (xs : List Int) => List.take n.toNat xs) 2 [1,2,3]) == [1,2]
 #guard ((fun (n : Int) (xs : List Int) => List.take n.toNat xs) (-1) [1,2,3]) == []

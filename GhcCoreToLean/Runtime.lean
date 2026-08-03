@@ -1,9 +1,10 @@
 /-! # Haskell runtime support helpers
 
 Named Lean images for `base` functions whose faithful translation is too
-complex for a readable inline lambda in `Maps.lean` (spec: 2026-07-24
-coverage-roadmap §"runtime support module"). Generated files import this
-module unconditionally; helpers are ordinary defs, `#guard`-tested in
+complex for a readable inline lambda in `Maps.lean`, or worth naming so
+Blaster has a stable unfold target (spec: 2026-07-24 coverage-roadmap
+§"runtime support module"). Generated files import this module
+unconditionally; helpers are ordinary defs, `#guard`-tested in
 `Tests/Unit.lean`, and stable named symbols for Blaster to unfold. -/
 
 namespace Hs
@@ -43,7 +44,13 @@ def enumFromThenTo (a b c : Int) : List Int :=
     default
 
 /-- Haskell `splitAt n xs = (take n xs, drop n xs)`; negative `n` acts as 0
-    (`Int.toNat` clamps, matching GHC). -/
+    (`Int.toNat` clamps, matching GHC).
+
+    Deliberately NOT `List.splitAt`: core's `List.splitAt` is an accumulator
+    (`go`) loop, whereas the `take`/`drop` pair is the reduction-friendly form
+    that `decide` and Blaster handle predictably. A maintainer "simplifying"
+    this to `List.splitAt` would quietly change proof behavior even though the
+    two agree extensionally. -/
 def splitAt (n : Int) (xs : List α) : List α × List α :=
   (xs.take n.toNat, xs.drop n.toNat)
 
