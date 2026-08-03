@@ -865,9 +865,24 @@ def mkPartialBind (nm : String) : Bind :=
 --     (`CustomRatio (-numerator r2) (denominator r2)`). Fix: `replaceCtorApps`,
 --     a boundary-aware application-position rewrite.
 --
--- Fix (B) cannot be silent-wrong in either direction: a false positive puts a
--- TERM where a type is expected (`BEq Point.Point`) and a false negative leaves
--- a type where a function is expected — both are elaboration errors.
+-- For any shape in the mapped surface, fix (B) is loud in both directions: a
+-- false positive puts a TERM where a type is expected (`BEq Point.Point`) and a
+-- false negative leaves a type where a function is expected — both are
+-- elaboration errors.
+--
+-- KNOWN HEDGE (not silent-wrong-free): the rewrite is textual, so a ctor name
+-- followed by args inside a hand-written STRING LITERAL in a spec block is
+-- rewritten too — `"s = \"Point 1\""` becomes `Point.Point 1` inside the
+-- literal. That is pre-existing exposure of the ` Ctor (` needle as well, not
+-- new to `replaceCtorApps`. No fixture emits a string literal, and nothing in
+-- today's maps produces one: Core spells a Haskell literal
+-- `unpackCString# "…"#`, and `unpackCString#` has no `valueMap` arm, so outside
+-- the `error`/`undefined` spine (where the whole application collapses to
+-- `default`) it emits as a loud unknown identifier. (Note the narrower claim:
+-- the string TYPE is mapped — `String` is `[Char]` in Core, which `typeConMap`
+-- sends to `List Char`. It is literal PRODUCTION that cannot compile today, not
+-- String-typed code in general.) So the residual risk is a hand-authored
+-- literal in theorem text — rare, and reviewable in the spec block itself.
 
 def pointDecl : DataDecl :=
   {name := "Point", kind := "data",
@@ -913,6 +928,12 @@ def rectDecl : DataDecl :=
        == "[Point.Point 1 2, Point.Point 3 4]"
 #guard replaceCtorApps "Point" "Point.Point" "f (Point ⟨1, 2⟩)" == "f (Point.Point ⟨1, 2⟩)"
 #guard replaceCtorApps "Point" "Point.Point" "Point (-1) 2" == "Point.Point (-1) 2"
+-- Contrast with the line above, pinning the `isArgStart` alphabet exactly: a
+-- PARENTHESISED negative argument rewrites (`(` is an arg start), an
+-- UNPARENTHESISED one does not (`-` is not) and stays bare — the same
+-- documented, fail-loud false negative as `Point x y`, via the full
+-- `resolveUserCtors` pipeline so no fixed needle rescues it either.
+#guard resolveUserCtors [pointDecl] "px (Point -1 2)" == "px (Point -1 2)"
 -- The four pre-existing needles still fire (never remove a hedge): pattern
 -- position, transpiler-emitted App position.
 #guard resolveUserCtors [pointDecl] "| Point ds_1 ds_2 =>" == "| Point.Point ds_1 ds_2 =>"
@@ -923,6 +944,25 @@ def rectDecl : DataDecl :=
 #guard dataDeclDeps ["Point", "Rect"] pointDecl == []
 #guard (sortDataDecls [rectDecl, pointDecl]).map (·.name) == ["Point", "Rect"]
 #guard (sortDataDecls [pointDecl, rectDecl]).map (·.name) == ["Point", "Rect"]
+
+-- `dataDeclDeps` must see THROUGH type wrappers — the most load-bearing
+-- property of the sort, since a record field is far more often `[Point]` or
+-- `Maybe Point` than a bare `Point`. Without it the original forward-reference
+-- bug returns (loud, but only after emission). `tyConNames` recurses into
+-- `.tyCon` args, so the wrapper itself (`List`/`Maybe`) is also reported —
+-- filtered out by `localNames`, which is why these come back as just `Point`.
+def rectListDecl : DataDecl :=
+  {name := "RectList", kind := "data",
+   ctors := [ {name := "RectList",
+               fields := [ {name := "pts", ty := .tyCon "List" [.tyCon "Point" []]} ]} ]}
+def rectMaybeDecl : DataDecl :=
+  {name := "RectMaybe", kind := "data",
+   ctors := [ {name := "RectMaybe",
+               fields := [ {name := "p", ty := .tyCon "Maybe" [.tyCon "Point" []]} ]} ]}
+#guard dataDeclDeps ["Point"] rectListDecl  == ["Point"]
+#guard dataDeclDeps ["Point"] rectMaybeDecl == ["Point"]
+#guard (sortDataDecls [rectListDecl, pointDecl]).map (·.name) == ["Point", "RectList"]
+#guard (sortDataDecls [rectMaybeDecl, pointDecl]).map (·.name) == ["Point", "RectMaybe"]
 
 -- A self-recursive decl is NOT a dependency (Lean inductives are self-recursive
 -- by construction), so it must not deadlock the sort.
@@ -947,6 +987,24 @@ def mutBDecl : DataDecl :=
    ctors := [ {name := "B", fields := [ {name := "getA", ty := .tyCon "A" []} ]} ]}
 #guard (sortDataDecls [mutADecl, mutBDecl]).length == 2
 #guard (sortDataDecls [mutADecl, mutBDecl]).map (·.name) == ["A", "B"]
+
+-- Totality fallback: pathological inputs (e.g. duplicate names) fall back to
+-- dump order rather than dropping decls. The `pending.filter (·.name != d.name)`
+-- step removes BOTH same-named decls while placing only one, so without the
+-- length check at the end of `sortDataDecls` this returns a single decl and the
+-- other is silently gone. GHC cannot emit two decls with one name; the guard is
+-- what makes the docstring's "always exactly the input decls" TRUE rather than
+-- merely claimed.
+def ptDeclDupA : DataDecl :=
+  {name := "Dup", kind := "data",
+   ctors := [ {name := "DupA", fields := [ {name := "ax", ty := .tyCon "Int" []} ]} ]}
+def ptDeclDupB : DataDecl :=
+  {name := "Dup", kind := "data",
+   ctors := [ {name := "DupB", fields := [ {name := "bx", ty := .tyCon "Bool" []} ]} ]}
+#guard (sortDataDecls [ptDeclDupA, ptDeclDupB]).length == 2
+-- …and the fallback hands back the INPUT, so both ctors survive in dump order.
+#guard (sortDataDecls [ptDeclDupA, ptDeclDupB]).flatMap (·.ctors.map (·.name))
+       == ["DupA", "DupB"]
 
 -- Whole-program pin for fix (A), with a manifest entry for the module's OWN
 -- type (`Point → RecordOps`) — exactly what transpile.sh passes: the field type

@@ -786,10 +786,15 @@ def dataDeclDeps (localNames : List Name) (d : DataDecl) : List Name :=
     `RecordOps`'s `Point`/`Rect`), which is not dependency order — so
     `inductive Rect` would reference a not-yet-declared `Point`.
 
-    Total by construction: every branch returns all input decls. On a
-    dependency CYCLE (mutually recursive records, which would need a Lean
-    `mutual` block) the remaining decls are appended in dump order, so Lean
-    fails loud on the forward reference instead of a decl being dropped. -/
+    The result is always exactly the input decls, reordered: elements only move
+    from `pending` to `acc`, never duplicate, so preserved length implies a
+    permutation. If the reordering ever DOES change the length — reachable only
+    when two decls share a name, since `pending.filter (·.name != d.name)` then
+    drops both, and GHC cannot produce that — the input is returned unchanged in
+    dump order. Likewise on a dependency CYCLE (mutually recursive records,
+    which would need a Lean `mutual` block) the remaining decls are appended in
+    dump order. Either way Lean fails loud on a forward reference instead of a
+    decl silently vanishing from the output. -/
 def sortDataDecls (ds : List DataDecl) : List DataDecl :=
   let names := ds.map (·.name)
   let rec go (fuel : Nat) (pending : List DataDecl) (placed : List Name)
@@ -801,7 +806,9 @@ def sortDataDecls (ds : List DataDecl) : List DataDecl :=
       match pending.find? (fun d => (dataDeclDeps names d).all (fun n => placed.contains n)) with
       | some d => go fuel (pending.filter (·.name != d.name)) (d.name :: placed) (d :: acc)
       | none   => acc.reverse ++ pending
-  go ds.length ds [] []
+  let result := go ds.length ds [] []
+  -- Totality fallback: any length change ⇒ hand back the input untouched.
+  if result.length != ds.length then ds else result
 
 /-- Apply the same name-resolution post-passes used on emitted bodies to a
     single user spec string: local types → bare, imported types → `M.T`,
