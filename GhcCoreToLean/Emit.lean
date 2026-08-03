@@ -213,9 +213,9 @@ private partial def appHeadName : Expr → Option Name
 
 /-- Does any subexpression emit a `default`? True for an applied bottom
     (`error`/`undefined`) or an applied partial whose faithful image uses
-    `default` (`head`/`last`/`!!`/`fromJust`). Used to decide whether a def's
-    polymorphic result needs an `[Inhabited t]` binder so the emitted `default`
-    elaborates. -/
+    `default` (`head`/`last`/`!!`/`fromJust`/`maximum`/`minimum`). Used to
+    decide whether a def's polymorphic result needs an `[Inhabited t]` binder so
+    the emitted `default` elaborates. -/
 private partial def exprHasBottom : Expr → Bool
   | .var _   => false
   | .lit _   => false

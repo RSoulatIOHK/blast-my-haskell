@@ -677,11 +677,15 @@ def totalBind : Bind :=
 --                          GHC.Classes.$fOrdInt xs
 --   minOf = \xs -> minimum @ty Data.Foldable.$fFoldable[] @ty
 --                          GHC.Classes.$fOrdInt xs
--- This is the FIRST M1 arm carrying an `Ord` dict, so it is the first check that
--- dict erasure is not an Eq/Foldable/Num-shaped whitelist. It is not: Lower
--- erases on the binder's `.dict` ROLE, which the shim assigns from GHC's
--- `DFunId` details or a `$d`/`$f` name prefix (shim/Main.hs `binderRole`) — so
--- `$fOrdInt` erases like any other, and the mapping lands at arity 1. Confirmed
+-- The `Ord` dict here is NOT new ground: it erases exactly like the `$fOrdInt`
+-- already carried by the pre-existing comparison arms — `allPos` in this same
+-- fixture desugars its `> 0` through `GHC.Classes.$fOrdInt` (a grep of
+-- /tmp/transpile-ListLibrary.json finds `$fOrdInt` in exactly three binds:
+-- maxOf, minOf, allPos), and comparison arms have carried it since the Tier era.
+-- Erasure is not an Eq/Foldable/Num/Ord-shaped whitelist at all: Lower erases on
+-- the binder's `.dict` ROLE, which the shim assigns from GHC's `DFunId` details
+-- or a `$d`/`$f` name prefix (shim/Main.hs `binderRole`) — so `$fOrdInt` erases
+-- like any other, and the mapping lands at arity 1. Confirmed
 -- in the emitted code: `def maxOf (xs_… : List Int) : Int :=
 -- ((fun xs => (List.max? xs).getD default)) (xs_…)` — one argument, no dict.
 #guard valueMap "Data.Foldable.maximum" == some "(fun xs => (List.max? xs).getD default)"
@@ -722,14 +726,46 @@ def maximumApp : Expr :=
 -- `emitDefHeader`. Both members of each hedge pair are registered in
 -- `Emit.isPartialDefaultName`: a one-sided registration would silently skip the
 -- binder for whichever key Core actually delivers.
--- REACHABILITY NOTE: that Inhabited-binder path is currently UNREACHABLE
--- end-to-end and is pinned at unit level only. Every fixture def is
--- monomorphic at `Int` (where `Inhabited Int` is found by ordinary instance
--- resolution and no binder is emitted — verified in the generated
--- ListLibrary.lean). A polymorphic `maximum` wrapper would need an `Ord a`
--- constraint in its signature, which this transpiler does not yet support for
--- builtin classes (known deferral; fails loud with tyConOpaque errors), so no
--- such fixture exists. Same shape as the Task 8 SCOPE NOTE about `[BEq t]`.
+-- The [Inhabited t] binder path: a POLYMORPHIC def whose body applies a
+-- registered partial name must get the binder. One guard per registered name
+-- (this is what enforces the "both members of each hedged pair" claim above).
+def mkPartialBind (nm : String) : Bind :=
+  .nonRec
+    {name := "poly", unique := 90,
+     ty := .forAll "a" (.tyFun (.tyCon "List" [.tyVar "a"]) (.tyVar "a")), role := .id}
+    (.lam {name := "xs", unique := 91, ty := .tyCon "List" [.tyVar "a"], role := .id}
+      (.app (.var {name := nm, unique := 92, ty := .tyVar "a", role := .id})
+            (.var {name := "xs", unique := 91, ty := .tyCon "List" [.tyVar "a"], role := .id})))
+-- Emitted for the maximum arm (checked): `def poly {a : Type} [Inhabited a]
+-- (xs_91 : List a) : a := ((fun xs => (List.max? xs).getD default)) (xs_91)`.
+-- `splitOn … == 2` asserts EXACTLY ONE `[Inhabited a]`, so a shape change in
+-- either direction (binder dropped, or duplicated per-tyvar) trips the guard.
+#guard ((emitBind [] [] [] (mkPartialBind "Data.Foldable.maximum")).splitOn "[Inhabited a]").length == 2
+#guard ((emitBind [] [] [] (mkPartialBind "GHC.List.maximum")).splitOn "[Inhabited a]").length == 2
+#guard ((emitBind [] [] [] (mkPartialBind "Data.Foldable.minimum")).splitOn "[Inhabited a]").length == 2
+#guard ((emitBind [] [] [] (mkPartialBind "GHC.List.minimum")).splitOn "[Inhabited a]").length == 2
+-- NON-VACUITY: the same shape with an UNREGISTERED name must get NO binder.
+-- Without this, the four positives above would still pass if `emitDefHeader`
+-- emitted `[Inhabited a]` unconditionally for every polymorphic def — i.e. they
+-- would pin nothing about `isPartialDefaultName`. This is what makes them
+-- load-bearing.
+#guard ((emitBind [] [] [] (mkPartialBind "GHC.List.reverse")).splitOn "[Inhabited a]").length == 1
+-- REACHABILITY NOTE: the four guards above ARE the pin for that binder path —
+-- it is covered at unit level, and only there. It stays UNREACHABLE end-to-end,
+-- and landing the missing `Ord a` constraint support would NOT be enough to open
+-- it. Every fixture def is monomorphic at `Int` (where `Inhabited Int` is found
+-- by ordinary instance resolution and no binder is emitted — verified in the
+-- generated ListLibrary.lean). A polymorphic `maximum` wrapper would need an
+-- `Ord a` constraint in its signature, which this transpiler does not yet
+-- support for builtin classes (known deferral) — that support is NECESSARY but
+-- NOT SUFFICIENT: core Lean's `Ord α` does not yield `Max α` (checked: `example
+-- {α : Type} [Ord α] : Max α := inferInstance` → "failed to synthesize Max α"),
+-- and `emitDefHeader` emits `{a : Type}`, `[Inhabited a]` and user-class
+-- constraints only — never a `[Max a]` binder. So the polymorphic route would
+-- still fail loud on `failed to synthesize Max a` at the `List.max?` call.
+-- Fail-loud either way, never silent-wrong; a `[Max a]`/`[Min a]` binder is the
+-- work that would actually open the path. Same shape as the Task 8 SCOPE NOTE
+-- about `[BEq t]`.
 -- BLASTER DATA POINT: both quantified fixture goals went through `List.max?`/
 -- `List.min?`/`Option.getD` on the FIRST try, no `decide` fallback needed
 -- (`maxOf_singleton : ∀ a, maxOf [a] = a`, and `minOf_pair : ∀ a b,

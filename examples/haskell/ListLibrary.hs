@@ -251,9 +251,9 @@ theorem minOf_pair : ∀ (a b : Int), minOf [a, b] = if a < b then a else b := b
 -- Int) exactly there. Documented partial-correctness tradeoff, not a claim that
 -- Haskell returns 0. Every nonempty case above is faithful.
 {- @lean
-theorem maxOf_empty : maxOf [] = 0 := by decide
+theorem maxOf_empty_isDefault : maxOf [] = 0 := by decide
 -}
 
 {- @lean
-theorem minOf_empty : minOf [] = 0 := by decide
+theorem minOf_empty_isDefault : minOf [] = 0 := by decide
 -}
