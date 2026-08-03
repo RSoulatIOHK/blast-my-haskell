@@ -789,4 +789,181 @@ def mkPartialBind (nm : String) : Bind :=
 #guard valueMap "GHC.Enum.enumFrom"     == none
 #guard valueMap "GHC.Enum.enumFromThen" == none
 
+/-! ## M2 Task 1 — records audit -/
+
+-- AUDIT (examples/haskell/RecordOps.hs → Generated/RecordOps.lean, GHC 9.2.7
+-- pass-0000). Hypothesis under test: record construction / update / selectors
+-- desugar to plain Core that the transpiler already handles. CONFIRMED at the
+-- Core level; the two things that broke were *emission*-level, both fixed below.
+--
+-- Features exercised and the observed Core spines, verbatim from
+-- /tmp/transpile-RecordOps.json (`@ty` = an erased type application; names are
+-- `<name>_<unique>` as the shim delivers them):
+--
+--  1. LABELED CONSTRUCTION `Point { px = x, py = y }` → positional ctor app,
+--     labels gone (no field-name residue anywhere in the dump):
+--       mkPoint = \x_2144 -> \y_2145 -> ((Point_2301 x_2144) y_2145)
+--  2. SELECTORS are ordinary top-level Core defs — one case with one alt, GHC
+--     names every binder `ds` (they are `wild`-scrutinised, binder unique 0):
+--       px      = \ds_2446 -> (case ds_2446 as wild_0 of
+--                               { Point ds_2447 ds_2448 -> ds_2447 })
+--       topLeft = \ds_2434 -> (case ds_2434 as wild_0 of
+--                               { Rect ds_2435 ds_2436 ds_2437 -> ds_2435 })
+--  3. SINGLE-FIELD UPDATE `p { px = px p + d }` → case-and-rebuild. Note the
+--     asymmetry: the new-value expression re-reads through the SELECTOR on the
+--     ORIGINAL variable (`(px_2136 p_2147)`) and the matching binder `ds_2429`
+--     goes unused — GHC does not reuse the case binder for the read:
+--       shiftX = \d_2146 -> \p_2147 -> (case p_2147 as wild_0 of
+--         { Point ds_2429 ds_2430 ->
+--             ((Point_2301 ((((GHC.Num.+_1300 @ty) GHC.Num.$fNumInt_2248)
+--                            (px_2136 p_2147)) d_2146)) ds_2430) })
+--  4. MULTI-FIELD UPDATE `r { width = w, height = h }` → same case-and-rebuild;
+--     here the UNTOUCHED field does come from the case binder (`ds_2424`):
+--       resize = \w_2287 -> \h_2288 -> \r_2289 -> (case r_2289 as wild_0 of
+--         { Rect ds_2424 ds_2425 ds_2426 -> (((Rect_2319 ds_2424) w_2287) h_2288) })
+--  5. SELECTOR AS A FIRST-CLASS FUNCTION `map px ps` → the selector is passed as
+--     an ordinary Var; no wrapper, no eta-reduction of `xs` (the type args sit
+--     between `map` and its value args):
+--       xs = \ps_2290 -> ((((GHC.Base.map_121 @ty) @ty) px_2136) ps_2290)
+--     `GHC.Base.map` is the already-mapped key (→ `List.map`), so nothing new.
+--  6. Nested record FIELD of user type: `Rect`'s `topLeft :: Point`.
+--
+-- NEGATIVES worth recording (later M2 tasks rest on them):
+--   * TAG CENSUS of this dump — the 25th: `"tag":"Cast"` ×0, `"tag":"Coercion"`
+--     ×0, `"tag":"Let"` ×0 (Type ×7, Case ×7, Lam ×14, App ×73). Records never
+--     produce a coercion at pass-0000, so M2 Task 2's `ECoercion` plumbing is
+--     still unexercised by any fixture — as that task's plan states.
+--   * `.transpile-sandbox/.decls/RecordOps.decls.json` gives BOTH decls
+--     `"kind": "data"` (the field Task 4 filters newtypes on), each ctor
+--     carrying named `fields` (`topLeft`/`width`/`height`, `px`/`py`) — so
+--     record-ness is visible in the sidecar even though Core has erased it.
+--   * decls.json order is REVERSE SOURCE ORDER (`Rect` before `Point`) — this
+--     is what made the sort below necessary, and it means dump order must never
+--     be trusted as dependency order.
+--   * No `$sel:`-style selector names and no `tyConOpaque`/`GHC.`/`$c` residue
+--     in the generated file; the only `$`-binds in the dump are the
+--     `$trModule`/`$tcPoint`/`$tc'Rect`/`$krep` Typeable junk already dropped.
+--
+-- TWO EMISSION BUGS SURFACED (both loud compile errors, neither silent-wrong):
+--
+-- (A) DECL ORDER + a local type as another decl's FIELD type. With `Rect`
+--     emitted first (dump order) and its field type still opaque in the data
+--     block, the output was
+--       inductive Rect where | Rect : RecordOps.Point → Int → Int → Rect
+--     i.e. `Unknown identifier RecordOps.Point` — two faults at once: the data
+--     block never got `resolveUserTypes` (so the field stayed
+--     `(GHCCore.tyConOpaque "Point")` and the shared ext-types manifest, which
+--     also lists the CURRENT module's types, rewrote it to `RecordOps.Point`),
+--     and `Point` was declared after `Rect`. Fix: `sortDataDecls` (dependency
+--     order) + `resolveUserTypes` over the data block. Manifest self-entries are
+--     now dead rather than removed (that file belongs to Task 4).
+-- (B) SPEC-TEXT ctor application to a LITERAL argument. `resolveUserCtors`'s
+--     four fixed needles all require a `(` right after the ctor name, so in
+--     `Rect (Point 0 0) 1 1` only the outer `Rect` was qualified; the inner
+--     `Point 0 0` stayed bare → `Function expected at Point`. Arithmetic never
+--     caught this: its spec's ctor args are all parenthesised
+--     (`CustomRatio (-numerator r2) (denominator r2)`). Fix: `replaceCtorApps`,
+--     a boundary-aware application-position rewrite.
+--
+-- Fix (B) cannot be silent-wrong in either direction: a false positive puts a
+-- TERM where a type is expected (`BEq Point.Point`) and a false negative leaves
+-- a type where a function is expected — both are elaboration errors.
+
+def pointDecl : DataDecl :=
+  {name := "Point", kind := "data",
+   ctors := [ {name := "Point",
+               fields := [ {name := "px", ty := .tyCon "Int" []},
+                           {name := "py", ty := .tyCon "Int" []} ]} ]}
+
+def rectDecl : DataDecl :=
+  {name := "Rect", kind := "data",
+   ctors := [ {name := "Rect",
+               fields := [ {name := "topLeft", ty := .tyCon "Point" []},
+                           {name := "width",   ty := .tyCon "Int" []},
+                           {name := "height",  ty := .tyCon "Int" []} ]} ]}
+
+-- Fix (B): the exact fixture spec line that failed. Both ctors get qualified —
+-- the outer one by the pre-existing ` Ctor (` needle, the inner one only by the
+-- new boundary-aware pass.
+#guard resolveSpecText [rectDecl, pointDecl] []
+         "area (resize w h (Rect (Point 0 0) 1 1)) = w * h"
+       == "area (resize w h (Rect.Rect (Point.Point 0 0) 1 1)) = w * h"
+
+-- Boundary NEGATIVES. The first is load-bearing for this fixture specifically:
+-- `Point` is a SUBSTRING of `mkPoint`, which appears in four of the five
+-- theorems (Arithmetic never tested this — `CustomRatio` is not a substring of
+-- `addRatio`/`subRatio`).
+#guard replaceCtorApps "Point" "Point.Point" "mkPoint 1 2"     == "mkPoint 1 2"
+#guard replaceCtorApps "Point" "Point.Point" "Points 0"        == "Points 0"
+#guard replaceCtorApps "Point" "Point.Point" "Point.Point 0 0" == "Point.Point 0 0"  -- idempotent
+#guard replaceCtorApps "Point" "Point.Point" "(p : Point) → Int" == "(p : Point) → Int"
+#guard replaceCtorApps "Point" "Point.Point" "List Point"      == "List Point"
+-- THE negative that documents why `isArgStart` excludes lowercase letters: with
+-- a lowercase arm this line becomes `BEq Point.Point where` and every
+-- hand-written-Eq fixture (Arithmetic, Ratio) breaks.
+#guard replaceCtorApps "Point" "Point.Point" "instance : BEq Point where"
+       == "instance : BEq Point where"
+-- Accepted (fail-loud) GAP of that same choice: a ctor applied to a bare
+-- VARIABLE is left alone → Lean reports "function expected at Point". Not
+-- silent-wrong, and no fixture writes this shape.
+#guard replaceCtorApps "Point" "Point.Point" "Point x y" == "Point x y"
+-- Positives: every occurrence in a string is rewritten, and the bracket/⟨ arms
+-- exist (both UNOBSERVED in fixtures so far — kept as hedges).
+#guard replaceCtorApps "Point" "Point.Point" "[Point 1 2, Point 3 4]"
+       == "[Point.Point 1 2, Point.Point 3 4]"
+#guard replaceCtorApps "Point" "Point.Point" "f (Point ⟨1, 2⟩)" == "f (Point.Point ⟨1, 2⟩)"
+#guard replaceCtorApps "Point" "Point.Point" "Point (-1) 2" == "Point.Point (-1) 2"
+-- The four pre-existing needles still fire (never remove a hedge): pattern
+-- position, transpiler-emitted App position.
+#guard resolveUserCtors [pointDecl] "| Point ds_1 ds_2 =>" == "| Point.Point ds_1 ds_2 =>"
+#guard resolveUserCtors [pointDecl] "((Point) (x_1)) (y_2)" == "((Point.Point) (x_1)) (y_2)"
+
+-- Fix (A): dependency order over data decls, both input orders.
+#guard dataDeclDeps ["Point", "Rect"] rectDecl  == ["Point"]
+#guard dataDeclDeps ["Point", "Rect"] pointDecl == []
+#guard (sortDataDecls [rectDecl, pointDecl]).map (·.name) == ["Point", "Rect"]
+#guard (sortDataDecls [pointDecl, rectDecl]).map (·.name) == ["Point", "Rect"]
+
+-- A self-recursive decl is NOT a dependency (Lean inductives are self-recursive
+-- by construction), so it must not deadlock the sort.
+def intListDecl : DataDecl :=
+  {name := "IntList", kind := "data",
+   ctors := [ {name := "Nil", fields := []},
+              {name := "Cons",
+               fields := [ {name := "hd", ty := .tyCon "Int" []},
+                           {name := "tl", ty := .tyCon "IntList" []} ]} ]}
+#guard dataDeclDeps ["IntList"] intListDecl == []
+#guard (sortDataDecls [intListDecl]).map (·.name) == ["IntList"]
+
+-- TOTALITY on a dependency CYCLE (mutually recursive records, which would need
+-- a Lean `mutual` block): every decl is still emitted, in dump order, so Lean
+-- fails loud on the forward reference. A sort that DROPPED a decl would be the
+-- one silent-wrong failure mode of this change — this is the pin against it.
+def mutADecl : DataDecl :=
+  {name := "A", kind := "data",
+   ctors := [ {name := "A", fields := [ {name := "getB", ty := .tyCon "B" []} ]} ]}
+def mutBDecl : DataDecl :=
+  {name := "B", kind := "data",
+   ctors := [ {name := "B", fields := [ {name := "getA", ty := .tyCon "A" []} ]} ]}
+#guard (sortDataDecls [mutADecl, mutBDecl]).length == 2
+#guard (sortDataDecls [mutADecl, mutBDecl]).map (·.name) == ["A", "B"]
+
+-- Whole-program pin for fix (A), with a manifest entry for the module's OWN
+-- type (`Point → RecordOps`) — exactly what transpile.sh passes: the field type
+-- must come out BARE (not `RecordOps.Point`), and `Point` must be declared
+-- before the `Rect` that uses it.
+def recordProg : Program :=
+  {binds := [], typeDecls := [rectDecl, pointDecl], instances := []}
+#guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn
+          "| Rect : Point → Int → Int → Rect").length == 2
+#guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "RecordOps.Point").length == 1
+#guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "tyConOpaque").length == 1
+#guard (((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "inductive Rect").head!
+          |>.splitOn "inductive Point").length == 2
+
+-- BLASTER DATA POINT (recorded after the two fixes, from
+-- `lake build GhcCoreToLean.Generated.RecordOps`): see the report/commit — the
+-- four quantified record goals and the `decide` list goal are the end-to-end
+-- evidence that the audited shapes verify, not just compile.
+
 end GhcCoreToLean.Tests

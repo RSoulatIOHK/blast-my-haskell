@@ -683,16 +683,63 @@ def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
     let replacement := sanitize d.name
     s.replace needle replacement
 
+/-- Characters that continue (or qualify) a Lean identifier. A ctor-name
+    occurrence flanked by one of these is part of a LONGER name — `mkPoint`,
+    `Points`, `Point.Point` — and must never be rewritten. -/
+private def isIdentish (c : Char) : Bool :=
+  c.isAlphanum || c == '_' || c == '\'' || c == '.'
+
+/-- Characters that can START a Lean value argument, i.e. that mark the
+    preceding identifier as being APPLIED.
+
+    Deliberately EXCLUDES lowercase letters: `instance : BEq CustomRatio where`
+    would otherwise read `where` as an argument and rewrite a *type* to a ctor.
+    The cost is that a ctor applied to a bare variable (`Point x y` in a user
+    spec) is not rewritten — Lean then fails loud ("function expected at
+    Point"), never silently. `-` is excluded for the same fail-loud reason:
+    `Point -1 2` is subtraction in Lean, so a negative literal argument has to
+    be parenthesised anyway (and then `(` fires). -/
+private def isArgStart (c : Char) : Bool :=
+  c == '(' || c == '[' || c == '⟨' || c.isDigit
+
+/-- Boundary-aware rewrite of `bare` → `qual` at every APPLICATION-position
+    occurrence: identifier boundaries on both sides (so `mkPoint` and an
+    already-qualified `Point.Point` are left alone) and an argument following
+    (`isArgStart`). This is what covers a ctor applied to a *literal*
+    argument — `Rect (Point 0 0) 1 1` — which the fixed needles in
+    `resolveUserCtors` cannot express: they all require a `(` immediately
+    after the ctor name. -/
+def replaceCtorApps (bare qual : String) (src : String) : String :=
+  match src.splitOn bare with
+  | []              => src
+  | first :: pieces =>
+    -- `pieces` are the gaps AFTER each occurrence; occurrence `i` sits between
+    -- gap `i-1` (`prev`, or `first`) and gap `i` (`next`).
+    let rec go (atStart : Bool) (prev : String) (pieces : List String)
+        (acc : String) : String :=
+      match pieces with
+      | []           => acc
+      | next :: more =>
+        let leftOK  := if prev.isEmpty then atStart else !isIdentish prev.back
+        let rightOK := next.isEmpty || !isIdentish next.front
+        let after   := next.dropWhile (· == ' ')
+        let appOK   := !after.isEmpty && isArgStart after.front
+        let repl    := if leftOK && rightOK && appOK then qual else bare
+        go false next more (acc ++ repl ++ next)
+    go true first pieces first
+
 /-- Qualify user-defined data constructors in any position where Lean's
     elaborator would otherwise be ambiguous (type vs. ctor under the same
-    name). Three call-shapes are recognised:
+    name). The recognised call-shapes are:
 
       *  `| Ctor `                              ← alt-pattern
       *  `(Ctor)`                               ← App in transpiler-emitted style
       *  `Ctor (` (preceded by whitespace)      ← App in user `[lean| … |]` spec
+      *  `Ctor <arg>` at identifier boundaries  ← App to a literal/bracketed
+                                                  argument (`replaceCtorApps`)
 
-    Type annotations like `(x : T)` or `→ T →` don't match any of these
-    needles, so they remain `T` and resolve to the type. -/
+    Type annotations like `(x : T)` or `→ T →` match none of these, so they
+    remain `T` and resolve to the type. -/
 def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     d.ctors.foldl (init := s) fun s c =>
@@ -703,7 +750,8 @@ def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
         , (s!"({bareCtor})",   s!"({qualCtor})")
         , (s!" {bareCtor} (",  s!" {qualCtor} (")
         , (s!"({bareCtor} (",  s!"({qualCtor} (") ]
-      rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
+      let s := rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
+      replaceCtorApps bareCtor qualCtor s
 
 /-- Rewrite `(GHCCore.tyConOpaque "T")` → `M.T` for each external type `T`
     declared in a transpiled dependency module `M` (built from the dependency
@@ -715,6 +763,45 @@ def resolveExternalTypes (extTypes : List (String × String)) (src : String) : S
     let needle      := s!"(GHCCore.tyConOpaque \"{tyName}\")"
     let replacement := s!"{modName}.{sanitize tyName}"
     s.replace needle replacement
+
+/-- Every type-constructor name mentioned anywhere in a type. -/
+private partial def tyConNames : GHCType → List Name
+  | .tyCon n args => n :: args.flatMap tyConNames
+  | .tyApp f a    => tyConNames f ++ tyConNames a
+  | .tyFun a b    => tyConNames a ++ tyConNames b
+  | .forAll _ b   => tyConNames b
+  | .tyVar _      => []
+  | .tyLit _      => []
+
+/-- Locally-declared types that a decl's constructor fields refer to
+    (self-references dropped: `data T = C T` needs no ordering, Lean
+    inductives are self-recursive by construction). -/
+def dataDeclDeps (localNames : List Name) (d : DataDecl) : List Name :=
+  let mentioned := d.ctors.flatMap fun c => c.fields.flatMap fun f => tyConNames f.ty
+  mentioned.filter fun n => n != d.name && localNames.contains n
+
+/-- Order data decls so that a decl using another local type as a field type is
+    emitted AFTER it. Lean has no forward references, and the decl-plugin dumps
+    types in `tcg_tcs` order (observed: *reverse* source order for
+    `RecordOps`'s `Point`/`Rect`), which is not dependency order — so
+    `inductive Rect` would reference a not-yet-declared `Point`.
+
+    Total by construction: every branch returns all input decls. On a
+    dependency CYCLE (mutually recursive records, which would need a Lean
+    `mutual` block) the remaining decls are appended in dump order, so Lean
+    fails loud on the forward reference instead of a decl being dropped. -/
+def sortDataDecls (ds : List DataDecl) : List DataDecl :=
+  let names := ds.map (·.name)
+  let rec go (fuel : Nat) (pending : List DataDecl) (placed : List Name)
+      (acc : List DataDecl) : List DataDecl :=
+    match fuel, pending with
+    | _, []            => acc.reverse
+    | 0, pending       => acc.reverse ++ pending
+    | fuel + 1, pending =>
+      match pending.find? (fun d => (dataDeclDeps names d).all (fun n => placed.contains n)) with
+      | some d => go fuel (pending.filter (·.name != d.name)) (d.name :: placed) (d :: acc)
+      | none   => acc.reverse ++ pending
+  go ds.length ds [] []
 
 /-- Apply the same name-resolution post-passes used on emitted bodies to a
     single user spec string: local types → bare, imported types → `M.T`,
@@ -757,7 +844,9 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   -- Reconstruct user classes → class decls + method→class map (selector rewrite).
   let (userClasses, methodMap) := reconstructClasses p.binds p.instances
   let classNames := userClasses.map (·.name)
-  let datas := p.typeDecls.map fun d =>
+  -- Dependency order: a decl with another local type as a field type must come
+  -- after it (Lean has no forward references; the dump order is not topological).
+  let datas := (sortDataDecls p.typeDecls).map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
   let classDecls := userClasses.map emitClassDecl
@@ -780,11 +869,22 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
                     |> resolveUserCtors p.typeDecls
+  -- `resolveUserTypes` (opaque → bare) must run on the data block too: a local
+  -- type used as another decl's FIELD type arrives as
+  -- `(GHCCore.tyConOpaque "Point")` there, exactly as in a body. Only the
+  -- *type* pass runs here — `resolveUserCtors` would rewrite the `| Ctor `
+  -- lines of the inductive itself.
   let dataBlock :=
-    String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))
+    resolveUserTypes p.typeDecls
+      (String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls)))
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
-  -- External-type resolution runs over the whole output (data fields included);
-  -- it only rewrites imported types, so local inductive names are untouched.
+  -- External-type resolution runs over the whole output (data fields included).
+  -- It is safe because `resolveUserTypes` has already made every LOCAL type bare
+  -- in every section (data block included), so the opaque needle can only match
+  -- an imported type. Note the shared manifest does carry the current module's
+  -- own types (`Point → RecordOps`); those entries are dead for exactly that
+  -- reason — before the data block was resolved they fired here and emitted a
+  -- self-qualified `RecordOps.Point` field type.
   resolveExternalTypes extTypes (String.intercalate "\n\n" sections)
 
 end GHCCore.Emit
