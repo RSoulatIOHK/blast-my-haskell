@@ -220,3 +220,40 @@ theorem pairsUpTo_example : pairsUpTo 3 = [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2
 {- @lean
 theorem pairsUpTo_empty : pairsUpTo 0 = [] := by decide
 -}
+
+-- M1 Task 9: partial maximum and minimum (bottom path; see PartialHead.hs
+-- for the precedent: faithful on the defined domain, default exactly at ⊥)
+
+maxOf :: [Int] -> Int
+maxOf xs = maximum xs
+
+minOf :: [Int] -> Int
+minOf xs = minimum xs
+
+{- @lean
+theorem maxOf_example : maxOf [3, 1, 2] = 3 := by decide
+-}
+
+{- @lean
+theorem maxOf_singleton : ∀ (a : Int), maxOf [a] = a := by blaster
+-}
+
+{- @lean
+theorem minOf_example : minOf [3, 1, 2] = 1 := by decide
+-}
+
+{- @lean
+theorem minOf_pair : ∀ (a b : Int), minOf [a, b] = if a < b then a else b := by blaster
+-}
+
+-- The ⊥ pins, and the reason this task exists: Haskell `maximum []` /
+-- `minimum []` THROW; the emitted getD-default form yields `default` (= 0 at
+-- Int) exactly there. Documented partial-correctness tradeoff, not a claim that
+-- Haskell returns 0. Every nonempty case above is faithful.
+{- @lean
+theorem maxOf_empty : maxOf [] = 0 := by decide
+-}
+
+{- @lean
+theorem minOf_empty : minOf [] = 0 := by decide
+-}

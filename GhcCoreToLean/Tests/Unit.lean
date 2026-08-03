@@ -654,4 +654,91 @@ def totalBind : Bind :=
 -- juxtaposed arg already binds tighter than the `×` around it.
 #guard typeConMap "(,)"    ["List Int", "Int"]  == some "(List Int × Int)"
 
+/-! ## M1 Task 9 — partial maximum and minimum (bottom path) -/
+
+-- maximum/minimum are ⊥ ONLY on []. Like head/last they map to a getD-default
+-- form: faithful on nonempty, `default` exactly where Haskell is ⊥. Semantics
+-- caveat: Haskell maximum needs Ord; Lean's List.max? folds Max.max. They agree
+-- at Int (M1's whole surface). On a user type with hand-written non-structural
+-- Ord, Max comes from the structural deriving route — the pre-existing README
+-- limitation; this task does not widen it. That divergence is BOUNDED by a
+-- loud failure rather than silent wrongness on the types most likely to expose
+-- it: core Lean has no `Max` for products (`#synth Max (Int × Int)` = "failed to
+-- synthesize"), so `maximum` on a tuple element type does not elaborate at all
+-- instead of quietly disagreeing with Haskell's lexicographic `Ord`.
+-- Names observed from /tmp/transpile-ListLibrary.json (GHC 9.2.7, pass-0000):
+--   Data.Foldable.maximum / .minimum                        (post-FTP Foldable)
+-- NEGATIVES: ZERO occurrences of `GHC.List.maximum`, `GHC.List.minimum`, or any
+-- `GHC.OldList.*` / `$c`-prefixed method selector. Those two GHC.List keys are
+-- therefore UNOBSERVED hedges, kept per the never-remove-a-hedge rule (matching
+-- the elem/notElem/concat family above). Core spines verbatim (`@ty` = an erased
+-- type application):
+--   maxOf = \xs -> maximum @ty Data.Foldable.$fFoldable[] @ty
+--                          GHC.Classes.$fOrdInt xs
+--   minOf = \xs -> minimum @ty Data.Foldable.$fFoldable[] @ty
+--                          GHC.Classes.$fOrdInt xs
+-- This is the FIRST M1 arm carrying an `Ord` dict, so it is the first check that
+-- dict erasure is not an Eq/Foldable/Num-shaped whitelist. It is not: Lower
+-- erases on the binder's `.dict` ROLE, which the shim assigns from GHC's
+-- `DFunId` details or a `$d`/`$f` name prefix (shim/Main.hs `binderRole`) — so
+-- `$fOrdInt` erases like any other, and the mapping lands at arity 1. Confirmed
+-- in the emitted code: `def maxOf (xs_… : List Int) : Int :=
+-- ((fun xs => (List.max? xs).getD default)) (xs_…)` — one argument, no dict.
+#guard valueMap "Data.Foldable.maximum" == some "(fun xs => (List.max? xs).getD default)"
+#guard valueMap "GHC.List.maximum"      == some "(fun xs => (List.max? xs).getD default)"
+#guard valueMap "Data.Foldable.minimum" == some "(fun xs => (List.min? xs).getD default)"
+#guard valueMap "GHC.List.minimum"      == some "(fun xs => (List.min? xs).getD default)"
+-- Semantic pins: faithful on nonempty, default (= 0 for Int) exactly on [].
+#guard ((List.max? ([3, 1, 2] : List Int)).getD default) == 3
+#guard ((List.min? ([3, 1, 2] : List Int)).getD default) == 1
+#guard ((List.max? ([-5, -2] : List Int)).getD default) == -2
+#guard ((List.max? ([] : List Int)).getD default) == 0    -- ⊥ → default
+#guard ((List.min? ([] : List Int)).getD default) == 0    -- ⊥ → default
+-- APPLIED-shape guards, LOAD-BEARING here (not optional as in the Task 8 block).
+-- The pins above ascribe `List Int` at the call site, so `Max Int` is resolved
+-- against a known type. The EMITTED code applies the mapping lambda with an
+-- UNANNOTATED binder (`((fun xs => (List.max? xs).getD default)) (xs_1)`), where
+-- `α` is still a metavariable when `List.max?`'s `[Max α]` and `getD`'s
+-- `[Inhabited α]` are looked up. `Max Int`/`Min Int` resolve to Int's own core
+-- instances — `#synth Max Int` = `Int.instMax`, `#synth Min Int` = `Int.instMin`
+-- in v4.24.0, NOT an `Ord`-derived route — so nothing here depends on
+-- `LinearOrder`-style instance search; these guards are what pin that the
+-- postponement resolves at all.
+#guard ((fun xs => (List.max? xs).getD default) ([3, 1, 2] : List Int)) == 3
+#guard ((fun xs => (List.min? xs).getD default) ([3, 1, 2] : List Int)) == 1
+#guard ((fun xs => (List.max? xs).getD default) ([] : List Int)) == 0
+-- Also note `List.maximum?`/`List.minimum?` do NOT exist in v4.24.0 (checked:
+-- "Unknown constant"); `List.max?`/`List.min?` are the current names.
+-- emitExpr-level pin, mirroring the `headApp`/`fromJustApp` guards in the
+-- pre-M1 "Task 5: partial functions" block above: `maximum xs` must emit the
+-- faithful getD form, never a blanket `default`.
+def maximumApp : Expr :=
+  .app (.var {name := "Data.Foldable.maximum", unique := 0, ty := .tyVar "a", role := .id})
+       (.var {name := "xs", unique := 1, ty := .tyCon "List" [.tyVar "a"], role := .id})
+#guard emitExpr [] [] maximumApp == "((fun xs => (List.max? xs).getD default)) (xs_1)"
+#guard emitExpr [] [] maximumApp != "default"   -- regression: must NOT blanket-collapse
+-- `exprHasBottom` must see through maximum/minimum (they mention `default`), so
+-- a POLYMORPHIC def using one gets an `[Inhabited t]` binder from
+-- `emitDefHeader`. Both members of each hedge pair are registered in
+-- `Emit.isPartialDefaultName`: a one-sided registration would silently skip the
+-- binder for whichever key Core actually delivers.
+-- REACHABILITY NOTE: that Inhabited-binder path is currently UNREACHABLE
+-- end-to-end and is pinned at unit level only. Every fixture def is
+-- monomorphic at `Int` (where `Inhabited Int` is found by ordinary instance
+-- resolution and no binder is emitted — verified in the generated
+-- ListLibrary.lean). A polymorphic `maximum` wrapper would need an `Ord a`
+-- constraint in its signature, which this transpiler does not yet support for
+-- builtin classes (known deferral; fails loud with tyConOpaque errors), so no
+-- such fixture exists. Same shape as the Task 8 SCOPE NOTE about `[BEq t]`.
+-- BLASTER DATA POINT: both quantified fixture goals went through `List.max?`/
+-- `List.min?`/`Option.getD` on the FIRST try, no `decide` fallback needed
+-- (`maxOf_singleton : ∀ a, maxOf [a] = a`, and `minOf_pair : ∀ a b,
+-- minOf [a, b] = if a < b then a else b`, which additionally makes blaster
+-- bridge Lean's `≤`-shaped Int min against a STRICT `<` in the statement — they
+-- agree only because both branches give the same value at `a = b`). Blaster
+-- also FALSIFIES the near-miss variants with real counterexamples (checked:
+-- `maxOf [a] = a + 1` → a := 0; `minOf [a, b] = if a < b then b else a` →
+-- a := -1, b := 0; `maxOf [a, b] = a` → a := -1, b := 0), so the ✅s are not
+-- vacuous — its Option/max? encoding is genuinely modelling the fold.
+
 end GhcCoreToLean.Tests

@@ -152,6 +152,12 @@ def valueMap : String → Option String
   | "GHC.List.last"       => some "(fun xs => xs.getLastD default)"
   | "GHC.List.!!"         => some "(fun xs i => xs.getD i.toNat default)"
   | "Data.Maybe.fromJust" => some "(fun m => m.getD default)"
+  -- maximum/minimum: ⊥ only on []. Same getD-default partial-correctness
+  -- route as head/last (registered in Emit.isPartialDefaultName so
+  -- polymorphic defs get an [Inhabited t] binder). Foldable-qualified
+  -- names observed (like sum/elem); GHC.List.* hedged.
+  | "Data.Foldable.maximum" | "GHC.List.maximum" => some "(fun xs => (List.max? xs).getD default)"
+  | "Data.Foldable.minimum" | "GHC.List.minimum" => some "(fun xs => (List.min? xs).getD default)"
   -- Tuple projections. Qualified only (a user could define `fst`/`snd`); the
   -- desugarer resolves these through `Data.Tuple.*`.
   | "Data.Tuple.fst"              => some "Prod.fst"
