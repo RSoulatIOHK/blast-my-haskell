@@ -1082,13 +1082,14 @@ def recordProg : Program :=
 --     one thing that DID reach it was the old shim's own
 --     `{"tag":"Cast","expr":{}}`, whose empty `expr` it could not parse (hard
 --     abort of the entire dump). Hence: shim now emits `{"tag":"Coercion"}`,
---     and the legacy `"Cast"` arm degrades to `.coercion` instead of aborting.
+--     and the legacy `"Cast"` arm degrades payload-free shapes to `.coercion`
+--     instead of aborting (exact enumeration at the PARSE guards below).
 --  2. `ECoercion` carries NO payload (nullary constructor) — there is nothing to
 --     round-trip, which is why `Expr.coercion` is an atom rather than wrapping a
 --     type or a pair of types.
 --  3. COERCION BINDERS arrive with role `.id`, i.e. they are NOT erased today.
---     Chain: `Convert.cvtBinder` (Convert.hs:113) branches on `Var.isId`, and a
---     GHC CoVar IS an Id → it emits `Binder{…}`, not `TyBinder{…}`;
+--     Chain: `Convert.cvtBinder` (Convert.hs:114-115) branches on `Var.isId`,
+--     and a GHC CoVar IS an Id → it emits `Binder{…}`, not `TyBinder{…}`;
 --     `cvtIdDetails` (Convert.hs:177) maps `IdInfo.CoVarId{} -> Ast.CoVarId`;
 --     `shim/Main.hs` `binderRole` (~line 150) only recognises `DFunId` plus a
 --     `$d`/`$f` NAME prefix, so `CoVarId` falls through to `"id"`. Therefore
@@ -1098,8 +1099,15 @@ def recordProg : Program :=
 --     speculative — no dump exhibits it). Candidate Task 3 fix: teach
 --     `binderRole` about `CoVarId` (either `-> "dict"` or a new `"coercion"`
 --     role), which makes BOTH `isTypeOrDictBinder` and `isTypeOrDictArg` erase
---     it for free. The guard below pins today's non-erasing behaviour and is
---     EXPECTED TO FLIP if Task 3 does that — read its failure as progress.
+--     it for free. The guard below pins the Lean-side lowering of a role-`.id`
+--     binder as it arrives TODAY; it is INSENSITIVE to the shim-side fix (the
+--     role literal is hard-coded here) — the parse-layer tripwire below is what
+--     fires when Task 3 changes the shim. And that tripwire covers only ONE of
+--     the two candidate fixes: a NEW role string ("coercion") is rejected by
+--     `parseVarRole` today, so introducing it flips the tripwire, whereas
+--     mapping `CoVarId -> "dict"` reuses a string that already parses and that
+--     `isTypeOrDictBinder` already erases — NOTHING Lean-side moves, so this
+--     observation must then be re-verified by hand.
 
 -- A Coercion in ARGUMENT position erases like a type/dict arg: `f co` → `f`.
 -- `Expr` derives no `BEq` (see the deriving-free mutual block in AST.lean), so
@@ -1118,6 +1126,8 @@ def coF : Var := {name := "f", unique := 1, ty := .tyCon "Int" [], role := .id}
 #guard emitExpr [] [] Expr.coercion == "GHCCore.coercionResidue"
 
 -- Coercion BINDER, pinning observation 3: role `.id` ⇒ the lambda SURVIVES.
+-- Lean-side lowering ONLY: the role literal is hard-coded below, so this guard
+-- cannot notice Task 3's shim fix — the parse-layer tripwire further down can.
 def coBinder : Var := {name := "co", unique := 9, ty := .tyCon "~R#" [], role := .id}
 #guard emitExpr [] [] (Lower.lowerExpr (.lam coBinder .coercion))
        == "(fun co_9 => GHCCore.coercionResidue)"
@@ -1128,6 +1138,24 @@ def coTyJson : Lean.Json :=
 def coVarJson : Lean.Json :=
   Lean.Json.mkObj [("name", .str "f"), ("unique", .num 1),
                    ("type", coTyJson), ("role", .str "id")]
+-- TRIPWIRE for Task 3: today `parseVarRole` accepts exactly "id"/"tyVar"/"dict"
+-- (Parse.lean:13-19), so a var carrying role "coercion" is REJECTED. That
+-- function is `private` to Parse.lean, hence pinning it through `parseVar`,
+-- whose only other failure modes are shape errors — which is why the positive
+-- control on the SAME object with a known role is part of the guard, not
+-- decoration: without it this would pass equally well for a typo'd `unique`.
+-- If Task 3 introduces a "coercion" role this flips and the M2 Task 2
+-- observations above must be revisited. It does NOT fire for the other
+-- candidate fix (`CoVarId -> "dict"`), which changes only Haskell and reuses a
+-- string Lean already accepts and already erases — see observation 3.
+def coRoleVarJson (r : String) : Lean.Json :=
+  Lean.Json.mkObj [("name", .str "co"), ("unique", .num 9),
+                   ("type", coTyJson), ("role", .str r)]
+#guard (match parseVar (coRoleVarJson "coercion") with
+        | .ok _ => false | .error _ => true)
+#guard (match parseVar (coRoleVarJson "dict") with
+        | .ok _ => true  | .error _ => false)
+
 def coercionJson : Lean.Json := Lean.Json.mkObj [("tag", .str "Coercion")]
 def legacyCastJson : Lean.Json :=
   Lean.Json.mkObj [("tag", .str "Cast"), ("expr", Lean.Json.mkObj [])]
@@ -1138,6 +1166,20 @@ def litExprJson : Lean.Json :=
                    ("lit", Lean.Json.mkObj [("tag", .str "LitInt"), ("value", .num 7)])]
 def nestedCastJson : Lean.Json :=
   Lean.Json.mkObj [("tag", .str "Cast"), ("expr", litExprJson)]
+def bogusCastJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"),
+                   ("expr", Lean.Json.mkObj [("tag", .str "Bogus")])]
+-- The remaining degrading shapes, so that EVERY case the enumeration below
+-- names is pinned by a guard rather than merely asserted: no `expr` field at
+-- all, an `expr` that is not an object, and an `expr` object whose `tag` is
+-- present but not a string (`legacyCastJson`'s `{}` covers the absent-`tag`
+-- case).
+def castNoExprJson : Lean.Json := Lean.Json.mkObj [("tag", .str "Cast")]
+def castNonObjExprJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"), ("expr", .num 5)]
+def castNonStrTagJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"),
+                   ("expr", Lean.Json.mkObj [("tag", .num 5)])]
 -- `f <arg>` as the shim would deliver it, for the COMPOSED parse→lower→emit path.
 def appCoJson (argJ : Lean.Json) : Lean.Json :=
   Lean.Json.mkObj [("tag", .str "App"),
@@ -1156,10 +1198,25 @@ def parseLowerEmit (j : Lean.Json) : String :=
 #guard parseEmit coercionJson == "GHCCore.coercionResidue"
 -- The legacy `{"tag":"Cast","expr":{}}` no longer ABORTS (it used to fail with
 -- an "expected tag" error that killed the whole dump); it degrades to the atom.
+-- EXACTLY WHICH SHAPES DEGRADE — the single statement of this claim, which
+-- Parse.lean's `"Cast"` arm and observation 1 both point at: `expr` missing,
+-- `expr` present but not an object, and `expr` an object whose `tag` is absent
+-- or not a string. The last two degrade because `getTag` itself errors on them,
+-- not via any explicit shape check. This is DELIBERATE, not lenience-by-
+-- accident: the `"Cast"` tag has zero producers (observation 1), and a
+-- payload-free `Cast` is indistinguishable from a coercion token. A TAGGED
+-- `expr` engages the normal parser and stays LOUD — an unknown tag STRING, or a
+-- well-formed tag with a bad payload, propagates its error (loud guard below).
 #guard parseEmit legacyCastJson == "GHCCore.coercionResidue"
+#guard parseEmit castNoExprJson == "GHCCore.coercionResidue"
+#guard parseEmit castNonObjExprJson == "GHCCore.coercionResidue"
+#guard parseEmit castNonStrTagJson == "GHCCore.coercionResidue"
 -- A well-formed TAGGED nested `expr` still parses as `.cast` (transparent in
 -- emission) — backwards compatibility for any dump that does carry one.
 #guard parseEmit nestedCastJson == "(7 : Int)"
+-- …and the loud half: matched on the CONSTRUCTOR, not on the message text, so
+-- rewording a parse error does not break this guard.
+#guard (match parseExpr bogusCastJson with | .ok _ => false | .error _ => true)
 -- COMPOSED path, the guard that piecewise ones cannot replace: parse ∘ lower
 -- must erase the argument. `isTypeOrDictArg` has no `.cast` arm, so if Parse
 -- ever yielded `.cast .coercion` here instead of a bare `.coercion` the arg

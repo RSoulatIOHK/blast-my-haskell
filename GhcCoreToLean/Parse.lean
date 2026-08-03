@@ -145,10 +145,14 @@ mutual
       -- `Cast x _ -> cvtExpr x` erases the cast before we see it), so the only
       -- producer this arm ever had was the pre-M2 shim's
       -- `ECoercion -> {"tag":"Cast","expr":{}}` — whose empty `expr` this arm
-      -- could not parse, aborting the whole dump. A payload-free / tagless
-      -- `expr` is therefore read as the coercion atom; a *tagged* nested `expr`
-      -- is still parsed as `.cast` (and still errors loud if malformed), so an
-      -- older dump with a real nested expression keeps working.
+      -- could not parse, aborting the whole dump. So a payload-free shape
+      -- (`expr` missing, non-object, or with a non-string `tag`) DEGRADES to the
+      -- coercion atom instead of erroring: this tag has no other producer, and a
+      -- payload-free `Cast` is indistinguishable from a coercion token. A
+      -- *tagged* `expr` engages the normal parser and stays LOUD — an unknown
+      -- tag string, or a bad payload under a known tag, propagates its error —
+      -- so an older dump with a real nested expression keeps working. Exact
+      -- enumeration + guards: Tests/Unit.lean, "M2 Task 2 — coercion token".
       match getField j "expr" with
       | .error _ => .ok .coercion
       | .ok ej   =>
