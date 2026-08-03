@@ -93,12 +93,20 @@ def valueMap : String → Option String
   -- It is the list-specialised `foldr :: (a->b->b) -> b -> [a] -> b` — two
   -- type args then `(f) (z) (xs)` and NO dict (observed in the JSON), so it
   -- has the same shape as the dict-erased Foldable form and shares this arm.
+  -- The foldl arm below has no matching `GHC.Base.*` alternative on purpose:
+  -- `GHC.Base` exports `foldr` (it is the fusion partner of `build`, which is
+  -- why comprehensions desugar to it) but exports no `foldl` at all — checked
+  -- against GHC 9.2.7, where `import GHC.Base (foldl)` is a hard export error.
   | "Data.Foldable.foldr"  | "GHC.List.foldr" | "GHC.Base.foldr"
                                                => some "(fun f z xs => List.foldr f z xs)"
   | "Data.Foldable.foldl"  | "GHC.List.foldl"   => some "(fun f z xs => List.foldl f z xs)"
   -- Folds & predicates (Foldable methods post-FTP; GHC.List hedged).
-  -- sum/product: explicit foldl matches GHC (`sum = foldl (+) 0`). The
-  -- all/any wraps are LOAD-BEARING adapters (Haskell arg order is (p, xs);
+  -- sum/product are hand-rolled as explicit foldl for two concrete reasons:
+  -- (a) v4.24 core has NO `List.product` whatsoever, so `product` must be
+  -- hand-rolled regardless, and symmetry argues for hand-rolling `sum` too;
+  -- (b) core's `List.sum` is `foldr (· + ·) 0` while GHC's is `foldl (+) 0`,
+  -- so the explicit foldl is the more faithful image of the source.
+  -- The all/any wraps are LOAD-BEARING adapters (Haskell arg order is (p, xs);
   -- Lean's List.all/any take the list first) — not legibility wraps.
   | "Data.Foldable.sum"     | "GHC.List.sum"     => some "(fun xs => List.foldl (· + ·) 0 xs)"
   | "Data.Foldable.product" | "GHC.List.product" => some "(fun xs => List.foldl (· * ·) 1 xs)"

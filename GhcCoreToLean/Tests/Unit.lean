@@ -481,10 +481,14 @@ def totalBind : Bind :=
 -- constrained plain functions. Lower erases every one of them: the emitted
 -- Lean is `(fun xs => List.foldl (· + ·) 0 xs) (xs_2395)` and `Hs.and (bs)` —
 -- no stray dict argument, so both new shapes land at the mapped arity.
--- `sum`/`product` use explicit foldl matching GHC (`sum = foldl (+) 0`) — NOT
--- List.sum, whose instance surface we'd rather not depend on. At Int, foldl vs
--- foldr order is unobservable (+/* are associative and commutative and both
--- sides are total). Base cases match GHC: sum [] = 0, product [] = 1,
+-- `sum`/`product` use explicit foldl matching GHC (`sum = foldl (+) 0`) rather
+-- than core's `List.sum`, for two concrete reasons: (a) v4.24 core has NO
+-- `List.product` at all, so `product` has to be hand-rolled either way and
+-- symmetry argues for hand-rolling `sum` with it; (b) core's `List.sum` is
+-- `foldr (· + ·) 0` (Init/Data/List/Basic.lean:2066) whereas GHC's `sum` is
+-- `foldl (+) 0`, so the explicit foldl is the more faithful image. At Int, foldl
+-- vs foldr order is unobservable anyway (+/* are associative and commutative
+-- and both sides are total). Base cases match GHC: sum [] = 0, product [] = 1,
 -- and [] = True, or [] = False, all p [] = True, any p [] = False.
 -- The all/any wraps are LOAD-BEARING (Lean's List.all takes the list first;
 -- Haskell takes the predicate first) — unlike the zip-family legibility wraps.

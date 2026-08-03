@@ -145,6 +145,16 @@ theorem anyZero_example : anyZero [1, 0] = true ∧ anyZero [1, 2] = false := by
 theorem conj_disj_empty : conj [] = true ∧ disj [] = false := by decide
 -}
 
+-- The non-empty companion to `conj_disj_empty`: `decide` only ever exercises
+-- the `[]` base case of `Hs.and`/`Hs.or`, so this quantified version is what
+-- actually covers the cons arms (and confirms Blaster unfolds both wrappers).
+{- @lean
+theorem conj_disj_nonempty : ∀ (b c : Bool), conj [b, c] = (b && c) ∧ disj [b, c] = (b || c) := by blaster
+-}
+
+-- RHS mixes `2 * (x + y)` with `x + x`: the differing surface forms for the
+-- same value are deliberate, exercising blaster's arithmetic normalization
+-- rather than a term-by-term syntactic match against the emitted body.
 {- @lean
 theorem doubled_example : ∀ (x y : Int), doubled [x + y, y, x] = [2 * (x + y), 2 * y, x + x] := by blaster
 -}

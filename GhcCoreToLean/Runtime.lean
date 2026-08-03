@@ -54,6 +54,15 @@ def enumFromThenTo (a b c : Int) : List Int :=
 def splitAt (n : Int) (xs : List α) : List α × List α :=
   (xs.take n.toNat, xs.drop n.toNat)
 
+-- `Hs.and`/`Hs.or` are the one pair here that core provides with a BYTE-IDENTICAL
+-- body — unlike `Hs.splitAt` above, where core's version differs structurally.
+-- v4.24 has `List.or` (`Init/Data/List/Basic.lean:1944`) and `List.and`
+-- (ibid.:1961), plus `or_nil`/`or_cons`/`and_nil`/`and_cons` `@[simp]` lemmas
+-- that these copies do NOT inherit. They are kept anyway for plan conformance
+-- (every Task-7 helper lands in `Hs`) and to insulate the mapping from core
+-- drift. Blaster parity was checked: goals over `Hs.and` discharge the same as
+-- over `List.and` — see `conj_disj_nonempty` in `examples/haskell/ListLibrary.hs`.
+
 /-- Haskell `and :: [Bool] -> Bool`. `and [] = True`. -/
 def and (xs : List Bool) : Bool := xs.all id
 
