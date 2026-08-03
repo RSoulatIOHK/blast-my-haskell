@@ -169,17 +169,34 @@ Development Host.)
   integral (`quot rem div mod divMod quotRem gcd lcm fromIntegral fromInteger`),
   comparison/`Ord` (`== /= < <= > >= min max compare`/`Ordering`), booleans
   (`&& || not otherwise`), combinators (`id . const flip $`), the total list
-  library (`++ map filter foldr foldl length reverse null`), 2-tuples
-  (`fst snd`, construction, patterns), and `Maybe`/`Either` eliminators
+  library (`++ map filter foldr foldl length reverse null take drop splitAt
+  replicate zip zipWith unzip sum product all any and or elem notElem lookup
+  concat concatMap`), list literals (`[a, b, c]`), list comprehensions
+  (single- and multi-generator), `Int` ranges (`[a..b]`, `[a,b..c]` — the
+  zero-stride `[a,a..c]` with `c ≥ a` is infinite in Haskell and lowers to
+  `default`), 2-/3-/4-tuples (`fst snd`, construction, patterns), and
+  `Maybe`/`Either` eliminators
   (`maybe fromMaybe isJust isNothing either`). Local recursive `where`/`let`
   helpers emit as Lean `let rec` (structural recursion only).
 - `error`/`undefined` are ⊥ on their whole domain, so they lower to Lean
-  `default` (a total, sound bottom). The partial list/Maybe functions
-  (`head`, `tail`, `init`, `last`, `!!`, `fromJust`) are ⊥ *only* on the
-  empty list / `Nothing`, so they lower to Lean's total `*D`/`getD` forms:
-  faithful on their defined domain (`head [1,2,3] = 1`) and `default` exactly
-  where Haskell is ⊥. Either way, properties should carry the preconditions
-  that rule the ⊥ branch out (partial-correctness modeling).
+  `default` (a total, sound bottom). The partial list/`Maybe` functions are ⊥
+  on only *part* of their domain, so each lowers to a total Lean form that is
+  faithful wherever Haskell is defined:
+  - `head`, `last`, `maximum`, `minimum`, `fromJust` are ⊥ exactly on `[]` /
+    `Nothing`, and lower to Lean's `*D`/`getD` forms — faithful on the defined
+    domain (`head [1,2,3] = 1`) and `default` exactly where Haskell is ⊥.
+  - `!!` is ⊥ on **any** out-of-range index, not just on the empty list. It
+    lowers to `getD` after `Int.toNat`, so a too-large index gives `default`,
+    but a *negative* index reads position 0 instead (`[7,8,9] !! (-1)` ↦ `7`).
+    That is still sound under partial-correctness modeling — ⊥ may be refined
+    by any value — but it is one more reason indexing properties must carry an
+    in-range precondition.
+  - `tail`/`init` need no default at all: they map to Lean's total
+    `List.tail`/`List.dropLast`, whose value on `[]` is `[]`. That happens to
+    coincide with the ⊥→`default` convention, since `default : List α = []`.
+
+  Either way, properties should carry the preconditions that rule the ⊥ branch
+  out (partial-correctness modeling).
 - Instances: hand-written `Eq` translates to `BEq` from its body (so
   non-structural equality like Ratio's cross-multiply is preserved); derived
   `Eq`/`Ord` are reconstructed via Lean `deriving DecidableEq, Ord` plus
@@ -193,8 +210,14 @@ Development Host.)
   from Core (no GHC-plugin changes). Not yet: superclasses, multi-parameter
   classes, default methods, methods whose signature doesn't mention the class
   parameter, and same-named methods across classes.
-- Not yet supported: 3-tuple *construction* (type and pattern work; a
-  constructed 3-tuple is a loud compile error), and Haskell list-literal syntax
-  (`[a, b, c]` desugars to `GHC.Base.build`).
+- Not yet supported: 5+-tuple construction; the infinite list producers
+  (`iterate`, `repeat`, `cycle`, `enumFrom`, `enumFromThen`) — all loud compile
+  errors by design; and builtin type-class constraints in signatures
+  (`Eq a => …`, `Ord a => …`, `Num a => …`). A polymorphic function carrying
+  such a constraint fails loudly (the dictionary surfaces as an unresolved
+  `GHCCore.tyConOpaque` binder); monomorphic code — e.g. the same function at
+  `Int` — is unaffected. (User-defined classes *are* supported; see the bullet
+  above.)
   Theorems over lists/recursion need a user-written `induction` proof — bare
-  `by blaster` (SMT) discharges only quantifier-free arithmetic goals.
+  `by blaster` (SMT) discharges only quantifier-free arithmetic goals;
+  concrete-value list properties close with `by decide`.
