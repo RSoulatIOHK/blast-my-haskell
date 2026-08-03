@@ -413,6 +413,7 @@ def totalBind : Bind :=
 #guard valueMap "GHC.List.zip"     == some "(fun xs ys => List.zip xs ys)"
 #guard valueMap "GHC.List.zipWith" == some "(fun f xs ys => List.zipWith f xs ys)"
 #guard valueMap "GHC.List.unzip"   == some "List.unzip"
+#guard valueMap "Data.List.unzip"  == some "List.unzip"   -- plan hedge (unobserved at pass-0000)
 -- Semantic pins: catch a Lean-side signature/arg-order surprise at build time.
 -- `List Int` ascriptions for the same reason as the Task 5 block: unannotated
 -- numeric list literals default to `Nat`, but `Int` is what the transpiler emits.

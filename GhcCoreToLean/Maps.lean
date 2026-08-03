@@ -74,7 +74,7 @@ def valueMap : String → Option String
   -- to the shorter list matches Haskell.
   | "GHC.List.zip"     => some "(fun xs ys => List.zip xs ys)"
   | "GHC.List.zipWith" => some "(fun f xs ys => List.zipWith f xs ys)"
-  | "GHC.List.unzip"   => some "List.unzip"
+  | "GHC.List.unzip" | "Data.List.unzip" => some "List.unzip"
   -- Foldable methods (post-FTP). The desugarer resolves these through
   -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
   -- mapping fires regardless of which name appears.
