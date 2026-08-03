@@ -64,6 +64,12 @@ def valueMap : String → Option String
   -- (infinite) are intentionally NOT mapped — loud fail.
   | "GHC.Enum.enumFromTo"     => some "Hs.enumFromTo"
   | "GHC.Enum.enumFromThenTo" => some "Hs.enumFromThenTo"
+  -- Int-indexed list ops. Haskell clamps negative counts to "empty/unchanged";
+  -- `Int.toNat` clamps negatives to 0 — the semantics match exactly.
+  | "GHC.List.take"      => some "(fun n xs => List.take n.toNat xs)"
+  | "GHC.List.drop"      => some "(fun n xs => List.drop n.toNat xs)"
+  | "GHC.List.splitAt"   => some "Hs.splitAt"
+  | "GHC.List.replicate" => some "(fun n x => List.replicate n.toNat x)"
   -- Foldable methods (post-FTP). The desugarer resolves these through
   -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
   -- mapping fires regardless of which name appears.

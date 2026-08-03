@@ -341,4 +341,37 @@ def totalBind : Bind :=
 -- only tested record that the `default` arm is deliberate, not an oversight.
 #guard Hs.enumFromThenTo 1 1 5 == []
 
+-- M1 Task 5: Int-indexed ops. Haskell take/drop/replicate/splitAt treat a
+-- negative count as 0 (`take n _ | n <= 0 = []`, `drop n xs | n <= 0 = xs`,
+-- `replicate = take n (repeat x)`, `splitAt n xs = (take n xs, drop n xs)`);
+-- `Int.toNat` clamps negatives to 0 and `List.take 0 = []` / `List.drop 0 = id`
+-- / `List.replicate 0 = []` — so the semantics MATCH on the whole domain.
+-- Names observed from /tmp/transpile-ListLibrary.json (GHC 9.2.7, pass-0000)
+-- and Generated/ListLibrary.lean:
+--   "GHC.List.take"  "GHC.List.drop"  "GHC.List.splitAt"  "GHC.List.replicate"
+-- (×1 each). Unlike `length`/`null`/`foldr` above, these are NOT Foldable
+-- methods post-FTP, so no `Data.Foldable.*` alternative is needed — all four
+-- keys fired and the generated file has no `GHC.List.*` residue. GHC eta-reduces
+-- `takeSome n xs = take n xs` to `takeSome = take`, so the mapped strings appear
+-- point-free; `Hs.splitAt`'s implicit `α` resolves from the emitted signature.
+-- The APPLIED form `((fun n xs => …) (a)) (b)` (which a non-eta-reducible use in
+-- a later task will produce) also elaborates: the unannotated binder types are
+-- postponed and resolved from the argument types.
+#guard valueMap "GHC.List.take"      == some "(fun n xs => List.take n.toNat xs)"
+#guard valueMap "GHC.List.drop"      == some "(fun n xs => List.drop n.toNat xs)"
+#guard valueMap "GHC.List.splitAt"   == some "Hs.splitAt"
+#guard valueMap "GHC.List.replicate" == some "(fun n x => List.replicate n.toNat x)"
+#guard Hs.splitAt 1 [5, 6, 7] == ([5], [6, 7])
+#guard Hs.splitAt (-2) [1] == ([], [1])
+#guard Hs.splitAt 9 [1] == ([1], [])
+-- Semantic pins for the inline lambdas (negative-clamp + arg order):
+#guard ((fun (n : Int) (xs : List Int) => List.take n.toNat xs) 2 [1,2,3]) == [1,2]
+#guard ((fun (n : Int) (xs : List Int) => List.take n.toNat xs) (-1) [1,2,3]) == []
+#guard ((fun (n : Int) (xs : List Int) => List.drop n.toNat xs) 1 [1,2,3]) == [2,3]
+-- `drop` is the one op whose clamp differs in KIND: take/replicate/splitAt-fst
+-- clamp to "empty", drop clamps to "unchanged". Pin it directly.
+#guard ((fun (n : Int) (xs : List Int) => List.drop n.toNat xs) (-1) [1,2,3]) == [1,2,3]
+#guard ((fun (n : Int) (x : Int) => List.replicate n.toNat x) 3 9) == [9,9,9]
+#guard ((fun (n : Int) (x : Int) => List.replicate n.toNat x) (-3) 9) == []
+
 end GhcCoreToLean.Tests

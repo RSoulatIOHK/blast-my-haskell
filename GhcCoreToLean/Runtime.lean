@@ -42,4 +42,9 @@ def enumFromThenTo (a b c : Int) : List Int :=
   else
     default
 
+/-- Haskell `splitAt n xs = (take n xs, drop n xs)`; negative `n` acts as 0
+    (`Int.toNat` clamps, matching GHC). -/
+def splitAt (n : Int) (xs : List α) : List α × List α :=
+  (xs.take n.toNat, xs.drop n.toNat)
+
 end Hs
