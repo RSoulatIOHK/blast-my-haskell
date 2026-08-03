@@ -465,4 +465,80 @@ def totalBind : Bind :=
 -- claim in the block comment above.
 #guard ((((fun f xs ys => List.zipWith f xs ys)) ((· - ·))) ([10, 20] : List Int)) [1, 2] == [9, 18]
 
+/-! ## M1 Task 7 — folds and predicates (sum, product, all, any, and, or) -/
+
+-- Names observed from /tmp/transpile-ListLibrary.json (GHC 9.2.7, pass-0000).
+-- ALL SIX resolve through `Data.Foldable.*`; a grep for `GHC.List.sum` /
+-- `.product` / `.all` / `.any` / `.and` / `.or` found ZERO occurrences, so the
+-- `GHC.List.*` keys below are unobserved hedges (kept, per the never-remove-a-
+-- hedge rule, matching the length/null/foldr arms). Core, dicts and all:
+--   sumList  = \xs -> Data.Foldable.sum @[] $fFoldable[] @Int $fNumInt xs
+--   conj     = \bs -> Data.Foldable.and @[] $fFoldable[] bs
+--   allPos   = \xs -> Data.Foldable.all @[] @Int $fFoldable[] (\v -> v > 0) xs
+-- Two DICT shapes appear here that no previously-mapped Foldable name had:
+-- `sum`/`product` carry TWO dicts ($fFoldable[] *and* $fNumInt, `length`
+-- carries one), and `all`/`any`/`and`/`or` are not class methods at all but
+-- constrained plain functions. Lower erases every one of them: the emitted
+-- Lean is `(fun xs => List.foldl (· + ·) 0 xs) (xs_2395)` and `Hs.and (bs)` —
+-- no stray dict argument, so both new shapes land at the mapped arity.
+-- `sum`/`product` use explicit foldl matching GHC (`sum = foldl (+) 0`) — NOT
+-- List.sum, whose instance surface we'd rather not depend on. At Int, foldl vs
+-- foldr order is unobservable (+/* are associative and commutative and both
+-- sides are total). Base cases match GHC: sum [] = 0, product [] = 1,
+-- and [] = True, or [] = False, all p [] = True, any p [] = False.
+-- The all/any wraps are LOAD-BEARING (Lean's List.all takes the list first;
+-- Haskell takes the predicate first) — unlike the zip-family legibility wraps.
+-- List COMPREHENSIONS also land in this block. `[2 * x | x <- xs]` desugars at
+-- pass-0000 to
+--   GHC.Base.build @Int (\a c n -> GHC.Base.foldr @Int @b
+--                                    (\ds ds' -> c (2 * ds) ds') n xs)
+-- i.e. through `GHC.Base.foldr`, NOT `Data.Foldable.foldr` — the first
+-- transpile loud-failed with `GHC.Base.foldr` residue in the emitted file.
+-- It is the list-specialised `foldr :: (a->b->b) -> b -> [a] -> b`: two type
+-- args, then `(f) (z) (xs)`, and NO dict (checked in the JSON), so it is the
+-- same shape as the dict-erased Foldable form and was added as a third
+-- alternative on the EXISTING foldr arm rather than as a new mapping.
+#guard valueMap "Data.Foldable.sum"     == some "(fun xs => List.foldl (· + ·) 0 xs)"
+#guard valueMap "GHC.List.sum"          == some "(fun xs => List.foldl (· + ·) 0 xs)"
+#guard valueMap "Data.Foldable.product" == some "(fun xs => List.foldl (· * ·) 1 xs)"
+#guard valueMap "GHC.List.product"      == some "(fun xs => List.foldl (· * ·) 1 xs)"
+#guard valueMap "Data.Foldable.all"     == some "(fun p xs => List.all xs p)"
+#guard valueMap "GHC.List.all"          == some "(fun p xs => List.all xs p)"
+#guard valueMap "Data.Foldable.any"     == some "(fun p xs => List.any xs p)"
+#guard valueMap "GHC.List.any"          == some "(fun p xs => List.any xs p)"
+#guard valueMap "Data.Foldable.and"     == some "Hs.and"
+#guard valueMap "GHC.List.and"          == some "Hs.and"
+#guard valueMap "Data.Foldable.or"      == some "Hs.or"
+#guard valueMap "GHC.List.or"           == some "Hs.or"
+-- The comprehension key, sharing the pre-existing `Data.Foldable.foldr` arm
+-- (whose `GHC.List.foldr` guard lives at the top of this file).
+-- OBSERVED (unlike the GHC.List.* hedges above): this is the one alternative
+-- in this block that a live fixture (`doubled`) actually exercises.
+#guard valueMap "GHC.Base.foldr"        == some "(fun f z xs => List.foldr f z xs)"
+-- Semantic pins.
+#guard Hs.and [true, true] == true
+#guard Hs.and [true, false] == false
+#guard Hs.and [] == true
+#guard Hs.or [false, true] == true
+#guard Hs.or [] == false
+-- Load-bearing, not a duplicate: the all-false case is the ONLY guard that
+-- distinguishes `Hs.or`'s body `xs.any id` from `xs.any (fun _ => true)`,
+-- which satisfies every other `or` guard here. (`Hs.and`'s analogous case is
+-- already covered by the `[true, false]` guard above.)
+#guard Hs.or [false, false] == false
+#guard ((fun xs => List.foldl (· + ·) 0 xs) ([1,2,3] : List Int)) == 6
+#guard ((fun xs => List.foldl (· * ·) 1 xs) ([2,3,4] : List Int)) == 24
+#guard ((fun xs => List.foldl (· + ·) 0 xs) ([] : List Int)) == 0
+-- all/any arg-order pins with a NON-symmetric predicate (a flipped wrap would
+-- feed the list where the predicate goes — loud type error — but pin anyway):
+#guard ((fun p xs => List.all xs p) (fun x => decide (x > (0:Int))) [1,2]) == true
+#guard ((fun p xs => List.all xs p) (fun x => decide (x > (0:Int))) [1,0]) == false
+#guard ((fun p xs => List.any xs p) (fun x => decide (x == (0:Int))) [1,0]) == true
+#guard ((fun p xs => List.any xs p) (fun x => decide (x == (0:Int))) [1,2]) == false
+-- Comprehension shape: the foldr mapping applied the way the desugared
+-- `[2 * x | x <- xs]` applies it — cons-ing consumer, nil seed, list last.
+-- Pins the (f, z, xs) arg order on the arm `GHC.Base.foldr` now shares.
+#guard ((fun f z xs => List.foldr f z xs)
+          (fun a b => List.cons (2 * a) b) ([] : List Int) ([1,2,3] : List Int)) == [2,4,6]
+
 end GhcCoreToLean.Tests

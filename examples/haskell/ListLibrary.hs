@@ -92,3 +92,59 @@ theorem split2_example : split2 [(1, 2), (3, 4)] = ([1, 3], [2, 4]) := by decide
 {- @lean
 theorem split2_nil : split2 [] = ([], []) := by decide
 -}
+
+-- M1 Task 7: folds and predicates (sum / product / all / any / and / or),
+-- plus a list comprehension. Haskell `sum = foldl (+) 0`, `product =
+-- foldl (*) 1`, `and [] = True`, `or [] = False`, `all p [] = True`,
+-- `any p [] = False` — the mapped Lean forms agree on all of these.
+-- The Bool-valued goals are written `= true` / `= false` (Lean `Bool`
+-- literals, not the `Prop` `True`/`False`).
+
+sumList :: [Int] -> Int
+sumList xs = sum xs
+
+prodList :: [Int] -> Int
+prodList xs = product xs
+
+allPos :: [Int] -> Bool
+allPos xs = all (> 0) xs
+
+anyZero :: [Int] -> Bool
+anyZero xs = any (== 0) xs
+
+conj :: [Bool] -> Bool
+conj bs = and bs
+
+disj :: [Bool] -> Bool
+disj bs = or bs
+
+doubled :: [Int] -> [Int]
+doubled xs = [2 * x | x <- xs]
+
+{- @lean
+theorem sumList_example : sumList [1, 2, 3] = 6 := by decide
+-}
+
+{- @lean
+theorem sumList_singleton : ∀ (a : Int), sumList [a] = a := by blaster
+-}
+
+{- @lean
+theorem prodList_example : prodList [2, 3, 4] = 24 := by decide
+-}
+
+{- @lean
+theorem allPos_example : allPos [1, 2] = true ∧ allPos [1, 0] = false := by decide
+-}
+
+{- @lean
+theorem anyZero_example : anyZero [1, 0] = true ∧ anyZero [1, 2] = false := by decide
+-}
+
+{- @lean
+theorem conj_disj_empty : conj [] = true ∧ disj [] = false := by decide
+-}
+
+{- @lean
+theorem doubled_example : doubled [1, 2, 3] = [2, 4, 6] := by decide
+-}

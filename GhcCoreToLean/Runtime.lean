@@ -54,4 +54,10 @@ def enumFromThenTo (a b c : Int) : List Int :=
 def splitAt (n : Int) (xs : List α) : List α × List α :=
   (xs.take n.toNat, xs.drop n.toNat)
 
+/-- Haskell `and :: [Bool] -> Bool`. `and [] = True`. -/
+def and (xs : List Bool) : Bool := xs.all id
+
+/-- Haskell `or :: [Bool] -> Bool`. `or [] = False`. -/
+def or (xs : List Bool) : Bool := xs.any id
+
 end Hs

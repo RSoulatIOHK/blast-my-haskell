@@ -87,8 +87,25 @@ def valueMap : String → Option String
   -- to `Int` (like `gcd`/`lcm`) so it composes with Int arithmetic.
   | "Data.Foldable.length" | "GHC.List.length"  => some "(fun xs => (List.length xs : Int))"
   | "Data.Foldable.null"   | "GHC.List.null"    => some "List.isEmpty"
-  | "Data.Foldable.foldr"  | "GHC.List.foldr"   => some "(fun f z xs => List.foldr f z xs)"
+  -- `GHC.Base.foldr` is the third alternative because list COMPREHENSIONS
+  -- desugar through it, not through the Foldable method: `[2*x | x <- xs]`
+  -- becomes `build (\c n -> GHC.Base.foldr (\ds ds' -> c (2*ds) ds') n xs)`.
+  -- It is the list-specialised `foldr :: (a->b->b) -> b -> [a] -> b` — two
+  -- type args then `(f) (z) (xs)` and NO dict (observed in the JSON), so it
+  -- has the same shape as the dict-erased Foldable form and shares this arm.
+  | "Data.Foldable.foldr"  | "GHC.List.foldr" | "GHC.Base.foldr"
+                                               => some "(fun f z xs => List.foldr f z xs)"
   | "Data.Foldable.foldl"  | "GHC.List.foldl"   => some "(fun f z xs => List.foldl f z xs)"
+  -- Folds & predicates (Foldable methods post-FTP; GHC.List hedged).
+  -- sum/product: explicit foldl matches GHC (`sum = foldl (+) 0`). The
+  -- all/any wraps are LOAD-BEARING adapters (Haskell arg order is (p, xs);
+  -- Lean's List.all/any take the list first) — not legibility wraps.
+  | "Data.Foldable.sum"     | "GHC.List.sum"     => some "(fun xs => List.foldl (· + ·) 0 xs)"
+  | "Data.Foldable.product" | "GHC.List.product" => some "(fun xs => List.foldl (· * ·) 1 xs)"
+  | "Data.Foldable.all"     | "GHC.List.all"     => some "(fun p xs => List.all xs p)"
+  | "Data.Foldable.any"     | "GHC.List.any"     => some "(fun p xs => List.any xs p)"
+  | "Data.Foldable.and"     | "GHC.List.and"     => some "Hs.and"
+  | "Data.Foldable.or"      | "GHC.List.or"      => some "Hs.or"
   -- Boolean / Prelude combinators.
   | "GHC.Classes.&&"   | "&&"      => some "(· && ·)"
   | "GHC.Classes.||"   | "||"      => some "(· || ·)"
