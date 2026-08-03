@@ -146,5 +146,5 @@ theorem conj_disj_empty : conj [] = true ∧ disj [] = false := by decide
 -}
 
 {- @lean
-theorem doubled_example : doubled [1, 2, 3] = [2, 4, 6] := by decide
+theorem doubled_example : ∀ (x y : Int), doubled [x + y, y, x] = [2 * (x + y), 2 * y, x + x] := by blaster
 -}
