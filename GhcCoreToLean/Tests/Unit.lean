@@ -1227,6 +1227,183 @@ def parseLowerEmit (j : Lean.Json) : String :=
 -- COVERAGE NOTE: no fixture reaches any of this yet — 0 `"Cast"`/`"Coercion"`
 -- tags across all existing dumps, and the Ratio/RecordOps regression exercises
 -- none of the lines above (it only proves nothing else broke). These guards are
--- the SOLE coverage of the new path until Task 3's newtype fixture triggers it.
+-- the SOLE coverage of the new path, and they REMAIN so after Task 3: the
+-- newtype fixture did NOT trigger it either (0 `Cast`/0 `Coercion` in
+-- `NewtypeBasic` too — census in the M2 Task 3 block below), because ghc-dump
+-- discards the newtype cast before the shim can see it.
+
+/-! ## M2 Task 3 — newtype observation -/
+
+-- OBSERVATION (examples/haskell/NewtypeBasic.hs → /tmp/transpile-NewtypeBasic.json,
+-- GHC 9.2.7 pass-0000). The load-bearing M2 unknown: what shape does newtype
+-- wrap/unwrap have at pass-0000 as delivered through ghc-dump?
+--
+-- ANSWER: BOTH SIDES ARE ALREADY GONE. The three non-Typeable binds, verbatim
+-- from the dump in Task 1's house style (`@ty` = an erased type application):
+--
+--   mkAge_2131   :: Int -> Age         = \n_2135 -> n_2135
+--   getAge_2132  :: Age -> Int         = \ds_2348 -> ds_2348
+--   addAges_2133 :: Age -> Age -> Age
+--     = \a_2137 -> \b_2138 ->
+--         ((((GHC.Num.+_1300 @ty) GHC.Num.$fNumInt_2239) (getAge_2132 a_2137))
+--          (getAge_2132 b_2138))
+--
+-- (The other six binds are the `$trModule` / `$tcAge` / `$tc'Age` / `$krep`×3
+-- Typeable junk that `isJunkName` drops — same shape as RecordOps.)
+--
+--  (a) CONSTRUCTION `Age n` → the BARE VALUE `n_2135`. No ctor application, no
+--      cast, no coercion, no wrapper of any kind. This is M2 Task 2's
+--      observation 1 in action: GHC wraps `n` in a `Cast`, and
+--      `GhcDump/Convert.hs:233` (`Cast x _ -> cvtExpr x`) throws the cast away
+--      before the shim runs, leaving only the body.
+--  (b) PATTERN `getAge (Age n) = n` → NO case at all: `\ds_2348 -> ds_2348`.
+--      Not a case on the `Age` ctor, not a `let`. GHC compiles a newtype match
+--      to a cast of the scrutinee too, so the same `Convert.hs:233` erasure
+--      removes it. (The binder is GHC's `ds`, as with RecordOps' selectors.)
+--  (c) COERCION tokens: ZERO of them — see the census.
+--  (d) `.transpile-sandbox/.decls/NewtypeBasic.decls.json` (note the `.decls/`
+--      subdirectory — the plan's path is stale), verbatim and complete:
+--        {"instances":[],"module":"NewtypeBasic","typeDecls":[{"constructors":
+--         [{"fields":[{"name":"_","type":{"args":[],"name":"Int","tag":"TyCon"}}],
+--          "name":"Age"}],"kind":"newtype","name":"Age"}]}
+--      `"kind":"newtype"` is present, exactly the field Task 4 filters on, with
+--      one ctor carrying one field. That field's `name` is `"_"` — the decl
+--      plugin's placeholder for an UNNAMED field (contrast RecordOps, whose
+--      fields carry real labels `px`/`topLeft`). So Task 4's "single ctor's
+--      single field" underlying-type lookup yields `Int` here, and its
+--      ≠1-ctor / ≠1-field malformed-dump error path is UNEXERCISED by this
+--      fixture (`newtype`s cannot have either shape in Haskell, so only a
+--      corrupt sidecar reaches it).
+--
+-- TAG CENSUS — every `"tag"` PRESENT in this dump, with counts: TyCon ×49,
+-- App ×32, Var ×28, Lit ×10, NonRec ×9, TyFun ×4, Lam ×4, LitString ×4,
+-- LitWord ×4, Type ×3, LitInt ×2 (11 distinct tags).
+-- ABSENT: `Cast` ×0, `Coercion` ×0, `Let` ×0, `Case` ×0, `DataAlt` ×0, `Rec` ×0.
+--   * `Case` ×0 / `DataAlt` ×0 is result (b) stated as a negative: this dump
+--     contains no pattern match anywhere. POSITIONAL CENSUS of the name `Age`,
+--     which is what selects the plan's decision rule: 0 occurrences as a `Var`
+--     name (the Var names are exactly n, ds, a, b, getAge, $trModule, $tcAge,
+--     $krep, GHC.Num.+, GHC.Num.$fNumInt and the GHC.Types Typeable ctors),
+--     0 occurrences as a `DataAlt` name, and 11 occurrences as `TyCon "Age"`.
+--     Every single `Age` in the Core is a TYPE reference — which is the whole of
+--     Task 4's remaining work, and nothing at the value level.
+--   * `Cast` ×0 / `Coercion` ×0 CLOSES the newtype half of Task 1's scope
+--     sentence ("newtype fields, strict fields and GND-derived selectors are
+--     Task 2-3's probes for it"): a monomorphic, non-GND newtype yields neither,
+--     because its coercions live only inside `Cast` nodes that never reach the
+--     shim. STILL UNPROBED, explicitly not closed: strict fields, GND-derived
+--     instances, and coercion VALUES. So M2 Task 2's `ECoercion` plumbing has
+--     no fixture coverage still.
+--   * `Lam` ×4 = the four value binders (n, ds, a, b), ALL role `"id"`. No
+--     `\(co :: a ~R# b) -> …` binder appeared — the direct negative for M2 Task
+--     2's observation 3, which is therefore still unexercised. The shim was NOT
+--     touched by this task (`binderRole` unchanged, no `CoVarId` arm), so no
+--     re-verification of that observation is owed.
+--
+-- DECISION RULE APPLIED: the plan's FIRST rule — "ghc-dump already erased
+-- wrap/unwrap ⇒ nothing to do at value level". Consequently NOTHING was
+-- implemented: no shim change, no `dataConMap` arm for `Age`, no program-derived
+-- unwrapping-ctor set, `lowerProgram`'s signature untouched. The guards below
+-- pin that negative so a later task cannot quietly assume the mechanism exists.
+
+-- The two observed spines, reconstructed exactly as the dump delivers them
+-- (uniques included). The EXISTING pipeline already emits identity — there is
+-- no newtype-aware step anywhere in it.
+def ntN  : Var := {name := "n",  unique := 2135, ty := .tyCon "Int" [], role := .id}
+def ntDs : Var := {name := "ds", unique := 2348, ty := .tyCon "Age" [], role := .id}
+#guard emitExpr [] [] (Lower.lowerExpr (.lam ntN (.var ntN)))   == "(fun n_2135 => n_2135)"
+#guard emitExpr [] [] (Lower.lowerExpr (.lam ntDs (.var ntDs))) == "(fun ds_2348 => ds_2348)"
+
+-- No static-list hack: `Age` is NOT an unwrapping data con. If a later task
+-- reaches for the tempting one-line "fix" (adding it beside `I#`/`W#`/`C#`),
+-- this fires and forces the program-derived-set question the plan raises.
+#guard isUnwrappingDataCon "Age" == false
+
+-- …and no program-derived set was threaded through lowering. A type ascription
+-- rather than a `#guard`, because the plan's rule-3 mechanism would change
+-- exactly this signature: that change stops this line compiling, forcing the
+-- observations above to be re-read first.
+example : CoreProgram → CoreProgram := Lower.lowerProgram
+
+-- HEDGE. The whole negative result rests on GHC + ghc-dump doing the erasure
+-- for us, so pin what happens if a future compiler/flag combination stops. Both
+-- unimplemented positions already route through `ctorNames` + `resolveUserCtors`
+-- and today (type-level `Age` still an `inductive`) produce CORRECT code; once
+-- Task 4 erases the type they produce an unknown `Age.Age` instead. Loud in
+-- both worlds, silently-wrong in neither — which is also the concrete reason
+-- the plan's "no global `dataConMap` arm" rule costs nothing.
+-- NOTE FOR TASK 4 — the two `emitFullProgram` guards below encode TODAY's
+-- value, so BOTH must be updated there (the `emitDataDecl` one after them does
+-- NOT: Task 4 suppresses at `emitFullProgram`'s `datas` map, not inside
+-- `emitDataDecl`). Dropping newtypes from `ctorNames` and from
+-- `resolveUserCtors`' decl set makes the value-position one read `(Age_9)
+-- (n_2135)` — or `id`/`(fun x => x)` if the plan's identity arm lands — and the
+-- pattern one read `| Age n_2135 =>`. If they fire, that is Task 4 working, not
+-- a regression; re-point them at the new strings and keep the loudness claim.
+def ageNewtypeDecl : DataDecl :=
+  {name := "Age", kind := "newtype",
+   ctors := [ {name := "Age", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
+def ageCtorV : Var := {name := "Age", unique := 9, ty := .tyCon "Age" [], role := .id}
+def mkAgeV : Var :=
+  {name := "mkAge", unique := 2131,
+   ty := .tyFun (.tyCon "Int" []) (.tyCon "Age" []), role := .id}
+def hypValueProg : Program :=
+  { binds := [.nonRec mkAgeV (.lam ntN (.app (.var ageCtorV) (.var ntN)))],
+    typeDecls := [ageNewtypeDecl], instances := [] }
+#guard ((emitFullProgram [] hypValueProg).splitOn "(Age.Age) (n_2135)").length == 2
+def ntWild  : Var := {name := "wild", unique := 0, ty := .tyCon "Age" [], role := .id}
+def getAgeV : Var :=
+  {name := "getAge", unique := 2132,
+   ty := .tyFun (.tyCon "Age" []) (.tyCon "Int" []), role := .id}
+def hypPatBody : Expr :=
+  .lam ntDs (.case_ (.var ntDs) ntWild (.tyCon "Int" [])
+              [.mk (.dataCon "Age") [ntN] (.var ntN)])
+def hypPatProg : Program :=
+  { binds := [.nonRec getAgeV hypPatBody],
+    typeDecls := [ageNewtypeDecl], instances := [] }
+#guard ((emitFullProgram [] hypPatProg).splitOn "| Age.Age n_2135 => n_2135").length == 2
+
+-- The DECL side, i.e. Task 4's starting point: `kind` is read NOWHERE today, so
+-- a `newtype` emits as a plain `inductive`. Task 4 flips this to suppression.
+#guard ((emitDataDecl false false ageNewtypeDecl).splitOn "inductive Age where").length == 2
+
+-- E2E STATUS — `lake build GhcCoreToLean.Generated.NewtypeBasic` FAILS, exactly
+-- as the plan stages it. ALL FOUR errors, verbatim, against the generated file
+-- (`inductive Age`; `def mkAge (n_2135 : Int) : Age := n_2135`;
+-- `def getAge (ds_2348 : Age) : Int := ds_2348`;
+-- `def addAges (a_2137 : Age) (b_2138 : Age) : Age := …`):
+--
+--   19:2  Type mismatch / n_2135 has type Int but is expected to have type Age
+--   22:2  Type mismatch / ds_2348 has type Age but is expected to have type Int
+--   25:5  failed to synthesize / HAdd Int Int Age
+--   27:88 translateType: unexpected sort type
+--         Lean.Expr.sort (Lean.Level.succ (Lean.Level.zero))
+--
+-- Errors 1-3 are the type-level `Age` reference and nothing else: the VALUES are
+-- already the erased identities the plan wants, and only the SIGNATURES still
+-- say `Age`. Note the failure MODE — `inductive Age` elaborates fine, so these
+-- are type MISMATCHES, not unknown identifiers.
+-- Error 4 (the theorem) is a CASCADE of errors 1-3, not an independent blaster
+-- limitation. Checked by hand, three scratch modules: (i) the Task-4-expected
+-- shape (`Age` erased, `mkAge`/`getAge` identities on `Int`) → `✅ Valid`;
+-- (ii) `Age` KEPT as an inductive with well-typed bodies (`Age.Age n` /
+-- `match`) → also `✅ Valid`, so blaster handles the single-field inductive
+-- perfectly well; (iii) `Age` kept with `sorry` bodies (standing in for the
+-- errored defs, which elaborate to `sorryAx`) → reproduces error 4's message
+-- CHARACTER FOR CHARACTER. `sorryAx`'s first explicit argument is a `Type`, and
+-- blaster's `translateType` rejects a sort — hence "unexpected sort type".
+-- Consequence for Task 4: the erasure is needed to make the emitted VALUES
+-- typecheck, NOT to make blaster cope with the inductive.
+--
+-- One extra Task-4 hazard observed while checking this, currently DORMANT. The
+-- shared manifest for this module is `Age\tNewtypeBasic`
+-- (`scripts/transpile_graph.py manifest .transpile-sandbox/.decls NewtypeBasic`),
+-- yet the generated file says bare `Age`, never `NewtypeBasic.Age`: the
+-- self-entry is dead because `resolveUserTypes` and `resolveExternalTypes`
+-- consume the SAME needle `(GHCCore.tyConOpaque "Age")` and the user pass runs
+-- first (`Emit.lean`, `resolveSpecText`/`emitFullProgram`). The moment Task 4
+-- drops newtypes from the user decl set, that entry goes LIVE and rewrites
+-- `Age` → `NewtypeBasic.Age` (a type that no longer exists) — which is exactly
+-- why Task 4 Step 3's manifest suppression is not optional.
 
 end GhcCoreToLean.Tests
