@@ -216,3 +216,7 @@ theorem dupEach_example : dupEach [1, 2] = [1, 1, 2, 2] := by decide
 {- @lean
 theorem pairsUpTo_example : pairsUpTo 3 = [(1, 1), (2, 1), (2, 2), (3, 1), (3, 2), (3, 3)] := by decide
 -}
+
+{- @lean
+theorem pairsUpTo_empty : pairsUpTo 0 = [] := by decide
+-}

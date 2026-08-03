@@ -573,12 +573,11 @@ def totalBind : Bind :=
 -- args and `concat` two, also erased.
 -- elem/notElem/lookup use BEq (the project's Eq image — hand-written Haskell
 -- `Eq` instances become `BEq` instances, and `$fEqInt` is erased by Lower along
--- with `$fFoldable[]`, so the mapping lands at the mapped arity). Dot-notation
--- binds the receiver by type; these wraps are LOAD-BEARING adapters: Haskell
--- `elem` is `(x, xs)` with the element FIRST, whereas Lean's `List.contains` is
--- receiver-first (`contains as a = elem a as`, an `abbrev`, Basic.lean:862).
--- `List.lookup k ps` and `List.flatten` need no adapter beyond arg order, and
--- `List.flatMap f xs` already matches Haskell's `concatMap f xs`.
+-- with `$fFoldable[]`, so the mapping lands at the mapped arity).
+-- Why these wraps exist, and which heads need none: see the arm comment in
+-- Maps.lean — LOAD-BEARING adapters (`List.contains`, an `abbrev` in
+-- `Init/Data/List/Basic.lean`, is reached receiver-first, so Haskell's
+-- element-FIRST arg order has to be adapted).
 -- SCOPE NOTE (unverified, out of scope): every fixture def here is at `Int`, so
 -- whether a POLYMORPHIC Haskell def with an `Eq a` constraint transpiles is
 -- untested — it would need `emitDefHeader` to synthesize a `[BEq t]` binder the
@@ -600,16 +599,18 @@ def totalBind : Bind :=
 #guard (([1, 2, 3] : List Int).contains 9) == false
 #guard (([(1, 10), (2, 20)] : List (Int × Int)).lookup 2) == some 20
 #guard (([(1, 10)] : List (Int × Int)).lookup 9) == none
+#guard (([(1, 10), (1, 20)] : List (Int × Int)).lookup 1) == some 10   -- FIRST match, like Haskell
 #guard (([[1], [2, 3]] : List (List Int)).flatten) == [1, 2, 3]
 #guard (([] : List (List Int)).flatten) == []
 #guard (([1, 2] : List Int).flatMap (fun x => [x, x])) == [1, 1, 2, 2]
--- APPLIED-shape guards, the load-bearing analogue of the Task 6 `zipWith` one
--- at line 466. The pins above use dot notation on a literal, where the
--- receiver type is already known; the EMITTED code applies the mapping lambda
--- with UNANNOTATED binders (`((fun x xs => xs.contains x) 0 xs_123)`), where
--- the binder type is still a metavariable when the field notation is
--- elaborated. These guards are the only ones that pin that that postponement
--- resolves — the dot-notation pins above pass either way.
+-- APPLIED-shape guards, the load-bearing analogue of the applied-shape
+-- `zipWith` guard in the M1 Task 6 block. The pins above use dot notation on a
+-- literal, where the receiver type is already known; the EMITTED code applies
+-- the mapping lambda with UNANNOTATED binders
+-- (`((fun x xs => xs.contains x) 0 xs_123)`), where the binder type is still a
+-- metavariable when the field notation is elaborated. These guards are the only
+-- ones that pin that that postponement resolves — the dot-notation pins above
+-- pass either way.
 #guard ((fun x xs => xs.contains x) (2 : Int) [1, 2, 3]) == true
 #guard ((fun x xs => !(xs.contains x)) (9 : Int) [1, 2, 3]) == true
 #guard ((fun k ps => ps.lookup k) (2 : Int) [(1, 10), (2, 20)]) == some 20
@@ -648,6 +649,7 @@ def totalBind : Bind :=
 #guard typeConMap "Maybe"  ["List Int"]         == some "Option (List Int)"
 #guard typeConMap "List"   ["(Int × Int)"]      == some "List (Int × Int)"  -- bracketed: unchanged
 #guard typeConMap "Either" ["List Int", "Int"]  == some "Sum (List Int) Int"
+#guard typeConMap "Either" ["Int", "List Int"]  == some "Sum Int (List Int)"  -- 2nd call site
 -- Tuple arms need no `parenArg`: `×` is `infixr:35`, BELOW application, so a
 -- juxtaposed arg already binds tighter than the `×` around it.
 #guard typeConMap "(,)"    ["List Int", "Int"]  == some "(List Int × Int)"

@@ -205,14 +205,27 @@ def valueMap : String → Option String
     need no `parenArg`).
 
     The `!startsWith "("` test rests on an invariant of `Emit.emitType`, whose
-    producers are a closed set: every one is either ATOMIC (tyVar, nullary
-    tyCon, nat literal) or FULLY BRACKETED (tyFun `(a → r)`, tyApp `(f x)`,
-    forAll `(∀ …)`, the tuple arms `(a × b)`, opaque tyCon
-    `((GHCCore.tyConOpaque "T") (a))`). So a leading `(` implies fully
-    bracketed, and the ONLY space-containing non-bracketed producers are the
-    four juxtaposition arms below. A future arm that splices args by
-    juxtaposition must use `parenArg` too; one that emits a new
-    space-containing UNBRACKETED shape would break this invariant. -/
+    producers are a closed set, in three buckets:
+    * ATOMIC (space-free): tyVar, nat literal, and MAPPED nullary tyCon. Note
+      "nullary tyCon ⇒ atomic" holds only for the MAPPED ones — every nullary
+      arm below returns a single word (Int / Nat / Bool / Char / Unit /
+      Ordering).
+    * FULLY BRACKETED: tyFun `(a → r)`, tyApp `(f x)`, forAll `(∀ …)`, the
+      tuple arms `(a × b)`, and BOTH opaque-tyCon shapes — the applied
+      `((GHCCore.tyConOpaque "T") (a))` and the NULLARY
+      `(GHCCore.tyConOpaque "T")`. The latter DOES contain a space, so it
+      belongs in this bucket rather than with the atoms; being bracketed, it is
+      correctly left alone.
+    * SPACE-CONTAINING and UNBRACKETED: the four juxtaposition arms below — the
+      case `parenArg` exists for — plus one benign outlier, a string type
+      literal `.tyLit (.str s)` whose payload has a space, which emits `"a b"`
+      and so gets wrapped to `("a b")`. Harmless: parens around a literal are
+      inert.
+    So a leading `(` still implies fully bracketed, and the juxtaposition arms
+    are the only place the wrapping is load-bearing. A future arm that splices
+    args by juxtaposition must use `parenArg` too; one that emits a new
+    space-containing UNBRACKETED shape in which parens are NOT inert would
+    break this invariant. -/
 private def parenArg (s : String) : String :=
   if s.contains ' ' && !s.startsWith "(" then s!"({s})" else s
 
