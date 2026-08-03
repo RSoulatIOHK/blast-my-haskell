@@ -406,25 +406,48 @@ def totalBind : Bind :=
 -- and needs no `Hs.*` wrapper. Haskell's `unzip` is a `foldr` with a lazy
 -- pattern `~(as,bs)` and seed `([],[])`; it agrees with `List.unzip` on every
 -- FINITE list, which is the transpiler's domain.
--- Emission shapes both elaborate: GHC eta-reduces `pairUp xs ys = zip xs ys` to
--- `pairUp = zip` (point-free `(fun xs ys => …)`), while `addWise = zipWith (+)`
--- keeps binders and emits the APPLIED form `(((fun f xs ys => …) (· + ·)) xs) ys`.
--- Eta-wrapped to pin Haskell arg order (f, xs, ys).
+-- Emission shapes — both elaborate. All the fixture defs are written WITH
+-- binders (`pairUp xs ys = zip xs ys`, `addWise xs ys = zipWith (+) xs ys`,
+-- `split2 ps = unzip ps`); what differs is whether GHC eta-reduces them. It
+-- does for `pairUp` and `split2`, so their CORE defs are point-free and the
+-- mapping string lands as the entire body: a bare lambda `(fun xs ys =>
+-- List.zip xs ys)` for `pairUp`, and the bare name `List.unzip` for `split2`
+-- (point-free in Core ≠ point-free in the emitted term — only `split2`'s is).
+-- `addWise`/`subWise` are NOT eta-reduced at pass-0000, so their binders
+-- survive into Lean and the mapping string is emitted in APPLIED position:
+-- `(((fun f xs ys => …) (· + ·)) xs) ys`.
+-- Eta-wrapped for arity legibility only (definitionally equal to the bare
+-- names — the wrap itself pins nothing; the (· - ·) semantic pins below do).
 #guard valueMap "GHC.List.zip"     == some "(fun xs ys => List.zip xs ys)"
 #guard valueMap "GHC.List.zipWith" == some "(fun f xs ys => List.zipWith f xs ys)"
 #guard valueMap "GHC.List.unzip"   == some "List.unzip"
 #guard valueMap "Data.List.unzip"  == some "List.unzip"   -- plan hedge (unobserved at pass-0000)
+-- The hedge asymmetry is deliberate, not an oversight: `unzip` is the only one
+-- of the three with a `Data.List` alternative key because the M1 plan mandated
+-- exactly that key. `zip`/`zipWith` were observed `GHC.List.*`-only (see the
+-- grep note above) and the plan states no hedge for them, so they get none.
 -- Semantic pins: catch a Lean-side signature/arg-order surprise at build time.
 -- `List Int` ascriptions for the same reason as the Task 5 block: unannotated
 -- numeric list literals default to `Nat`, but `Int` is what the transpiler emits.
 -- Arg order must be pinned with a NON-commutative op — `(· + ·)` would pass even
 -- if `List.zipWith`'s two list args were swapped.
+-- FOUR guards in this block share the RHS `[9, 18]`; they are NOT duplicates and
+-- none subsumes another, so a future cleanup must not delete any of them:
+--   (1) the equal-length one just below pins ARG ORDER (a flip yields [-9,-18]);
+--   (2) `[10,20,30] - [1,2]` pins LEFT-longer truncation;
+--   (3) `[10,20] - [1,2,3]` pins RIGHT-longer truncation (a `zipWith` that
+--       truncated only one way would still satisfy (1) and (2));
+--   (4) the applied-shape guard `(((fun f xs ys => …) (· - ·)) …)` at the end
+--       of this block pins that the APPLIED emission shape ELABORATES — a
+--       property of the emitted term, not of `List.zipWith`.
 #guard List.zipWith (· - ·) ([10, 20] : List Int) [1, 2] == [9, 18]
 -- Truncation to the shorter list, pinned in BOTH directions (Haskell's
--- `zip (x:xs) (y:ys) = …; zip _ _ = []` truncates either way; so does Lean's).
+-- `zip (x:xs) (y:ys) = …; zip _ _ = []` truncates either way; so does Lean's) —
+-- for `zip` and for `zipWith` alike.
 #guard List.zip ([1, 2] : List Int) [10, 20, 30] == [(1, 10), (2, 20)]
 #guard List.zip ([1, 2, 3] : List Int) [10, 20] == [(1, 10), (2, 20)]
 #guard List.zipWith (· - ·) ([10, 20, 30] : List Int) [1, 2] == [9, 18]
+#guard List.zipWith (· - ·) ([10, 20] : List Int) [1, 2, 3] == [9, 18]   -- right-longer truncation
 #guard List.unzip ([(1, 10), (2, 20)] : List (Int × Int)) == ([1, 2], [10, 20])
 -- Base case: Haskell `unzip [] = ([], [])` (its `foldr` seed is `([], [])`).
 #guard List.unzip ([] : List (Int × Int)) == ([], [])
@@ -434,10 +457,12 @@ def totalBind : Bind :=
 -- it needs a case split on `l`); Blaster discharges the quantified form anyway.
 #guard List.zip ([1, 2, 3] : List Int) ([] : List Int) == []
 #guard List.zip ([] : List Int) ([1, 2, 3] : List Int) == []
--- The APPLIED form GHC emits for `addWise = zipWith (+)` (a partial application
--- of the unannotated lambda, which does NOT eta-reduce to point-free the way
--- `pairUp`/`split2` do) really does elaborate: the binder types are postponed
--- and resolved from the argument types. Load-bearing for the claim above.
+-- The APPLIED form GHC emits for `addWise xs ys = zipWith (+) xs ys` — the
+-- unannotated mapping lambda applied to `(+)` and then to the def's own two
+-- binders, since this def does NOT eta-reduce to a point-free Core def the way
+-- `pairUp`/`split2` do — really does elaborate: the binder types are postponed
+-- and resolved from the argument types. Load-bearing for the emission-shapes
+-- claim in the block comment above.
 #guard ((((fun f xs ys => List.zipWith f xs ys)) ((· - ·))) ([10, 20] : List Int)) [1, 2] == [9, 18]
 
 end GhcCoreToLean.Tests

@@ -70,6 +70,10 @@ theorem pairUp_example : pairUp [1, 2] [3, 4, 5] = [(1, 3), (2, 4)] := by decide
 -}
 
 {- @lean
+theorem pairUp_nil : ∀ (xs : List Int), pairUp xs [] = [] := by blaster
+-}
+
+{- @lean
 theorem addWise_example : addWise [1, 2] [10, 20] = [11, 22] := by decide
 -}
 
@@ -86,5 +90,5 @@ theorem split2_example : split2 [(1, 2), (3, 4)] = ([1, 3], [2, 4]) := by decide
 -}
 
 {- @lean
-theorem pairUp_nil : ∀ (xs : List Int), pairUp xs [] = [] := by blaster
+theorem split2_nil : split2 [] = ([], []) := by decide
 -}

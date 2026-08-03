@@ -70,10 +70,15 @@ def valueMap : String → Option String
   | "GHC.List.drop"      => some "(fun n xs => List.drop n.toNat xs)"
   | "GHC.List.splitAt"   => some "Hs.splitAt"
   | "GHC.List.replicate" => some "(fun n x => List.replicate n.toNat x)"
-  -- Zip family. Eta-wrapped to pin Haskell arg order (f, xs, ys). Truncation
-  -- to the shorter list matches Haskell.
+  -- Zip family. Eta-wrapped for arity legibility ONLY — these lambdas are
+  -- definitionally equal to the bare names and pin nothing; arg order is
+  -- pinned by the (· - ·) guards in Tests/Unit.lean, the only thing that
+  -- catches a flip. Truncation to the shorter list matches Haskell.
   | "GHC.List.zip"     => some "(fun xs ys => List.zip xs ys)"
   | "GHC.List.zipWith" => some "(fun f xs ys => List.zipWith f xs ys)"
+  -- Asymmetry is deliberate: only `unzip` carries a `Data.List` hedge, because
+  -- the M1 plan mandated exactly that key. `zip`/`zipWith` were observed as
+  -- `GHC.List.*` only and the plan lists no hedge for them, so none is added.
   | "GHC.List.unzip" | "Data.List.unzip" => some "List.unzip"
   -- Foldable methods (post-FTP). The desugarer resolves these through
   -- `Data.Foldable.*` on `[a]`, NOT `GHC.List.*` — include both forms so the
