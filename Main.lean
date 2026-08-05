@@ -97,6 +97,11 @@ def loadExtManifest : IO Emit.ExtManifest := do
   let m := Emit.parseExtManifest (← IO.FS.readFile path)
   for line in m.rejected do
     IO.eprintln s!"warning: EXT_TYPES_MANIFEST line matches no channel, skipped: {line}"
+  for n in m.ambiguous do
+    IO.eprintln s!"warning: `{n}` is declared as a data type in one graph module and as \
+a newtype in another; both manifest entries are DROPPED (choosing either could erase \
+a reference to the data type, which would typecheck and be silently wrong). References \
+to `{n}` from this module will fail loud at `lake build`; rename one of the types."
   pure m
 
 /-- Publish THIS module's erasable newtypes (`Emit.newtypeExports`) as manifest

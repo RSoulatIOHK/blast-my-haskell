@@ -1141,8 +1141,18 @@ two lists must also stay DISJOINT downstream — a newtype leaking into the data
 channel would emit `newtype.Age`.
 
 Keys are BARE type names, so two graph modules declaring the same type name are
-ambiguous; first entry wins (dependency order). That is a pre-existing property
-of the data channel, inherited unchanged by the newtype channel.
+ambiguous. WITHIN the data channel that is a pre-existing property and first entry
+wins (dependency order); its consequence is a mis-qualified `WrongModule.Point`,
+which is loud almost always.
+
+ACROSS the channels the severity is NOT the same, which is why `parseExtManifest`
+refuses that case instead of picking a winner. Graph `{A: newtype Age = Age Int,
+B: data Age = …, C: imports B's Age}`: the manifest would carry both `Age⇥B` and
+`Age⇥newtype⇥Int`, and pass 2 runs first, so C's `f :: Age -> Int` over B's DATA
+type would emit `f : Int → Int` and a `@lean` theorem would verify a property
+about `Int` instead. That typechecks — silent-wrong. So a name appearing in both
+channels has BOTH entries dropped and is reported: the reference stays opaque and
+fails loud at `lake build`.
 -/
 
 /-- The `newtype` channel's discriminator field. Lowercase and a Haskell keyword,
@@ -1163,6 +1173,8 @@ structure ExtManifest where
   newtypes : List (Name × String)   := []
   /-- Lines that matched no channel; the caller warns and drops them. -/
   rejected : List String            := []
+  /-- Names found in BOTH channels: dropped from both, caller warns. -/
+  ambiguous : List Name             := []
   deriving BEq, Repr, Inhabited
 
 /-- Parse an `EXT_TYPES_MANIFEST` file body into its two disjoint channels (see
@@ -1178,9 +1190,13 @@ structure ExtManifest where
     emitted Lean, where `GHCCore.tyConOpaque` is undefined — so the failure mode
     of skipping is loud at `lake build`, whereas aborting would refuse a module
     over a corrupt line the user never wrote. Empty lines (the trailing newline
-    always yields one) are neither parsed nor reported. -/
+    always yields one) are neither parsed nor reported.
+
+    A name appearing in BOTH channels is dropped from both and reported in
+    `ambiguous` — the one configuration where picking a winner would be
+    silent-wrong rather than loud (see the section header's `{A, B, C}` graph). -/
 def parseExtManifest (s : String) : ExtManifest :=
-  (s.splitOn "\n").foldl (init := {}) fun m line =>
+  let raw : ExtManifest := (s.splitOn "\n").foldl (init := {}) fun m line =>
     let reject := { m with rejected := m.rejected ++ [line] }
     if line.isEmpty then m else
     match line.splitOn "\t" with
@@ -1191,6 +1207,13 @@ def parseExtManifest (s : String) : ExtManifest :=
       if t.isEmpty || u.isEmpty || tag != newtypeChannelTag then reject
       else { m with newtypes := m.newtypes ++ [(t, u)] }
     | _ => reject
+  let clashing := (raw.newtypes.filterMap fun (n, _) =>
+    if raw.datas.any (·.1 == n) then some n else none).eraseDups
+  if clashing.isEmpty then raw else
+  { raw with
+    datas     := raw.datas.filter    fun (t, _) => !clashing.contains t
+    newtypes  := raw.newtypes.filter fun (t, _) => !clashing.contains t
+    ambiguous := clashing }
 
 /-- Rewrite `(GHCCore.tyConOpaque "T")` → `M.T` for each external type `T`
     declared in a transpiled dependency module `M` (the manifest's DATA channel,

@@ -1867,6 +1867,24 @@ def wrapPNtDecl : DataDecl :=
 #guard parseExtManifest "\n\n" == {}
 #guard parseExtManifest "Point\tRecordOps\nAge\n"
        == {datas := [("Point", "RecordOps")], rejected := ["Age"]}
+-- CROSS-CHANNEL AMBIGUITY is the one manifest configuration that would be
+-- SILENT-wrong rather than loud, so it is refused rather than resolved: with
+-- `data Age` in module B and `newtype Age = Age Int` in module A, a client using
+-- B's Age would have it ERASED to `Int` by pass 2 (which runs before pass 4), and
+-- a theorem over `Int` typechecks. Both entries are dropped — the reference stays
+-- opaque and fails loud — and the name is reported for the caller to warn about.
+-- (Within the data channel, ambiguity mis-qualifies to `WrongModule.Point`, which
+-- is loud; that asymmetry is why only this case is refused.)
+#guard parseExtManifest "Age\tB\nAge\tnewtype\tInt\n" == {ambiguous := ["Age"]}
+#guard parseExtManifest "Age\tnewtype\tInt\nAge\tB\n" == {ambiguous := ["Age"]}
+-- Unrelated entries in the same file are unaffected, and the report is deduped.
+#guard parseExtManifest "Point\tRecordOps\nAge\tB\nAge\tnewtype\tInt\nAge\tnewtype\tBool\n"
+       == {datas := [("Point", "RecordOps")], ambiguous := ["Age"]}
+-- The SAME name twice in the SAME channel is NOT this case (first entry wins, as
+-- it always has): only a cross-channel clash can silently erase a data type.
+#guard parseExtManifest "Point\tA\nPoint\tB\n" == {datas := [("Point", "A"), ("Point", "B")]}
+#guard resolveExternalTypes [("Point", "A"), ("Point", "B")] "(GHCCore.tyConOpaque \"Point\")"
+       == "A.Point"
 
 -- SUBSTITUTION SLOT. Imported newtypes are erased at PASS 2, from `extNts`. This
 -- is the client's exact emitted signature shape: no local decls at all, the needle
