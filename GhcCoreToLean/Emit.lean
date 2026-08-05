@@ -836,13 +836,27 @@ origin marker and GND instances have no `$c` methods to sniff — M2 spec
 correction 3), so `deriving (Show)` on a newtype is refused for the same reason.
 Relaxable later by extending the decl-plugin to dump instance origin.
 
-Two deliberate scope limits, both recorded rather than fixed:
+Detection is STRUCTURAL: every newtype mentioned anywhere in a head type is
+flagged, argument positions included. A newtype in argument position was the
+sharpest silent-wrong hole here — `instance Eq (Celsius, Celsius)` reads as head
+`(,)`, so a head-only check let it through and emitted
+`instance : BEq (Int × Int)` with zero diagnostics, relocating Eq onto every pair
+of `Int`s in the module. Observed on the pre-fix binary: exit 0, empty stderr,
+and `theorem _ : ((1,2) == (1,3)) = true := by decide` builds.
+
+One deliberate scope limit remains, recorded rather than fixed:
 
 * The check reads the CURRENT module's `typeDecls`, so an orphan instance in
   module B on a newtype imported from A is invisible to it (cross-module newtype
-  tracking is out of M2 scope).
-* Only the HEAD tycon of each head type is inspected, never type arguments:
-  `instance Eq (Maybe Celsius)` reports head `Maybe` and is not flagged.
+  tracking is out of M2 scope). Severity: NOT silent-wrong — it fails loud at
+  `lake build` time. `resolveNewtypes` only rewrites needles for newtypes it
+  knows, and the cross-module manifest deliberately suppresses newtype names
+  (they have no Lean image to point at), so the `(GHCCore.tyConOpaque "N")`
+  needle `emitType` produced survives into the generated Lean, where
+  `GHCCore.tyConOpaque` is undefined — `GhcCoreToLean/Runtime.lean` declares no
+  such symbol (grep: its only occurrences in this repo are the emitter's own
+  needle-construction and needle-rewriting sites). Mechanism-level claim: no
+  cross-module orphan fixture was built to observe it end-to-end.
 -/
 
 /-- Names of ALL `newtype` decls — well-formed or not.
@@ -862,26 +876,48 @@ def malformedNewtypes (decls : List DataDecl) : List Name :=
   let erased := (newtypeDecls decls).map (·.1)
   (newtypeNames decls).filter fun n => !erased.contains n
 
-/-- Head type constructor of a `GHCType`, if it has one. `.tyApp` is peeled so a
-    curried application still reports its head; arguments are NOT inspected (see
-    the section header's scope note). -/
-private def headTyConName : GHCType → Option Name
-  | .tyCon n _ => some n
-  | .tyApp f _ => headTyConName f
-  | _          => none
+mutual
+  /-- Every name from `nts` MENTIONED anywhere in a type — head position, tycon
+      arguments, either side of an application or arrow, or a `∀` body.
+      Duplicates are kept; the caller dedups.
 
-/-- Instances the transpiler must REFUSE, as `(className, newtypeName)` pairs —
-    one per offending head type, so a multi-parameter class reports each newtype
-    it mentions. Every element of `headTypes` is scanned, not just the first:
-    `instance Convert Int Celsius` is as unrepresentable as `instance Eq Celsius`. -/
+      Structural rather than head-only because the head tycon alone misses the
+      worst case: `instance Eq (Celsius, Celsius)` has head `(,)`, so a head-only
+      check passed it through and emitted `instance : BEq (Int × Int)` — see the
+      section header. Written as a `mutual` pair with `newtypeMentionsAll` so the
+      recursion through `.tyCon`'s argument LIST is structural: `partial` would
+      make this opaque to kernel reduction and the `#guard`s pinning it in
+      `Tests/Unit.lean` would not elaborate. -/
+  private def newtypeMentions (nts : List Name) : GHCType → List Name
+    | .tyCon n args => (if nts.contains n then [n] else []) ++ newtypeMentionsAll nts args
+    | .tyApp f x    => newtypeMentions nts f ++ newtypeMentions nts x
+    | .tyFun a r    => newtypeMentions nts a ++ newtypeMentions nts r
+    | .forAll _ b   => newtypeMentions nts b
+    | .tyVar _      => []
+    | .tyLit _      => []
+
+  /-- `newtypeMentions` over a list of types — the recursive half that walks
+      `.tyCon`'s arguments and, at the top level, an instance's `headTypes`. -/
+  private def newtypeMentionsAll (nts : List Name) : List GHCType → List Name
+    | []      => []
+    | t :: ts => newtypeMentions nts t ++ newtypeMentionsAll nts ts
+end
+
+/-- Instances the transpiler must REFUSE, as `(className, newtypeName)` pairs.
+
+    Every element of `headTypes` is scanned (not just the first — `instance
+    Convert Int Celsius` is as unrepresentable as `instance Eq Celsius`), and each
+    is scanned STRUCTURALLY, not just for its head tycon (`instance Eq (Celsius,
+    Celsius)` is unrepresentable too, and was the silent-wrong hole this closed).
+    One pair per distinct `(class, newtype)`: a head naming the same newtype twice
+    is one problem reported once, while a multi-parameter class mentioning two
+    different newtypes still reports both. Dedup keeps the first occurrence, so
+    report order follows the dump. -/
 def newtypeInstanceViolations (insts : List Instance) (decls : List DataDecl)
     : List (Name × Name) :=
   let nts := newtypeNames decls
-  insts.flatMap fun i =>
-    i.headTypes.filterMap fun t =>
-      match headTyConName t with
-      | some n => if nts.contains n then some (i.className, n) else none
-      | none   => none
+  (insts.flatMap fun i =>
+    (newtypeMentionsAll nts i.headTypes).map fun n => (i.className, n)).eraseDups
 
 /-- The refusal message for one `newtypeInstanceViolations` pair: names the class,
     the newtype, its underlying type when the newtype is well-formed enough to
@@ -905,7 +941,10 @@ def newtypeInstanceError (decls : List DataDecl) (v : Name × Name) : String :=
   s!"  dropped outright. Both are silent-wrong, so transpilation is refused.\n" ++
   s!"  Remedy: {remedy}.\n" ++
   s!"  Note: a `deriving` clause on a newtype is refused for the same reason —\n" ++
-  s!"  the dump carries no derived-vs-hand-written marker to tell them apart."
+  s!"  the dump carries no derived-vs-hand-written marker to tell them apart.\n" ++
+  s!"  Note: `{nt}` may sit NESTED in the instance head (e.g. `instance {cls}\n" ++
+  s!"  ({nt}, {nt})`) rather than be the head itself; that is refused identically,\n" ++
+  s!"  because the head's Lean image is built from the erased type."
 
 /-- The warning for a malformed `newtype` (see `malformedNewtypes`). Not an error:
     Haskell admits neither shape, so only a corrupt or out-of-date decl sidecar

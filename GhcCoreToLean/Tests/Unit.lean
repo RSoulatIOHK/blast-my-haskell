@@ -1573,7 +1573,8 @@ def ntRDecl : DataDecl :=
 
 /-! ## M2 Task 5 — newtype-instance loud-fail guard -/
 
--- ANY instance whose head tycon is a newtype is REFUSED (loud): erasure cannot
+-- ANY instance MENTIONING a newtype anywhere in its head types — head position or
+-- nested in an argument — is REFUSED (loud): erasure cannot
 -- represent it, and derived-vs-hand-written is indistinguishable in `tcg_insts`
 -- (GND instances carry no `$c` methods to sniff). Relaxable later via a
 -- decl-plugin origin dump.
@@ -1598,7 +1599,12 @@ def ntRDecl : DataDecl :=
 --       `(fun a b => decide (a > b))` on plain Int — the OPPOSITE order from the
 --       Haskell, with the user's `compare` nowhere in the file.
 --
--- Both are silent-wrong; the guard now makes them exit 1 before anything is
+--   (c) `newtype Celsius = Celsius Int` + `instance Eq (Celsius, Celsius)` —
+--       ARGUMENT position, which the FIRST version of this guard (head-tycon only)
+--       still let through. See the argument-position block below for the observed
+--       output and the false theorem it made provable.
+--
+-- All three are silent-wrong; the guard now makes them exit 1 before anything is
 -- written. `examples/haskell/NewtypeInstances.hs` is the committed negative
 -- fixture (excluded from the green-regression list).
 
@@ -1641,15 +1647,96 @@ def eqPointInst : Instance :=
            dfunName := "$fOrdAge", dfunUnique := 0}, eqAgeInst]
          [ageNewtypeDecl] == [("Ord", "Age"), ("Eq", "Age")]
 
--- SCOPE LIMIT, recorded as a negative: only the HEAD tycon is inspected, so a
--- newtype in ARGUMENT position (`instance Eq (Maybe Celsius)`) reports head
--- `Maybe` and is NOT flagged. Recursing into arguments is deliberately out of M2
--- scope (as is the orphan-instance-on-an-imported-newtype case, which no
--- single-module `typeDecls` can see).
+-- ARGUMENT POSITION, formerly a recorded scope limit and in fact SILENT-WRONG:
+-- head-only detection read `instance Eq (Maybe Age)` as head `Maybe` and let it
+-- through. Detection is now STRUCTURAL, so a newtype nested anywhere in a head
+-- type is flagged.
+--
+-- OBSERVED on the pre-fix binary (`f323c5f`), the reason this is a soundness fix
+-- and not a completeness nicety. `newtype Celsius = Celsius Int` +
+-- `instance {-# OVERLAPPING #-} Eq (Celsius, Celsius) where
+--    (Celsius a, _) == (Celsius b, _) = a == b`
+-- transpiled with exit 0 and EMPTY stderr, emitting inside the module namespace:
+--     def _dollar_c_eq__eq__3286 (ds_3425 : (Int × Int)) (ds_3426 : (Int × Int)) : Bool := …
+--     instance : BEq (Int × Int) where
+--       beq := _dollar_c_eq__eq__3286        -- compares FIRST COMPONENTS ONLY
+-- i.e. Eq relocated onto `Int × Int`, so
+--     theorem _ : (((1,2) : Int × Int) == ((1,3) : Int × Int)) = true := by decide
+-- BUILT (`lake build` succeeded). Every `==` on a pair of Ints in the module,
+-- theorem text included, silently meant "first components equal".
+--
+-- The shape below is exactly what the shim dumps for that head:
+-- `.tyCon "(,)" [.tyCon "Celsius" [], .tyCon "Celsius" []]` — unqualified inner
+-- names, matching `newtypeNames`. Reported ONCE despite two mentions (dedup).
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "(,)" [.tyCon "Age" [], .tyCon "Age" []]],
+           dfunName := "$fEq(,)", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("Eq", "Age")]
+-- …the `Maybe`-argument shape that the old comment pinned as UNFLAGGED.
 #guard newtypeInstanceViolations
          [{className := "Eq", headTypes := [.tyCon "Maybe" [.tyCon "Age" []]],
            dfunName := "$fEqMaybeAge", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("Eq", "Age")]
+-- …either side of a function arrow (`instance C (Age -> Int)`, `instance C (Int -> Age)`)…
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyFun (.tyCon "Age" []) (.tyCon "Int" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyFun (.tyCon "Int" []) (.tyCon "Age" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+-- …either side of a curried `.tyApp` (the un-saturated dump shape)…
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyApp (.tyCon "Maybe" []) (.tyCon "Age" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+-- …and under a `∀`.
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.forAll "a" (.tyCon "Maybe" [.tyCon "Age" []])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+-- NO OVER-FIRE: a DATA type in each of those same positions is still fine. This
+-- is what keeps `Hs.splitAt`-style pair types and `Arithmetic`'s hand-written
+-- `Eq CustomRatio` working — the recursion must be newtype-keyed, not tuple-shy.
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "(,)" [.tyCon "Point" [], .tyCon "Point" []]],
+           dfunName := "$fEq(,)", dfunUnique := 0}]
+         [ageNewtypeDecl, pointDecl] == []
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "Maybe" [.tyCon "Point" []]],
+           dfunName := "$fEqMaybePoint", dfunUnique := 0}]
+         [ageNewtypeDecl, pointDecl] == []
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyFun (.tyCon "Point" []) (.tyCon "Int" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl, pointDecl] == []
+-- Type VARIABLES and type LITERALS are not names to match against either.
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyCon "Maybe" [.tyVar "Age"], .tyLit (.nat 7)],
+           dfunName := "$fC", dfunUnique := 0}]
          [ageNewtypeDecl] == []
+
+-- DEDUP is per (class, newtype) PAIR, not per newtype: a head mentioning the same
+-- newtype twice reports once (above), while two DIFFERENT newtypes in one head
+-- still report both, in dump order.
+#guard newtypeInstanceViolations
+         [{className := "Convert",
+           headTypes := [.tyCon "(,)" [.tyCon "Age" [], .tyCon "Bad2" []]],
+           dfunName := "$fConvert", dfunUnique := 0}]
+         [ageNewtypeDecl, badNewtypeTwoCtors] == [("Convert", "Age"), ("Convert", "Bad2")]
+
+-- REMAINING SCOPE LIMIT, recorded as a negative: the guard reads the CURRENT
+-- module's `typeDecls`, so an ORPHAN instance in module B on a newtype imported
+-- from A sees an empty newtype set and correctly reports nothing. This pins that
+-- the empty-set path is total (no crash) and silent — the loudness for that case
+-- lives DOWNSTREAM, at Lean build time: the cross-module manifest deliberately
+-- skips `kind == "newtype"` (`scripts/transpile_graph.py`) and `resolveNewtypes`
+-- only rewrites needles for newtypes it knows, so the `(GHCCore.tyConOpaque
+-- "Age")` needle survives into the generated Lean, where `GHCCore.tyConOpaque` is
+-- undefined (nothing in `GhcCoreToLean/Runtime.lean` declares it). Mechanism
+-- verified by reading those two sites; no cross-module orphan fixture was built.
+#guard newtypeInstanceViolations [eqAgeInst] [] == []
 
 -- The message names the class, the newtype, the underlying type and the remedy.
 #guard ((newtypeInstanceError [ageNewtypeDecl] ("Eq", "Age")).splitOn "instance Eq Age").length == 2
