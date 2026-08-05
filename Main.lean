@@ -123,6 +123,20 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     IO.eprintln s!"parse error: {msg}"
     pure 1
   | .ok prog => do
+    -- Program-level validation, BEFORE any emission (nothing is written below
+    -- until the very end, so an early `return` leaves no partial output).
+    -- Warn about malformed newtype dumps: they fall back to being emitted as
+    -- data, which fails loud at `lake build` — this names the cause up front.
+    for n in Emit.malformedNewtypes prog.typeDecls do
+      IO.eprintln s!"warning: {Emit.malformedNewtypeWarning n}"
+    -- Refuse any instance whose head type is a newtype: erasure has nowhere to
+    -- put it and both fallbacks are silent-wrong. See Emit's "Newtype-instance
+    -- guard" section for the two observed shapes.
+    let ntViolations := Emit.newtypeInstanceViolations prog.instances prog.typeDecls
+    if !ntViolations.isEmpty then
+      for v in ntViolations do
+        IO.eprintln s!"error: {Emit.newtypeInstanceError prog.typeDecls v}"
+      return 1
     let userBinds := prog.binds.filterMap keepBinding
     let lowered   := Lower.lowerProgram userBinds
     let userProg  : Program := { prog with binds := lowered }

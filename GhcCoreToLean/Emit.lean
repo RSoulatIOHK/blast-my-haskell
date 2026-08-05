@@ -813,6 +813,113 @@ def newtypeSubsts (decls : List DataDecl) : List (Name × String) :=
                     (n, resolveNewtypes (nts.filter (·.1 != n)) u))
   (saturate raw.length raw).map fun (n, u) => (n, resolveUserTypes (keptTypeDecls decls) u)
 
+/-! ### Newtype-instance guard (Program validation, NOT a resolution pass)
+
+Erasure identifies a newtype with its underlying type, so an instance whose head
+is a newtype has nowhere to go — and both places it *can* go are silent-wrong,
+the one failure mode this project forbids:
+
+* **Eq relocates.** `newtype Mod7 = Mod7 Int` + a hand-written `Eq Mod7` emits
+  `instance : BEq Int where beq := <mod-7 function>` inside the module namespace,
+  so every `==` on `Int` in the module (theorem text included) silently means
+  mod-7. Observed: `((1 : Int) == 8) = false` is *refuted* by `decide`.
+* **Ord vanishes.** `newtype Coin = Coin Int` + `instance Ord Coin where compare
+  (Coin a) (Coin b) = compare b a` matches `ordTypes` on the opaque head, so
+  `isSuppressedMethod` drops every `$c` method, while the newtype is filtered out
+  of `datas` and gets no `deriving Ord` either. The user's reversed `compare` is
+  gone and Lean's own `Int` order takes over — with zero diagnostics.
+
+So: ANY instance whose head type is a newtype is a hard transpiler error.
+
+Derived-vs-hand-written is not distinguishable here (`tcg_insts` carries no
+origin marker and GND instances have no `$c` methods to sniff — M2 spec
+correction 3), so `deriving (Show)` on a newtype is refused for the same reason.
+Relaxable later by extending the decl-plugin to dump instance origin.
+
+Two deliberate scope limits, both recorded rather than fixed:
+
+* The check reads the CURRENT module's `typeDecls`, so an orphan instance in
+  module B on a newtype imported from A is invisible to it (cross-module newtype
+  tracking is out of M2 scope).
+* Only the HEAD tycon of each head type is inspected, never type arguments:
+  `instance Eq (Maybe Celsius)` reports head `Maybe` and is not flagged.
+-/
+
+/-- Names of ALL `newtype` decls — well-formed or not.
+
+    The guard keys off THIS, deliberately not off `newtypeDecls`: a malformed
+    newtype does not erase, but it is still a newtype at the source level (GHC has
+    still erased its value level), so an instance on it is just as unrepresentable
+    and must be refused just as loudly. -/
+def newtypeNames (decls : List DataDecl) : List Name :=
+  (decls.filter (·.kind == "newtype")).map (·.name)
+
+/-- `newtype` decls dumped with a shape Haskell does not admit (≠1 ctor or ≠1
+    field) and which therefore do NOT erase — see `newtypeDecls`. Reported as a
+    warning at the validation site so the shape's only diagnostic isn't an
+    indirect Lean type mismatch. -/
+def malformedNewtypes (decls : List DataDecl) : List Name :=
+  let erased := (newtypeDecls decls).map (·.1)
+  (newtypeNames decls).filter fun n => !erased.contains n
+
+/-- Head type constructor of a `GHCType`, if it has one. `.tyApp` is peeled so a
+    curried application still reports its head; arguments are NOT inspected (see
+    the section header's scope note). -/
+private def headTyConName : GHCType → Option Name
+  | .tyCon n _ => some n
+  | .tyApp f _ => headTyConName f
+  | _          => none
+
+/-- Instances the transpiler must REFUSE, as `(className, newtypeName)` pairs —
+    one per offending head type, so a multi-parameter class reports each newtype
+    it mentions. Every element of `headTypes` is scanned, not just the first:
+    `instance Convert Int Celsius` is as unrepresentable as `instance Eq Celsius`. -/
+def newtypeInstanceViolations (insts : List Instance) (decls : List DataDecl)
+    : List (Name × Name) :=
+  let nts := newtypeNames decls
+  insts.flatMap fun i =>
+    i.headTypes.filterMap fun t =>
+      match headTyConName t with
+      | some n => if nts.contains n then some (i.className, n) else none
+      | none   => none
+
+/-- The refusal message for one `newtypeInstanceViolations` pair: names the class,
+    the newtype, its underlying type when the newtype is well-formed enough to
+    have one, and the remedy. -/
+def newtypeInstanceError (decls : List DataDecl) (v : Name × Name) : String :=
+  let (cls, nt) := v
+  let under? := (newtypeSubsts decls).find? (·.1 == nt) |>.map (·.2)
+  let erasedTo := match under? with
+    | some u => s!" (erased → `{u}`)"
+    | none   => " (malformed dump: it does not even erase cleanly)"
+  let remedy := match under? with
+    | some u => s!"write the instance — and any property about it — against\n" ++
+                s!"  the underlying type `{u}`, or drop the instance"
+    | none   => "write the instance — and any property about it — against\n" ++
+                "  the underlying type, or drop the instance"
+  s!"newtype instance not representable: `instance {cls} {nt}`\n" ++
+  s!"  `{nt}` is a newtype{erasedTo}. Newtypes are erased to their underlying\n" ++
+  s!"  type, so an instance on one has no Lean image: it would either silently\n" ++
+  s!"  reattach to the underlying type (changing the meaning of every use of\n" ++
+  s!"  `{cls}`'s methods at that type in this module, theorem text included) or be\n" ++
+  s!"  dropped outright. Both are silent-wrong, so transpilation is refused.\n" ++
+  s!"  Remedy: {remedy}.\n" ++
+  s!"  Note: a `deriving` clause on a newtype is refused for the same reason —\n" ++
+  s!"  the dump carries no derived-vs-hand-written marker to tell them apart."
+
+/-- The warning for a malformed `newtype` (see `malformedNewtypes`). Not an error:
+    Haskell admits neither shape, so only a corrupt or out-of-date decl sidecar
+    can produce one, and the downstream failure is already loud (GHC erased the
+    value level, so identity bodies against a surviving one-field inductive are
+    type MISMATCHES). Erroring here would newly refuse input that currently
+    transpiles; warning names the consequence up front instead. -/
+def malformedNewtypeWarning (n : Name) : String :=
+  s!"malformed newtype `{n}`: dumped with ≠1 constructor or ≠1 field, a shape\n" ++
+  s!"  Haskell does not admit, so it is NOT erased and is emitted as an ordinary\n" ++
+  s!"  data type. GHC has already erased its value level, so the generated Lean is\n" ++
+  s!"  expected to FAIL to typecheck (identity bodies against a one-field\n" ++
+  s!"  inductive). This indicates a corrupt or out-of-date decl sidecar."
+
 /-- Characters that continue (or qualify) a Lean identifier. A ctor-name
     occurrence flanked by one of these is part of a LONGER name — `mkPoint`,
     `Points`, `Point.Point` — and must never be rewritten. -/

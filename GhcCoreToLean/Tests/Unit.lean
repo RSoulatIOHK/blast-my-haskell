@@ -1571,4 +1571,103 @@ def ntRDecl : DataDecl :=
          "area (resize w h (Rect (Point 0 0) 1 1)) = w * h"
        == "area (resize w h (Rect.Rect (Point.Point 0 0) 1 1)) = w * h"
 
+/-! ## M2 Task 5 — newtype-instance loud-fail guard -/
+
+-- ANY instance whose head tycon is a newtype is REFUSED (loud): erasure cannot
+-- represent it, and derived-vs-hand-written is indistinguishable in `tcg_insts`
+-- (GND instances carry no `$c` methods to sniff). Relaxable later via a
+-- decl-plugin origin dump.
+--
+-- OBSERVED at HEAD before this guard existed — both shapes built with ZERO
+-- diagnostics, which is why the guard is soundness-critical and not a
+-- representability nicety:
+--
+--   (a) `newtype Mod7 = Mod7 Int` + hand-written `Eq Mod7` (`a mod 7 == b mod 7`)
+--       emitted, inside `namespace Mod7Probe`:
+--         instance : BEq Int where
+--           beq := _dollar_c_eq__eq__3186     -- the mod-7 function
+--       i.e. the Eq RELOCATED onto `Int`. Canary: `example : ((1 : Int) == 8) =
+--       false := by decide` → "Tactic `decide` proved that the proposition
+--       (1 == 8) = false is false". Every `==` on Int in the module — theorem text
+--       included — silently meant mod-7.
+--   (b) `newtype Coin = Coin Int` + `instance Ord Coin where compare (Coin a)
+--       (Coin b) = compare b a` (REVERSED) emitted no Ord anything: `ordTypes`
+--       matched the opaque head so `isSuppressedMethod` dropped all nine `$c`
+--       defs, and the newtype was filtered out of `datas` so no `deriving Ord`
+--       replaced them. `richer a b = a > b` came out as
+--       `(fun a b => decide (a > b))` on plain Int — the OPPOSITE order from the
+--       Haskell, with the user's `compare` nowhere in the file.
+--
+-- Both are silent-wrong; the guard now makes them exit 1 before anything is
+-- written. `examples/haskell/NewtypeInstances.hs` is the committed negative
+-- fixture (excluded from the green-regression list).
+
+def eqAgeInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Age" []], dfunName := "$fEqAge", dfunUnique := 0}
+def eqPointInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Point" []], dfunName := "$fEqPoint", dfunUnique := 0}
+
+-- A violation is detected…
+#guard newtypeInstanceViolations [eqAgeInst] [ageNewtypeDecl] == [("Eq", "Age")]
+-- …and an instance on a DATA type is not flagged (the guard must not over-fire:
+-- `Arithmetic`'s hand-written `Eq CustomRatio` has to keep working).
+#guard newtypeInstanceViolations [eqPointInst] [ageNewtypeDecl, pointDecl] == []
+-- ZERO CHURN: a newtype-free decl set, and an instance-free program, are both `[]`.
+#guard newtypeInstanceViolations [eqPointInst] [pointDecl, rectDecl] == []
+#guard newtypeInstanceViolations [] [ageNewtypeDecl] == []
+
+-- KEYED OFF ALL NEWTYPE DECLS, not the erased-pair list: a MALFORMED newtype does
+-- not erase (`newtypeDecls` skips it, `keptTypeDecls` keeps it) yet an instance on
+-- it is just as unrepresentable — GHC has still erased its value level — so it is
+-- still refused. `newtypeNames` is the key, deliberately not `newtypeDecls`.
+#guard newtypeDecls [badNewtypeTwoCtors] == []
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "Bad2" []],
+           dfunName := "$fEqBad2", dfunUnique := 0}]
+         [badNewtypeTwoCtors] == [("Eq", "Bad2")]
+#guard newtypeNames [ageNewtypeDecl, pointDecl, badNewtypeTwoCtors] == ["Age", "Bad2"]
+
+-- EVERY head type is scanned, not just `headTypes.head?`: a multi-parameter class
+-- whose SECOND parameter is the newtype is equally unrepresentable.
+#guard newtypeInstanceViolations
+         [{className := "Convert", headTypes := [.tyCon "Int" [], .tyCon "Age" []],
+           dfunName := "$fConvertIntAge", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("Convert", "Age")]
+-- Ord — shape (b) above, the silently-DROPPED one — is caught by the same rule;
+-- nothing about the guard is Eq-specific, and both instances of a two-instance
+-- type are reported.
+#guard newtypeInstanceViolations
+         [{className := "Ord", headTypes := [.tyCon "Age" []],
+           dfunName := "$fOrdAge", dfunUnique := 0}, eqAgeInst]
+         [ageNewtypeDecl] == [("Ord", "Age"), ("Eq", "Age")]
+
+-- SCOPE LIMIT, recorded as a negative: only the HEAD tycon is inspected, so a
+-- newtype in ARGUMENT position (`instance Eq (Maybe Celsius)`) reports head
+-- `Maybe` and is NOT flagged. Recursing into arguments is deliberately out of M2
+-- scope (as is the orphan-instance-on-an-imported-newtype case, which no
+-- single-module `typeDecls` can see).
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "Maybe" [.tyCon "Age" []]],
+           dfunName := "$fEqMaybeAge", dfunUnique := 0}]
+         [ageNewtypeDecl] == []
+
+-- The message names the class, the newtype, the underlying type and the remedy.
+#guard ((newtypeInstanceError [ageNewtypeDecl] ("Eq", "Age")).splitOn "instance Eq Age").length == 2
+#guard ((newtypeInstanceError [ageNewtypeDecl] ("Eq", "Age")).splitOn
+         "underlying type `Int`").length == 2
+-- …and degrades honestly for a malformed newtype, which has no underlying type to
+-- name (the `newtypeSubsts` lookup misses).
+#guard ((newtypeInstanceError [badNewtypeTwoCtors] ("Eq", "Bad2")).splitOn
+         "malformed dump").length == 2
+
+-- MALFORMED-NEWTYPE diagnostic (WARNING, not error — Haskell admits neither
+-- shape, so only a corrupt sidecar reaches it, and the downstream Lean type
+-- mismatch is already loud; erroring would newly refuse input that transpiles).
+#guard malformedNewtypes [ageNewtypeDecl, pointDecl] == []
+#guard malformedNewtypes
+         [badNewtypeTwoCtors, badNewtypeTwoFields, badNewtypeNoFields, ageNewtypeDecl]
+       == ["Bad2", "BadF", "BadN"]
+#guard ((malformedNewtypeWarning "Bad2").splitOn "Bad2").length == 2
+#guard ((malformedNewtypeWarning "Bad2").splitOn "FAIL to typecheck").length == 2
+
 end GhcCoreToLean.Tests
