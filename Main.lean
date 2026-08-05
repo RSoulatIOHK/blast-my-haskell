@@ -48,7 +48,7 @@ private def topBinderNames (prog : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc).reverse
 
-private def emitNamesCrib (prog : Program) : String :=
+private def emitNamesCrib (extTypes : List (String × String)) (prog : Program) : String :=
   -- `$f` dict-builders survive into emitFullProgram (for class reconstruction)
   -- but are suppressed from emission; keep them out of the crib too.
   let names := (topBinderNames prog.binds).filter (fun n => !n.startsWith "$f")
@@ -61,7 +61,12 @@ private def emitNamesCrib (prog : Program) : String :=
     -- (`sortDataDecls`) rather than the dump order. Newtypes appear here even
     -- though they emit no decl — the crib is the record of what the module
     -- declared, and the annotation is where a reader learns the type is gone.
-    let nts := Emit.newtypeSubsts prog.typeDecls
+    -- The underlying string is run through pass 4 as well, because a newtype over
+    -- an IMPORTED type erases to `(GHCCore.tyConOpaque "Point")` at pass 2 and
+    -- only becomes `RecordOps.Point` there; without this the crib comment would be
+    -- the one place a raw needle still appears in generated output.
+    let nts := (Emit.newtypeSubsts prog.typeDecls).map fun (n, u) =>
+      (n, Emit.resolveExternalTypes extTypes u)
     let typeLines := (Emit.sortDataDecls prog.typeDecls).map fun d =>
       match nts.find? (·.1 == d.name) with
       | some (_, u) => s!"--   newtype {d.name} (erased → {u})"
@@ -77,17 +82,36 @@ private def emitNamesCrib (prog : Program) : String :=
       ++ String.intercalate "\n" all
       ++ "\n\n"
 
-/-- Imported-type → defining-module map for cross-module references, read from
-    the tab-separated file named by `EXT_TYPES_MANIFEST` (one `Type\tModule`
-    per line). transpile.sh builds it from the dependencies' `.decls.json`. -/
-def loadExtTypes : IO (List (String × String)) := do
-  let some path ← IO.getEnv "EXT_TYPES_MANIFEST" | pure []
-  if path.isEmpty || !(← System.FilePath.pathExists path) then pure [] else
-  let s ← IO.FS.readFile path
-  pure ((s.splitOn "\n").filterMap fun line =>
-    match line.splitOn "\t" with
-    | [t, m] => if t.isEmpty || m.isEmpty then none else some (t, m)
-    | _      => none)
+/-- Cross-module type information, read from the tab-separated file named by
+    `EXT_TYPES_MANIFEST`. Two channels — `Type\tModule` (imported data type →
+    defining module) and `Type\tnewtype\tUnderlying` (imported newtype → the type
+    it erases to); see `Emit.parseExtManifest` and the manifest section header in
+    `Emit.lean` for the format, and `transpile.sh` for who writes each channel.
+
+    A line matching neither channel is WARNED about and skipped rather than fatal:
+    the consequence of a dropped entry is a surviving `(GHCCore.tyConOpaque "T")`
+    needle, i.e. a loud `lake build` failure, so skipping cannot be silent-wrong. -/
+def loadExtManifest : IO Emit.ExtManifest := do
+  let some path ← IO.getEnv "EXT_TYPES_MANIFEST" | pure {}
+  if path.isEmpty || !(← System.FilePath.pathExists path) then pure {} else
+  let m := Emit.parseExtManifest (← IO.FS.readFile path)
+  for line in m.rejected do
+    IO.eprintln s!"warning: EXT_TYPES_MANIFEST line matches no channel, skipped: {line}"
+  pure m
+
+/-- Publish THIS module's erasable newtypes (`Emit.newtypeExports`) as manifest
+    lines to the file named by `NEWTYPE_EXPORTS_OUT`; `transpile.sh` appends it to
+    the shared manifest so the modules that IMPORT this one erase the newtype the
+    same way this one does.
+
+    Always truncates when the variable is set — including to EMPTY — because the
+    sidecar lives in the sandbox's `.decls` directory, which persists across runs:
+    a newtype deleted from the source must not leave a live entry behind. -/
+def writeNewtypeExports (typeDecls : List DataDecl) : IO Unit := do
+  let some path ← IO.getEnv "NEWTYPE_EXPORTS_OUT" | pure ()
+  if path.isEmpty then pure () else
+  let lines := (Emit.newtypeExports typeDecls).map fun (n, u) => Emit.newtypeManifestLine n u
+  IO.FS.writeFile path (String.join (lines.map (· ++ "\n")))
 
 /-- Lean modules to `import` for transpiled dependencies, from the
     space-separated `LEAN_IMPORTS` env var (e.g. `GhcCoreToLean.Generated.Ratio`). -/
@@ -123,26 +147,38 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     IO.eprintln s!"parse error: {msg}"
     pure 1
   | .ok prog => do
+    -- The cross-module manifest is loaded FIRST because its `newtype` channel is
+    -- an input to the validation below, not just to emission: an instance on an
+    -- IMPORTED newtype is exactly as unrepresentable as one on a local newtype,
+    -- and since that newtype's needle IS erased now (pass 2), letting it through
+    -- would be silent-wrong rather than a loud `lake build` failure.
+    let ext    ← loadExtManifest
+    let extNts := ext.newtypes
     -- Program-level validation, BEFORE any emission (nothing is written below
     -- until the very end, so an early `return` leaves no partial output).
     -- Warn about malformed newtype dumps: they fall back to being emitted as
     -- data, which fails loud at `lake build` — this names the cause up front.
     for n in Emit.malformedNewtypes prog.typeDecls do
       IO.eprintln s!"warning: {Emit.malformedNewtypeWarning n}"
-    -- Refuse any instance whose head type is a newtype: erasure has nowhere to
-    -- put it and both fallbacks are silent-wrong. See Emit's "Newtype-instance
-    -- guard" section for the two observed shapes.
-    let ntViolations := Emit.newtypeInstanceViolations prog.instances prog.typeDecls
+    -- Refuse any instance whose head type is a newtype — local or imported:
+    -- erasure has nowhere to put it and both fallbacks are silent-wrong. See
+    -- Emit's "Newtype-instance guard" section for the observed shapes and for the
+    -- invariant that ties this name set to the set pass 2 erases.
+    let ntViolations :=
+      Emit.newtypeInstanceViolations prog.instances prog.typeDecls (extNts.map (·.1))
     if !ntViolations.isEmpty then
       for v in ntViolations do
-        IO.eprintln s!"error: {Emit.newtypeInstanceError prog.typeDecls v}"
+        IO.eprintln s!"error: {Emit.newtypeInstanceError prog.typeDecls v extNts}"
       return 1
+    -- Publish this module's own erasable newtypes for its dependents. After the
+    -- guard: a refused module aborts the whole pipeline (`transpile.sh` runs under
+    -- `set -e`), so no dependent can read the file this run either way.
+    writeNewtypeExports prog.typeDecls
     let userBinds := prog.binds.filterMap keepBinding
     let lowered   := Lower.lowerProgram userBinds
     let userProg  : Program := { prog with binds := lowered }
-    let extTypes  ← loadExtTypes
-    let body      := Emit.emitFullProgram extTypes userProg
-    let crib      := emitNamesCrib userProg
+    let body      := Emit.emitFullProgram ext.datas userProg extNts
+    let crib      := emitNamesCrib ext.datas userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that
     -- shadow Lean builtins (e.g. an Int-typed `min`/`max`) resolve to the
     -- local def rather than colliding with `Min.min`/`Max.max`. The matching
@@ -161,7 +197,7 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let mut leanCursor := (pre.splitOn "\n").length
     let mut blocks : List (Nat × Nat × Nat × Nat) := []   -- hsS hsE leanS leanE
     for (hsStart, hsEnd, raw) in specs do
-      let resolved := Emit.resolveSpecText userProg.typeDecls extTypes raw.trim
+      let resolved := Emit.resolveSpecText userProg.typeDecls ext.datas raw.trim extNts
       let nLines   := (resolved.splitOn "\n").length
       let leanS    := leanCursor + 1
       let leanE    := leanS + nLines - 1

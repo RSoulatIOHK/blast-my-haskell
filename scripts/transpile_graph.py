@@ -23,6 +23,19 @@ Two subcommands, both line-oriented so bash can consume them:
       (the transpiler reads this via EXT_TYPES_MANIFEST). `newtype` decls are
       skipped: they are erased to their underlying type and have no Lean name to
       qualify.
+
+      This is the DATA channel of a two-channel manifest. The other one,
+
+          <TypeName>\tnewtype\t<UnderlyingLeanType>
+
+      carries imported newtypes and is NOT written here: computing the underlying
+      Lean type means replicating the transpiler's emitType/typeConMap, so the
+      defining module's own transpile publishes it (Emit.newtypeExports →
+      $NEWTYPE_EXPORTS_OUT) and transpile.sh appends it to this file. The two
+      channels cannot collide — `newtype` is lowercase and a Haskell keyword, so
+      it can never be the module name of a data line — and data lines are
+      byte-identical to what this subcommand has always printed. Format spec:
+      Emit.lean's manifest section header; parser: Emit.parseExtManifest.
 """
 
 from __future__ import annotations
@@ -112,6 +125,10 @@ def manifest(decls_dir: str, mods: list[str]) -> int:
             # across the graph, so this also kills the CURRENT module's own
             # self-entry, which goes live the moment newtypes leave the
             # transpiler's user-type set.
+            # Imported newtypes are NOT dropped from the pipeline by this skip:
+            # they travel in the manifest's separate `newtype` channel, appended
+            # by transpile.sh from the defining module's transpile (see the
+            # `manifest` docstring above).
             if t.get("kind") == "newtype":
                 continue
             name = t.get("name")

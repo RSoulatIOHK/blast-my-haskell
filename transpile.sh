@@ -141,7 +141,11 @@ if [[ ! -x "$TRANSPILER" ]]; then
   exit 1
 fi
 
-# 4. Shared type→module manifest (so external type refs resolve to <Mod>.<Type>).
+# 4. Shared cross-module type manifest. Two channels (see Emit.lean's manifest
+#    section header): the DATA channel `Type<TAB>Module` written here from the
+#    dependencies' .decls.json, and the NEWTYPE channel
+#    `Type<TAB>newtype<TAB>Underlying` appended per module in emit_module below.
+#    Rebuilt from scratch (`>`) every run, so those appends never accumulate.
 MANIFEST="/tmp/transpile-ext-types.tsv"
 python3 "$HELPER" manifest "${SANDBOX}/.decls" "${MODULES[@]}" > "$MANIFEST"
 export EXT_TYPES_MANIFEST="$MANIFEST"
@@ -151,7 +155,7 @@ export EXT_TYPES_MANIFEST="$MANIFEST"
 # + source map) → close namespace.
 emit_module() {
   local mod="$1" src="$2" deps="$3" out="$4"
-  local cbor decls json lean_imports dep
+  local cbor decls json lean_imports dep nt_exports
 
   # ghc-dump-core names CBOR by module *path* (Lib.Inner → Lib/Inner.pass-0000.cbor),
   # whereas the decl plugin names by dotted module (Lib.Inner.decls.json).
@@ -178,7 +182,18 @@ emit_module() {
   fi
 
   mkdir -p "$(dirname "$out")"
-  LEAN_IMPORTS="$lean_imports" "$TRANSPILER" "$json" "$out" "$mod" >/dev/null
+  # A newtype has no Lean name for the manifest's data channel to qualify, so the
+  # transpiler publishes its RESOLVED UNDERLYING type here instead (only when that
+  # type is builtin-only — see Emit.newtypeExports) and we append it to the shared
+  # manifest. Appending after this module emits is sufficient because modules emit
+  # in dependency order: every module that imports this one runs strictly later.
+  # The transpiler truncates the sidecar on every run, so it cannot go stale.
+  nt_exports="${SANDBOX}/.decls/${mod}.newtypes.tsv"
+  NEWTYPE_EXPORTS_OUT="$nt_exports" LEAN_IMPORTS="$lean_imports" \
+    "$TRANSPILER" "$json" "$out" "$mod" >/dev/null
+  if [[ -s "$nt_exports" ]]; then
+    cat "$nt_exports" >>"$MANIFEST"
+  fi
   export DECLS_JSON_PATH="$decls"
 
   # Close the `namespace <module>` the transpiler opened (specs are already

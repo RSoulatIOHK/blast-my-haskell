@@ -1726,17 +1726,19 @@ def eqPointInst : Instance :=
            dfunName := "$fConvert", dfunUnique := 0}]
          [ageNewtypeDecl, badNewtypeTwoCtors] == [("Convert", "Age"), ("Convert", "Bad2")]
 
--- REMAINING SCOPE LIMIT, recorded as a negative: the guard reads the CURRENT
--- module's `typeDecls`, so an ORPHAN instance in module B on a newtype imported
--- from A sees an empty newtype set and correctly reports nothing. This pins that
--- the empty-set path is total (no crash) and silent — the loudness for that case
--- lives DOWNSTREAM, at Lean build time: the cross-module manifest deliberately
--- skips `kind == "newtype"` (`scripts/transpile_graph.py`) and `resolveNewtypes`
--- only rewrites needles for newtypes it knows, so the `(GHCCore.tyConOpaque
--- "Age")` needle survives into the generated Lean, where `GHCCore.tyConOpaque` is
--- undefined (nothing in `GhcCoreToLean/Runtime.lean` declares it). Mechanism
--- verified by reading those two sites; no cross-module orphan fixture was built.
+-- ORPHAN INSTANCES (was a recorded scope limit here; CLOSED by Task 6, which had
+-- to close it — see that section for the observed refusal). With no local decls
+-- and no imported-newtype names, the newtype set is empty and nothing is reported:
+-- this pins that the empty-set path is total (no crash).
 #guard newtypeInstanceViolations [eqAgeInst] [] == []
+-- The loudness of THAT configuration rests on the needle surviving into the
+-- generated Lean, where `GHCCore.tyConOpaque` is undefined (nothing in
+-- `GhcCoreToLean/Runtime.lean` declares it). Task 6 OBSERVED that failure verbatim
+-- for a newtype the manifest cannot carry:
+--   error: …/NtUserUnderClient.lean:13:23: Unknown identifier `GHCCore.tyConOpaque`
+-- But once the manifest DOES carry the newtype, the needle is erased and the same
+-- input would silently relocate the instance — so the guard now takes the imported
+-- names too (Task 6 section).
 
 -- The message names the class, the newtype, the underlying type and the remedy.
 #guard ((newtypeInstanceError [ageNewtypeDecl] ("Eq", "Age")).splitOn "instance Eq Age").length == 2
@@ -1756,5 +1758,201 @@ def eqPointInst : Instance :=
        == ["Bad2", "BadF", "BadN"]
 #guard ((malformedNewtypeWarning "Bad2").splitOn "Bad2").length == 2
 #guard ((malformedNewtypeWarning "Bad2").splitOn "FAIL to typecheck").length == 2
+
+/-! ## M2 Task 6 — cross-module records & newtypes (`RecordClient.hs`) -/
+
+-- OBSERVED (`/tmp/transpile-RecordClient.json`, GHC 9.2.7 pass-0000, module
+-- importing `RecordOps (Point, mkPoint, px)` + `NewtypeBasic (Age, mkAge, getAge)`):
+--
+--   (a) An imported newtype in a SIGNATURE arrives as a BARE tycon, the same
+--       convention imported `data` types use (Task 1's observation for `Point`):
+--         "binder": {"name":"bumpAge", …
+--           "type":{"arg":{"args":[],"name":"Age","tag":"TyCon"},
+--                   "res":{"args":[],"name":"Age","tag":"TyCon"},"tag":"TyFun"}}
+--       compare the imported data type, same dump:
+--           {"arg":{"args":[],"name":"Point","tag":"TyCon"}, …}   -- originDist
+--       So `emitType` produces the SAME `(GHCCore.tyConOpaque "Age")` needle a
+--       local newtype would, and the client's `typeDecls` is `[]` (the decl plugin
+--       dumps only `tcg_tcs`), which is why pass 2 needs the manifest channel.
+--
+--   (b) PLAN CORRECTION. The plan's Step 2 expected `clientAge`'s Core type to
+--       carry `Age`. It does NOT: `clientAge :: Int -> Int` dumps as
+--           "type":{"arg":{…"name":"Int"…},"res":{…"name":"Int"…},"tag":"TyFun"}
+--       and the value level is already GHC-erased, so that function transpiled and
+--       verified (`✅ Valid`) even BEFORE this task — it proves the value half of
+--       cross-module newtype use, not the type half. `bumpAge :: Age -> Age` was
+--       added to the fixture as the function that actually reaches the type level;
+--       without it the fixture never touches the gap the task exists to close.
+--
+--   (c) NEW LIMITATION observed (records half, not newtypes). Imported VALUE names
+--       in `@lean` spec text are NOT qualified — only types are (pass 4 rewrites
+--       type needles; nothing rewrites a bare function name). The plan's
+--       `theorem originDist_mk : … originDist (mkPoint x y) = x` failed loud:
+--           error: RecordClient.lean:22:51: Function expected at
+--             mkPoint
+--           but this term has type ?m.1
+--       Fixed IN THE FIXTURE by writing `RecordOps.mkPoint`. Same family as the
+--       bare-ctor-application limitation Task 7's README bullet already covers;
+--       imported selectors used in DEFS (`px` → `RecordOps.px`) are unaffected —
+--       those come from Core, where the name arrives qualified.
+
+-- EXPORT SET. `newtypeExports` publishes a newtype iff its underlying string is
+-- built entirely from `typeConMap`-mapped tycons, which is exactly "contains no
+-- `GHCCore.tyConOpaque` needle". Builtin and mapped-compound underlyings export…
+#guard newtypeExports [ageNewtypeDecl]  == [("Age", "Int")]
+#guard newtypeExports [agesNewtypeDecl] == [("Ages", "List Int")]
+-- …and the export is the RAW `emitType` form (`List Int`, unbracketed): the
+-- consumer's `resolveNewtypes` re-applies `newtypeArg`, so bracketing exactly once
+-- keeps argument position right on the client side too.
+#guard resolveNewtypes [("Ages", "List Int")] "(List (GHCCore.tyConOpaque \"Ages\"))"
+       == "(List (List Int))"
+-- A newtype over a LOCAL user type is SKIPPED (documented M2 limitation): the
+-- correct spelling in a client is `M.Q`, which needs qualified-underlying
+-- resolution. Note the test must read the PRE-`resolveUserTypes` string —
+-- `newtypeSubsts` has already turned the needle into a bare `Q` by then, which is
+-- why the filter runs on `newtypeChainSubsts`.
+#guard newtypeSubsts [wrapperNtDecl, qDecl] == [("Wrapper", "Q")]
+#guard newtypeChainSubsts [wrapperNtDecl, qDecl]
+       == [("Wrapper", "(GHCCore.tyConOpaque \"Q\")")]
+#guard newtypeExports [wrapperNtDecl, qDecl] == []
+-- A newtype over an IMPORTED/unknown user type is skipped by the same rule (`Point`
+-- is not among the decls here, so nothing resolves it away either). This is the
+-- probe fixture's `newtype WrapP = WrapP Point`, reconstructed.
+def wrapPNtDecl : DataDecl :=
+  {name := "WrapP", kind := "newtype",
+   ctors := [ {name := "WrapP", fields := [ {name := "_", ty := .tyCon "Point" []} ]} ]}
+#guard newtypeExports [wrapPNtDecl] == []
+-- The recursive newtype is skipped too — its needle is its own name.
+#guard newtypeExports [ntRDecl] == []
+-- CHAINS export once flattened to a mapped type, in either dump order, and a
+-- malformed newtype exports nothing (`newtypeDecls` never lists it).
+#guard newtypeExports [ntADecl, ntBDecl] == [("NA", "Int"), ("NB", "Int")]
+#guard newtypeExports [ntBDecl, ntADecl] == [("NB", "Int"), ("NA", "Int")]
+#guard newtypeExports [badNewtypeTwoCtors, badNewtypeTwoFields, badNewtypeNoFields] == []
+-- ZERO CHURN: a newtype-free module publishes nothing (the sidecar is written but
+-- empty, so `transpile.sh` appends nothing).
+#guard newtypeExports [pointDecl, rectDecl] == []
+
+-- MANIFEST FORMAT. Data lines are byte-identical to what they always were; the
+-- newtype channel is a third field behind the `newtype` tag.
+#guard newtypeManifestLine "Age" "Int" == "Age\tnewtype\tInt"
+#guard parseExtManifest "Point\tRecordOps\nRect\tRecordOps\n"
+       == {datas := [("Point", "RecordOps"), ("Rect", "RecordOps")]}
+#guard parseExtManifest "Age\tnewtype\tInt\n" == {newtypes := [("Age", "Int")]}
+-- Both channels in one file, in file order, kept DISJOINT — a newtype leaking into
+-- the data channel would emit the nonexistent `newtype.Age`. This is the exact
+-- content `transpile.sh` produced for `RecordClient`.
+#guard parseExtManifest "Rect\tRecordOps\nPoint\tRecordOps\nAge\tnewtype\tInt\n"
+       == {datas := [("Rect", "RecordOps"), ("Point", "RecordOps")],
+           newtypes := [("Age", "Int")]}
+-- An underlying type may contain SPACES but never a tab, so the 3-field split is
+-- unambiguous for compound types.
+#guard parseExtManifest "Ages\tnewtype\tList Int\n" == {newtypes := [("Ages", "List Int")]}
+#guard parseExtManifest "Pair\tnewtype\t(Int × Int)\n" == {newtypes := [("Pair", "(Int × Int)")]}
+-- MALFORMED lines are REJECTED (the caller warns) and dropped, never guessed at.
+-- Dropping is the safe failure: the un-erased needle is loud at `lake build`.
+#guard parseExtManifest "Age\n"                == {rejected := ["Age"]}
+#guard parseExtManifest "\tRecordOps\n"        == {rejected := ["\tRecordOps"]}
+#guard parseExtManifest "Point\t\n"            == {rejected := ["Point\t"]}
+#guard parseExtManifest "Age\tnewtype\t\n"     == {rejected := ["Age\tnewtype\t"]}
+#guard parseExtManifest "Age\tnewtype\tInt\tX\n" == {rejected := ["Age\tnewtype\tInt\tX"]}
+#guard parseExtManifest "Age\tdata\tInt\n"     == {rejected := ["Age\tdata\tInt"]}
+-- A TRUNCATED newtype line is rejected, NOT read as data — this is what makes
+-- "the channels cannot collide" true at the parser and not only at the writers
+-- (as data it would rewrite `Age` → `newtype.Age`).
+#guard parseExtManifest "Age\tnewtype\n"       == {rejected := ["Age\tnewtype"]}
+-- Empty lines (every file ends with one) are neither parsed nor reported, and a
+-- good line beside a bad one still lands.
+#guard parseExtManifest "" == {}
+#guard parseExtManifest "\n\n" == {}
+#guard parseExtManifest "Point\tRecordOps\nAge\n"
+       == {datas := [("Point", "RecordOps")], rejected := ["Age"]}
+
+-- SUBSTITUTION SLOT. Imported newtypes are erased at PASS 2, from `extNts`. This
+-- is the client's exact emitted signature shape: no local decls at all, the needle
+-- erased to `Int`, and no `tyConOpaque` left for pass 4 to turn into a
+-- `NewtypeBasic.Age` that does not exist.
+def clientBumpV : Var :=
+  {name := "bumpAge", unique := 4002,
+   ty := .tyFun (.tyCon "Age" []) (.tyCon "Age" []), role := .id}
+def clientA : Var := {name := "a", unique := 4002, ty := .tyCon "Age" [], role := .id}
+def clientProg : Program :=
+  { binds := [.nonRec clientBumpV (.lam clientA (.var clientA))],
+    typeDecls := [], instances := [] }
+#guard ((emitFullProgram [] clientProg [("Age", "Int")]).splitOn
+         "(a_4002 : Int) : Int").length == 2
+#guard ((emitFullProgram [] clientProg [("Age", "Int")]).splitOn "tyConOpaque").length == 1
+-- Without the channel the needle SURVIVES — the pre-Task-6 state, loud at `lake
+-- build` (`Unknown identifier GHCCore.tyConOpaque`), never silent.
+#guard ((emitFullProgram [] clientProg []).splitOn "tyConOpaque").length == 3
+-- Pass 4 must NOT see the needle: with a (hypothetical, python-suppressed) data
+-- entry for `Age` present as well, the newtype channel still wins because pass 2
+-- runs first. Both directions of the manifest hazard are now pinned.
+#guard ((emitFullProgram [("Age", "NewtypeBasic")] clientProg [("Age", "Int")]).splitOn
+         "NewtypeBasic.Age").length == 1
+-- LOCAL SHADOWING: a local newtype of the same bare name wins over the imported
+-- entry (local substitutions are prepended, and the first match consumes the
+-- needle). The manifest's keys are unqualified, so this rule has to be stated.
+#guard ((emitFullProgram [] {clientProg with typeDecls := [ageNewtypeDecl]}
+          [("Age", "Bool")]).splitOn "(a_4002 : Int) : Int").length == 2
+-- SPEC TEXT (pass site 3) takes the same channel, so a theorem about an imported
+-- newtype-typed function elaborates against the underlying type.
+#guard resolveSpecText [] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int" [("Age", "Int")]
+       == "(a : Int) → Int"
+-- ZERO CHURN for every existing call site: `extNts` defaults to `[]`, and with it
+-- empty both passes are exactly the pre-Task-6 identity.
+#guard emitFullProgram [] clientProg == emitFullProgram [] clientProg []
+#guard resolveSpecText [ageNewtypeDecl] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int"
+       == resolveSpecText [ageNewtypeDecl] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int" []
+
+-- THE SOUNDNESS COUPLING (why this task had to touch Task 5's guard). Erasing an
+-- imported newtype's needle makes an ORPHAN instance on it silent-wrong — exactly
+-- Task 5 failure mode (a), now reachable from a module whose `typeDecls` is empty.
+-- What the emitter WOULD produce, pinned so the coupling cannot be re-broken: a
+-- client-side `$c==` on the imported newtype plus the orphan instance, i.e. the
+-- shape `NtOrphanProbe.hs` dumps.
+def eqAgeMethodV : Var :=
+  {name := "$c==", unique := 3186,
+   ty := .tyFun (.tyCon "Age" []) (.tyFun (.tyCon "Age" []) (.tyCon "Bool" [])),
+   role := .id}
+def clientB : Var := {name := "b", unique := 4003, ty := .tyCon "Age" [], role := .id}
+def orphanEqProg : Program :=
+  { binds := [.nonRec eqAgeMethodV (.lam clientA (.lam clientB (.var clientB)))],
+    typeDecls := [], instances := [eqAgeInst] }
+#guard ((emitFullProgram [] orphanEqProg [("Age", "Int")]).splitOn "BEq Int").length == 2
+-- So the guard takes the IMPORTED names too, and reports the same violation it
+-- would for a local decl…
+#guard newtypeInstanceViolations [eqAgeInst] [] ["Age"] == [("Eq", "Age")]
+-- …with an honest underlying type in the message (the local `newtypeSubsts` lookup
+-- cannot find an imported newtype, so `extNts` is consulted as well — otherwise
+-- the message would claim the dump is malformed).
+#guard ((newtypeInstanceError [] ("Eq", "Age") [("Age", "Int")]).splitOn
+         "underlying type `Int`").length == 2
+#guard ((newtypeInstanceError [] ("Eq", "Age")).splitOn "malformed dump").length == 2
+-- INVARIANT (Emit's guard-section header): the guard's name set ⊇ the set pass 2
+-- erases. Cross-module both sides read the same channel, so for any manifest the
+-- one is the other's key list.
+#guard (newtypeExports [ageNewtypeDecl]).map (·.1) == ["Age"]
+-- NO OVER-FIRE from the new parameter: an instance on a local DATA type is still
+-- fine while imported newtype names are in scope.
+#guard newtypeInstanceViolations [eqPointInst] [pointDecl] ["Age"] == []
+-- …and an imported newtype the manifest did NOT carry (skip rule) is invisible to
+-- the guard, unchanged from Task 5 — and still loud downstream, since nothing
+-- erased its needle either. OBSERVED end-to-end (probe modules, not committed):
+--   `newtype WrapP = WrapP Point` (Point imported) → sidecar EMPTY, no manifest
+--   entry; the defining module still transpiles and builds (its own erasure goes
+--   `WrapP` → `RecordOps.Point` at pass 4), while a client using `WrapP` in a
+--   signature emits `(GHCCore.tyConOpaque "WrapP")` and fails:
+--     error: NtUserUnderClient.lean:13:23: Unknown identifier `GHCCore.tyConOpaque`
+def eqWrapPInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "WrapP" []],
+   dfunName := "$fEqWrapP", dfunUnique := 0}
+#guard newtypeInstanceViolations [eqWrapPInst] [] [] == []
+-- OBSERVED refusal for the carried case (probe `NtOrphanProbe.hs`, `instance Eq Age`
+-- in a module importing `NewtypeBasic (Age, …)`, not committed — Task 7's
+-- regression loop keeps exactly one expected-fail fixture):
+--   error: newtype instance not representable: `instance Eq Age`
+--     `Age` is a newtype (erased → `Int`). …
+--   transpile.sh exit 1, no `Generated/NtOrphanProbe.lean` written.
 
 end GhcCoreToLean.Tests
