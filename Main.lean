@@ -48,7 +48,8 @@ private def topBinderNames (prog : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc).reverse
 
-private def emitNamesCrib (extTypes : List (String × String)) (prog : Program) : String :=
+private def emitNamesCrib (extTypes : List (String × String))
+    (extNts : List (Name × String)) (prog : Program) : String :=
   -- `$f` dict-builders survive into emitFullProgram (for class reconstruction)
   -- but are suppressed from emission; keep them out of the crib too.
   let names := (topBinderNames prog.binds).filter (fun n => !n.startsWith "$f")
@@ -61,12 +62,14 @@ private def emitNamesCrib (extTypes : List (String × String)) (prog : Program) 
     -- (`sortDataDecls`) rather than the dump order. Newtypes appear here even
     -- though they emit no decl — the crib is the record of what the module
     -- declared, and the annotation is where a reader learns the type is gone.
-    -- The underlying string is run through pass 4 as well, because a newtype over
-    -- an IMPORTED type erases to `(GHCCore.tyConOpaque "Point")` at pass 2 and
-    -- only becomes `RecordOps.Point` there; without this the crib comment would be
-    -- the one place a raw needle still appears in generated output.
+    -- The underlying string is run through the same passes the emitted types are,
+    -- in pipeline order: an IMPORTED newtype in the underlying (`newtype W = W Age`)
+    -- erases at pass 2 from `extNts`, and an imported DATA type only becomes
+    -- `RecordOps.Point` at pass 4. `newtypeSubsts` has already chained the LOCAL
+    -- newtypes, so `extNts` is the only substitution missing. Without both, the crib
+    -- comment would be the one place a raw needle still appears in generated output.
     let nts := (Emit.newtypeSubsts prog.typeDecls).map fun (n, u) =>
-      (n, Emit.resolveExternalTypes extTypes u)
+      (n, Emit.resolveExternalTypes extTypes (Emit.resolveNewtypes extNts u))
     let typeLines := (Emit.sortDataDecls prog.typeDecls).map fun d =>
       match nts.find? (·.1 == d.name) with
       | some (_, u) => s!"--   newtype {d.name} (erased → {u})"
@@ -98,10 +101,11 @@ def loadExtManifest : IO Emit.ExtManifest := do
   for line in m.rejected do
     IO.eprintln s!"warning: EXT_TYPES_MANIFEST line matches no channel, skipped: {line}"
   for n in m.ambiguous do
-    IO.eprintln s!"warning: `{n}` is declared as a data type in one graph module and as \
-a newtype in another; both manifest entries are DROPPED (choosing either could erase \
-a reference to the data type, which would typecheck and be silently wrong). References \
-to `{n}` from this module will fail loud at `lake build`; rename one of the types."
+    IO.eprintln s!"warning: two graph modules declare a DIFFERENT type named `{n}` — \
+either a data type in one and a newtype in the other, or a newtype over two different \
+underlying types; ALL its manifest entries are DROPPED (choosing a winner would erase \
+`{n}` to the wrong type, which would typecheck and be silently wrong). References to \
+`{n}` from this module will fail loud at `lake build`; rename one of the types."
   pure m
 
 /-- Publish THIS module's erasable newtypes (`Emit.newtypeExports`) as manifest
@@ -183,7 +187,7 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let lowered   := Lower.lowerProgram userBinds
     let userProg  : Program := { prog with binds := lowered }
     let body      := Emit.emitFullProgram ext.datas userProg extNts
-    let crib      := emitNamesCrib ext.datas userProg
+    let crib      := emitNamesCrib ext.datas extNts userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that
     -- shadow Lean builtins (e.g. an Int-typed `min`/`max`) resolve to the
     -- local def rather than colliding with `Min.min`/`Max.max`. The matching

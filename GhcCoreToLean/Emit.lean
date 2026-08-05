@@ -1141,18 +1141,31 @@ two lists must also stay DISJOINT downstream — a newtype leaking into the data
 channel would emit `newtype.Age`.
 
 Keys are BARE type names, so two graph modules declaring the same type name are
-ambiguous. WITHIN the data channel that is a pre-existing property and first entry
+ambiguous. WITHIN the DATA channel that is a pre-existing property and first entry
 wins (dependency order); its consequence is a mis-qualified `WrongModule.Point`,
 which is loud almost always.
 
-ACROSS the channels the severity is NOT the same, which is why `parseExtManifest`
-refuses that case instead of picking a winner. Graph `{A: newtype Age = Age Int,
-B: data Age = …, C: imports B's Age}`: the manifest would carry both `Age⇥B` and
-`Age⇥newtype⇥Int`, and pass 2 runs first, so C's `f :: Age -> Int` over B's DATA
-type would emit `f : Int → Int` and a `@lean` theorem would verify a property
-about `Int` instead. That typechecks — silent-wrong. So a name appearing in both
-channels has BOTH entries dropped and is reported: the reference stays opaque and
-fails loud at `lake build`.
+The two ambiguity shapes that involve the NEWTYPE channel are NOT that benign, so
+`parseExtManifest` refuses both rather than picking a winner:
+
+  * ACROSS the channels. Graph `{A: newtype Age = Age Int, B: data Age = …,
+    C: imports B's Age}`: the manifest carries both `Age⇥B` and `Age⇥newtype⇥Int`,
+    and pass 2 runs first, so C's `f :: Age -> Int` over B's DATA type emits
+    `f : Int → Int` and a `@lean` theorem verifies a property about `Int` instead.
+    That typechecks — silent-wrong.
+
+  * WITHIN the newtype channel, with two DISTINCT underlyings. Graph
+    `{A: newtype Key = Key Int, B: newtype Key = Key [Int], C: imports B's Key}`:
+    the manifest carries `Key⇥newtype⇥Int` and `Key⇥newtype⇥List Int`,
+    `resolveNewtypes` folds left so the FIRST wins, and C's `idKey :: Key -> Key`
+    over B's `[Int]` emits `idKey : Int → Int` — with `∀ (k : Int), idKey k = k`
+    reported valid. Also silent-wrong, and with no wrong-module name anywhere in
+    the output to make it loud the way the data channel's clash is. The SAME
+    underlying published by several modules is NOT this case: those entries are
+    interchangeable, so they dedup to one.
+
+In both refused shapes ALL of the name's entries are dropped and the name is
+reported: the reference stays opaque and fails loud at `lake build`.
 -/
 
 /-- The `newtype` channel's discriminator field. Lowercase and a Haskell keyword,
@@ -1173,7 +1186,9 @@ structure ExtManifest where
   newtypes : List (Name × String)   := []
   /-- Lines that matched no channel; the caller warns and drops them. -/
   rejected : List String            := []
-  /-- Names found in BOTH channels: dropped from both, caller warns. -/
+  /-- Irreconcilably ambiguous names — found in BOTH channels, or in the newtype
+      channel with two DIFFERENT underlyings. ALL their entries are dropped in
+      either channel, and the caller warns. -/
   ambiguous : List Name             := []
   deriving BEq, Repr, Inhabited
 
@@ -1192,9 +1207,12 @@ structure ExtManifest where
     over a corrupt line the user never wrote. Empty lines (the trailing newline
     always yields one) are neither parsed nor reported.
 
-    A name appearing in BOTH channels is dropped from both and reported in
-    `ambiguous` — the one configuration where picking a winner would be
-    silent-wrong rather than loud (see the section header's `{A, B, C}` graph). -/
+    A newtype-channel name is dropped from BOTH channels and reported in
+    `ambiguous` when it also appears in the data channel, OR when it appears with
+    two DIFFERENT underlying types — the two configurations where picking a winner
+    would be silent-wrong rather than loud (see the section header's two graphs).
+    Repeats of the SAME underlying are interchangeable, so they dedup to one entry
+    and are not ambiguous. -/
 def parseExtManifest (s : String) : ExtManifest :=
   let raw : ExtManifest := (s.splitOn "\n").foldl (init := {}) fun m line =>
     let reject := { m with rejected := m.rejected ++ [line] }
@@ -1207,12 +1225,16 @@ def parseExtManifest (s : String) : ExtManifest :=
       if t.isEmpty || u.isEmpty || tag != newtypeChannelTag then reject
       else { m with newtypes := m.newtypes ++ [(t, u)] }
     | _ => reject
-  let clashing := (raw.newtypes.filterMap fun (n, _) =>
-    if raw.datas.any (·.1 == n) then some n else none).eraseDups
-  if clashing.isEmpty then raw else
+  -- Dedup FIRST: the same (name, underlying) pair from two modules says the same
+  -- thing, so it must not count as a conflict below.
+  let nts := raw.newtypes.eraseDups
+  let clashing := (nts.filterMap fun (n, u) =>
+    if raw.datas.any (·.1 == n) || nts.any (fun (n', u') => n' == n && u' != u)
+    then some n else none).eraseDups
+  if clashing.isEmpty then { raw with newtypes := nts } else
   { raw with
-    datas     := raw.datas.filter    fun (t, _) => !clashing.contains t
-    newtypes  := raw.newtypes.filter fun (t, _) => !clashing.contains t
+    datas     := raw.datas.filter fun (t, _) => !clashing.contains t
+    newtypes  := nts.filter       fun (t, _) => !clashing.contains t
     ambiguous := clashing }
 
 /-- Rewrite `(GHCCore.tyConOpaque "T")` → `M.T` for each external type `T`

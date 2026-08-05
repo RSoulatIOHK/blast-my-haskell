@@ -1795,6 +1795,14 @@ def eqPointInst : Instance :=
 --       bare-ctor-application limitation Task 7's README bullet already covers;
 --       imported selectors used in DEFS (`px` → `RecordOps.px`) are unaffected —
 --       those come from Core, where the name arrives qualified.
+--
+--   (d) PLAN CORRECTION. The plan's Step 1 expected the manifest to carry `Point`
+--       but NOT `Age` ("a newtype has no Lean name to qualify"). It now carries
+--       `Age⇥newtype⇥Int` as well: the plan predates the two-CHANNEL design, under
+--       which the newtype line publishes the UNDERLYING type rather than a module
+--       to qualify with. The plan's claim is still true of the DATA channel —
+--       `scripts/transpile_graph.py manifest` skips newtypes, and it is the
+--       defining module's own transpile that appends the newtype line.
 
 -- EXPORT SET. `newtypeExports` publishes a newtype iff its underlying string is
 -- built entirely from `typeConMap`-mapped tycons, which is exactly "contains no
@@ -1867,21 +1875,49 @@ def wrapPNtDecl : DataDecl :=
 #guard parseExtManifest "\n\n" == {}
 #guard parseExtManifest "Point\tRecordOps\nAge\n"
        == {datas := [("Point", "RecordOps")], rejected := ["Age"]}
--- CROSS-CHANNEL AMBIGUITY is the one manifest configuration that would be
--- SILENT-wrong rather than loud, so it is refused rather than resolved: with
--- `data Age` in module B and `newtype Age = Age Int` in module A, a client using
--- B's Age would have it ERASED to `Int` by pass 2 (which runs before pass 4), and
--- a theorem over `Int` typechecks. Both entries are dropped — the reference stays
--- opaque and fails loud — and the name is reported for the caller to warn about.
--- (Within the data channel, ambiguity mis-qualifies to `WrongModule.Point`, which
--- is loud; that asymmetry is why only this case is refused.)
+-- AMBIGUITY. Two manifest configurations would be SILENT-wrong rather than loud,
+-- so both are refused rather than resolved. Both drop ALL of the name's entries —
+-- the reference stays opaque and fails loud — and report the name for the caller
+-- to warn about.
+--
+-- (1) CROSS-CHANNEL: with `data Age` in module B and `newtype Age = Age Int` in
+-- module A, a client using B's Age would have it ERASED to `Int` by pass 2 (which
+-- runs before pass 4), and a theorem over `Int` typechecks.
 #guard parseExtManifest "Age\tB\nAge\tnewtype\tInt\n" == {ambiguous := ["Age"]}
 #guard parseExtManifest "Age\tnewtype\tInt\nAge\tB\n" == {ambiguous := ["Age"]}
 -- Unrelated entries in the same file are unaffected, and the report is deduped.
 #guard parseExtManifest "Point\tRecordOps\nAge\tB\nAge\tnewtype\tInt\nAge\tnewtype\tBool\n"
        == {datas := [("Point", "RecordOps")], ambiguous := ["Age"]}
--- The SAME name twice in the SAME channel is NOT this case (first entry wins, as
--- it always has): only a cross-channel clash can silently erase a data type.
+-- (2) WITHIN THE NEWTYPE CHANNEL with DIFFERENT underlyings — verified silent-wrong
+-- on a live 3-module probe before this check existed: `A: newtype Key = Key Int`,
+-- `B: newtype Key = Key [Int]`, client importing B's `Key`. `resolveNewtypes` folds
+-- left, so the client emitted `idKey : Int → Int` for a `[Int] -> [Int]` function
+-- and `∀ (k : Int), idKey k = k` reported `✅ Valid`, with zero diagnostics. Refused
+-- in EITHER dump order (which one comes first is dependency order, not a property
+-- of the clash).
+#guard parseExtManifest "Key\tnewtype\tInt\nKey\tnewtype\tList Int\n"
+       == {ambiguous := ["Key"]}
+#guard parseExtManifest "Key\tnewtype\tList Int\nKey\tnewtype\tInt\n"
+       == {ambiguous := ["Key"]}
+-- All THREE entries go, not just the two that disagree, and neighbours survive.
+#guard parseExtManifest "Point\tRecordOps\nKey\tnewtype\tInt\nAge\tnewtype\tInt\nKey\tnewtype\tBool\n"
+       == {datas := [("Point", "RecordOps")], newtypes := [("Age", "Int")],
+           ambiguous := ["Key"]}
+-- The SAME underlying published by two modules is NOT a clash: the entries say the
+-- same thing, so they DEDUP to one and nothing is refused. (This is the reachable
+-- benign case — re-exported/duplicated newtype definitions across a graph.)
+#guard parseExtManifest "Key\tnewtype\tInt\nKey\tnewtype\tInt\n"
+       == {newtypes := [("Key", "Int")]}
+#guard parseExtManifest "Key\tnewtype\tInt\nAge\tnewtype\tBool\nKey\tnewtype\tInt\n"
+       == {newtypes := [("Key", "Int"), ("Age", "Bool")]}
+-- MIXED: a cross-channel clash on one name and a distinct-underlying clash on
+-- another, in one file — both names are reported, in file order.
+#guard parseExtManifest "Age\tB\nAge\tnewtype\tInt\nKey\tnewtype\tInt\nKey\tnewtype\tBool\n"
+       == {ambiguous := ["Age", "Key"]}
+-- The SAME name twice in the DATA channel is NOT refused (first entry wins, as it
+-- always has): there the consequence is a mis-qualified `WrongModule.Point`, which
+-- is loud, so no silent-wrong path needs closing. That asymmetry is the whole
+-- reason the newtype channel is treated more strictly than the data one.
 #guard parseExtManifest "Point\tA\nPoint\tB\n" == {datas := [("Point", "A"), ("Point", "B")]}
 #guard resolveExternalTypes [("Point", "A"), ("Point", "B")] "(GHCCore.tyConOpaque \"Point\")"
        == "A.Point"

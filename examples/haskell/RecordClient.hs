@@ -19,6 +19,11 @@ bumpAge a = mkAge (getAge a + 1)
 theorem clientAge_id : ∀ (n : Int), clientAge n = n := by blaster
 -}
 
+-- `RecordOps.mkPoint` must be written QUALIFIED here: imported VALUE names in
+-- `@lean` spec text are NOT auto-qualified (only type needles are, at pass 4), so
+-- a bare `mkPoint` fails loud at `lake build`. Known limitation; the user-facing
+-- statement is README's spec-notation bullet, "for imported symbols, qualify with
+-- the module". See the M2 Task 6 note (c) in `GhcCoreToLean/Tests/Unit.lean`.
 {- @lean
 theorem originDist_mk : ∀ (x y : Int), originDist (RecordOps.mkPoint x y) = x := by blaster
 -}
