@@ -50,15 +50,19 @@ emit cborPath mDeclsPath = do
   let merged = mergeDecls coreVal decls
   BSLC.putStrLn (AP.encodePretty merged)
 
--- | Splice `typeDecls` and `instances` from the decl-plugin's JSON into the
--- core-side JSON. If decls is Null (no plugin output), pass core through.
+-- | Splice `typeDecls`, `instances` and `classDecls` from the decl-plugin's JSON
+-- into the core-side JSON. If decls is Null (no plugin output), pass core
+-- through. A key the plugin did not write becomes `A.Null`, which the Lean
+-- parser reads as the empty list — so an OLD decls.json (pre-`classDecls`
+-- plugin) still parses.
 mergeDecls :: A.Value -> A.Value -> A.Value
 mergeDecls core decls =
   case (core, decls) of
     (A.Object cobj, A.Object dobj) ->
       let pick k = maybe A.Null id (AKM.lookup k dobj)
-          coreWith = AKM.insert "typeDecls" (pick "typeDecls")
-                   $ AKM.insert "instances" (pick "instances")
+          coreWith = AKM.insert "typeDecls"  (pick "typeDecls")
+                   $ AKM.insert "instances"  (pick "instances")
+                   $ AKM.insert "classDecls" (pick "classDecls")
                    $ cobj
       in A.Object coreWith
     _ -> core

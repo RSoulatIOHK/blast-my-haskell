@@ -209,10 +209,14 @@ def coinDecl : DataDecl :=
 #guard (emitInstance [] [] eqInstProgram eqInst).isSome
 
 -- Dict Task 1: ClassDecl / ClassMethod AST types exist and hold the shape.
+-- (Widened to `ClassDecl` v2 by M3 Task 1: `tyVar` → `tyVars`, plus `supers`.
+-- `hasDefault` is defaulted, so this single-param no-superclass shape — the only
+-- one supported end-to-end — reads exactly as it did in v1.)
 def sizedClass : ClassDecl :=
-  { name := "Sized", tyVar := "a",
+  { name := "Sized", tyVars := ["a"], supers := [],
     methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
 #guard sizedClass.name == "Sized"
+#guard sizedClass.methods.head!.hasDefault == false
 #guard sizedClass.methods.length == 1
 #guard (sizedClass.methods.head!).name == "size"
 
@@ -2125,5 +2129,404 @@ def tagLocalDataDecl : DataDecl :=
 --   `Generated/NtSD.lean` written — while `RecordOps` itself still transpiles
 --   with `Point⇥RecordOps` and `Rect⇥RecordOps` in its own manifest, which is
 --   what the call site's defining-module filter buys.
+
+/-! ## M3 Task 1 — decl-plugin class-shape dump (`classDecls`)
+
+    Class SHAPES previously never reached the transpiler: the decl-plugin's
+    `isUserDataTyCon` filters class TyCons out (`not (isClassTyCon tc)`), and
+    class-op Ids and `$p` superclass selectors are not top-level binds, so
+    `reconstructClasses` could only ever infer a single-parameter, superclass-free,
+    default-free class from its instances. This task adds the `classDecls` channel.
+    Emission is UNCHANGED — the observations below are the deliverable, and the
+    gate is a byte-identical `Generated/UserClass.lean`.
+
+### The GHC 9.2.7 API actually used
+
+    Verified with `ghci-9.2.7 -package-env=- -package ghc` (NOT from memory —
+    `-package-env=-` is needed or the user's global package env fails to resolve).
+    The `:i` / `:t` replies, verbatim:
+
+        type ClassOpItem :: *
+        type ClassOpItem = (GHC.Types.Var.Id, DefMethInfo)
+          	-- Defined in ‘GHC.Core.Class’
+        type DefMethInfo :: *
+        type DefMethInfo =
+          GHC.Maybe.Maybe
+            (GHC.Types.Name.Name, DefMethSpec GHC.Core.TyCo.Rep.Type)
+          	-- Defined in ‘GHC.Core.Class’
+        type DefMethSpec :: * -> *
+        data DefMethSpec ty = VanillaDM | GenericDM ty
+          	-- Defined in ‘GHC.Types.Basic’
+        classOpItems :: Class -> [ClassOpItem]
+        classSCTheta :: Class -> [GHC.Core.TyCo.Rep.PredType]
+        classTyVars :: Class -> [GHC.Types.Var.TyVar]
+        className :: Class -> GHC.Types.Name.Name
+        tyConClass_maybe :: TyCon -> GHC.Maybe.Maybe Class
+        getClassPredTys_maybe
+          :: GHC.Core.TyCo.Rep.PredType
+             -> GHC.Maybe.Maybe (Class, [GHC.Core.TyCo.Rep.Type])
+        dropForAlls :: Type -> Type
+        getTyVar_maybe :: Type -> GHC.Maybe.Maybe TyVar
+        splitFunTy_maybe :: Type -> GHC.Maybe.Maybe (Mult, Type, Type)
+        isPredTy :: Type -> GHC.Types.Bool
+
+    Two CORRECTIONS to the plan's assumed API:
+    * `ClassOpItem`'s second component is NOT `Maybe (Id, DefMethSpec)`. The
+      `Maybe` is the whole second component (`DefMethInfo`), and it carries the
+      default method's `Name` (`$dm<method>`) plus a `DefMethSpec Type`, not an
+      `Id`. `isJust` on it is the `hasDefault` discriminator. M3 Task 4 wants the
+      `Name` inside — `fst <$> dmInfo` in `ppClassOp` is the one-line addition.
+    * `DefMethSpec`'s constructors are `VanillaDM | GenericDM ty`
+      (`GenericDM` = a `DefaultSignatures` generic default). Not used yet.
+
+    A THIRD API fact forced a design choice: `splitTyConApp_maybe` SUCCEEDS on a
+    `FunTy` in 9.2 (linear types make it the 5-argument `FUN` application:
+    multiplicity, two RuntimeReps, arg, res). The existing `ppType` tries
+    `splitTyConApp_maybe` FIRST and has no type-variable case at all, so a method
+    type `a -> Int` would render as a `FUN`-headed TyCon with `_Unknown` leaves.
+    Hence a SEPARATE `ppMethodTy` (tyvar → arrow → tycon → `_Unknown`), which also
+    keeps `typeDecls`/`instances` byte-identical by construction: the task adds a
+    channel, it does not re-render the old ones.
+
+### Observation 1 — `UserClass.hs`, the byte-identity fixture
+
+    `.transpile-sandbox/.decls/UserClass.decls.json`, `classDecls` verbatim
+    (aeson orders keys alphabetically):
+
+        "classDecls":[{"methods":[{"hasDefault":false,"name":"size","type":
+        {"arg":{"name":"a","tag":"TyVar"},"res":{"args":[],"name":"Int",
+        "tag":"TyCon"},"tag":"TyFun"}}],"name":"Sized","supers":[],
+        "tyVars":["a"]}]
+
+    The method type came out as a real `TyFun (TyVar "a") (TyCon "Int" [])` — i.e.
+    the plugin's shape and `reconstructClasses`' head-abstracted guess AGREE
+    exactly here, which is why full (whole-record) precedence keeps
+    `UserClass.lean` byte-identical rather than merely leaving the channel unused.
+    Pinned below, since "identical because the new channel is ignored" and
+    "identical because the two sources agree" are indistinguishable from the diff. -/
+
+/-- The `classDecls` entry above, verbatim from the plugin's output file. -/
+def m3SizedJson : String :=
+  "{\"methods\":[{\"hasDefault\":false,\"name\":\"size\",\"type\":{\"arg\":" ++
+  "{\"name\":\"a\",\"tag\":\"TyVar\"},\"res\":{\"args\":[],\"name\":\"Int\"," ++
+  "\"tag\":\"TyCon\"},\"tag\":\"TyFun\"}}],\"name\":\"Sized\",\"supers\":[]," ++
+  "\"tyVars\":[\"a\"]}"
+
+def m3parseClass (s : String) : Except String ClassDecl := do
+  parseClassDecl (← Lean.Json.parse s)
+
+#guard ((m3parseClass m3SizedJson).toOption.map (·.name)) == some "Sized"
+#guard ((m3parseClass m3SizedJson).toOption.map (·.tyVars)) == some ["a"]
+#guard ((m3parseClass m3SizedJson).toOption.map (·.supers)) == some ([] : List Name)
+#guard ((m3parseClass m3SizedJson).toOption.map (·.methods.map (·.name))) == some ["size"]
+#guard ((m3parseClass m3SizedJson).toOption.map (·.methods.map (·.hasDefault))) == some [false]
+-- THE GATE, in one line: the plugin's own JSON re-emits the class block that
+-- `Generated/UserClass.lean` has today, character for character.
+#guard ((m3parseClass m3SizedJson).toOption.map emitClassDecl)
+         == some "class Sized (a : Type) where\n  size : (a → Int)"
+
+/-! ### Observation 2 — `SuperClass.hs` (new fixture; observation only)
+
+    `class Sized a where size :: a -> Int` / `class Sized a => Container a where
+    empty :: a; insert :: Int -> a -> a` / `data Bag = Bag Int` / both instances /
+    `sizeViaContainer :: Container a => a -> Int; sizeViaContainer x = size x`.
+
+    `classDecls` (pretty-printed; note `tcg_tcs` order is Container-then-Sized,
+    the REVERSE of declaration order — see the ordering note in `mergeClassDecls`):
+
+        [ { "name": "Container", "tyVars": ["a"], "supers": ["Sized"],
+            "methods": [ {"name": "empty",  "hasDefault": false,
+                          "type": {"tag":"TyVar","name":"a"}},
+                         {"name": "insert", "hasDefault": false,
+                          "type": {"tag":"TyFun","arg":{"tag":"TyCon","name":"Int","args":[]},
+                                   "res":{"tag":"TyFun","arg":{"tag":"TyVar","name":"a"},
+                                          "res":{"tag":"TyVar","name":"a"}}}} ] }
+        , { "name": "Sized", "tyVars": ["a"], "supers": [],
+            "methods": [ {"name": "size", "hasDefault": false,
+                          "type": {"tag":"TyFun","arg":{"tag":"TyVar","name":"a"},
+                                   "res":{"tag":"TyCon","name":"Int","args":[]}}} ] } ]
+
+    So `supers: ["Sized"]` — the superclass reaches the transpiler for the first
+    time. `empty : a` also shows a method whose type is a BARE type variable
+    (no arrow), which matters for observation 4.
+
+### Observation 3 — the Core spines (`/tmp/transpile-SuperClass.json`)
+
+    Every `$`-name in the whole dump, with counts:
+
+        39 "$krep"   7 "$trModule"   4 "$fContainerBag"   3 "$fSizedBag"
+         2 "$tcSized"  2 "$tcContainer"  2 "$tcBag"
+         2 "$dSized"   2 "$dContainer"
+         2 "$csize"    2 "$cinsert"     2 "$cempty"
+         1 "$p1Container"
+
+    (a) The Container INSTANCE's dfun stores the superclass DICT positionally as
+    the dictionary constructor's first field. There is NO selector here, and no
+    `$cp1Container`-style bind anywhere in the dump — that spelling does not
+    occur at pass-0000:
+
+        ### $fContainerBag#9147 [role=dict]   type: (Container Bag)
+          App
+            App
+              App
+                App
+                  Var C:Container#9120 [role=id] : _Unknown
+                  Type Bag
+                Var $fSizedBag#9151 [role=dict] : _Unknown
+              Var $cempty#9207 [role=id] : Bag
+            Var $cinsert#9212 [role=id] : (Int -> (Bag -> Bag))
+
+    (b) `$p1Container` occurs EXACTLY ONCE, and only because the fixture has a
+    superclass USE site (a `Container a`-constrained function calling a `Sized`
+    method). Without `sizeViaContainer` the selector appears nowhere and the
+    observation would have been a false negative:
+
+        ### sizeViaContainer#8931 [role=id]
+        ###   type: (forall a. ((Container _v9077) -> (_v9077 -> Int)))
+          Lam (a#9192 [role=tyVar] : Type)
+            Lam ($dContainer#9193 [role=dict] : (Container _v9192))
+              Let
+                $dSized#9195 [role=dict] : (Sized _v9192) =
+                  App
+                    App
+                      Var $p1Container#9117 [role=id] : _Unknown
+                      Type _v9192
+                    Var $dContainer#9193 [role=dict] : (Container _v9192)
+              in
+                Lam (x#9078 [role=id] : _v9192)
+                  App
+                    App
+                      App
+                        Var size#8930 [role=id] : _Unknown
+                        Type _v9192
+                      Var $dSized#9195 [role=dict] : (Sized _v9192)
+                    Var x#9078 [role=id] : _v9192
+
+    ITS ROLE, precisely: `$p1Container` is a class-op selector Id, so the shim's
+    `binderRole` heuristic (`$d`/`$f` prefix ⇒ `dict`) gives it role `id`, NOT
+    `dict`. It is nonetheless ERASED before Emit — but by the LET, not by itself:
+    the let-BINDER `$dSized` starts with `$d` ⇒ role `dict`, and
+    `Lower.lowerExpr`'s `.let_` arm drops a dict-bound `let` whole, RHS included.
+    The following `size @a $dSized x` then loses its dict argument the ordinary
+    way, and `methodMap` rewrites the bare `size` to `Sized.size`. Net: superclass
+    dictionary EXTRACTION already works, for free, today.
+
+    HANDOFF / hedge for Task 5: that erasure is contingent on GHC floating the
+    projection to a `$d`-named `let`. If a later pass inlined it into argument
+    position (`size @a ($p1Container @a $dContainer) x`), the argument would be an
+    `.app`, not a `.var` with role `dict`, so `Lower.isTypeOrDictArg` would return
+    false and the selector would survive into Emit. PREDICTED (not observed) as an
+    unbound identifier ⇒ loud, not silent-wrong. Re-check if Task 5 changes passes.
+
+    (c) `$dm` — ZERO occurrences. This is a true negative with a known cause:
+    `SuperClass.hs` declares no default methods. It is NOT evidence about how GHC
+    emits defaults; that observation belongs to Task 4's `DefaultMethods.hs`, and
+    deliberately no default was added here to keep the two apart.
+
+### Observation 5 — `hasDefault` is empirically the right discriminator
+
+    Every other dumped field is visible in a committed fixture's output;
+    `hasDefault` is not, because no fixture declares a default (deliberately — see
+    (c)). So `isJust dmInfo` was verified by throwaway probe `DefProbe.hs`
+    (`class Greet a where name :: a -> Int; greet :: a -> Int; greet x = name x + 1`
+    + `data G = G Int` + an instance defining only `name`; run, read, deleted — the
+    M2 `NtSA.hs`/`NtSC.hs` pattern). The DISCRIMINATING result, within the one
+    class:
+
+        class Greet -> [('name', False), ('greet', True)]
+
+    Both-false would have meant `isJust dmInfo` is not the discriminator at
+    `typeCheckResultAction` time and the field was a constant-`false`
+    silent-wrong; both-true would have meant it keys on something else. Neither
+    happened: it separates the defaulted method from the plain one.
+
+### Observation 6 — Task 4 handoffs the probe turned up for free
+
+    From the same throwaway probe. Recorded because they CORRECT the plan's
+    fact 5, which assumed an instance relying on a default is dropped whole:
+
+    * `$dmgreet` IS a top-level bind, and its role is `dict` — not because it is
+      one, but because the shim's `binderRole` classifies any `$d`-prefixed name
+      as a dict. A default-method BODY mislabelled as a dictionary is a trap for
+      Task 4's dict-erasure reasoning.
+    * GHC ALSO emits a `$cgreet` wrapper for the defaulted method, so
+      `emitInstanceUser` does NOT drop the instance — it emitted a complete
+      `instance : Greet G where name := … ; greet := _dollar_cgreet_2388`.
+    * But `$cgreet` is not top-level-NonRec: it shares a Rec group with the dfun,
+      `Rec group: ['$fGreetG', '$cgreet']`. `emitFullProgram`'s `bindHeadName`
+      reads only the group's FIRST binder, so the group classifies as `$f…` ⇒
+      `isJunkName` ⇒ dropped from BOTH `methodDefs` and `userBinds`. The instance
+      then references a def that was never emitted:
+
+        error: …/DefProbe.lean:28:11: Unknown identifier `_dollar_cgreet_2388`
+
+      Loud, but the cause is head-only Rec-group classification, NOT the
+      default-method gap — so Task 4 has a second, independent defect to fix, and
+      a `$dm`-relying instance is not silently dropped as fact 5 predicted.
+
+### Observation 4 — the expected (loud) degradation, verbatim
+
+    `./transpile.sh examples/haskell/SuperClass.hs` exits 0 with EMPTY stderr and
+    emits `class Container (a : Type) where` — no `Sized` parent — and no
+    `instance : Container Bag` at all. `lake build GhcCoreToLean.Generated.
+    SuperClass` then fails:
+
+        error: …/SuperClass.lean:43:3: failed to synthesize
+          Sized t_v9077
+        error: …/SuperClass.lean:46:2: failed to synthesize
+          Container Bag
+        error: …/SuperClass.lean:49:2: failed to synthesize
+          Container Bag
+        error: …/SuperClass.lean:52:51: translateType: unexpected sort type
+          Lean.Expr.sort (Lean.Level.succ (Lean.Level.zero))
+
+    Two independent causes, both loud, both Task 5/Task 4 work:
+    * `Sized t_v9077` unsynthesized — `supers` is parsed but not emitted, so
+      `sizeViaContainer`'s body calls `Sized.size` with only `[Container t]` in
+      scope. This is the superclass gap itself (Task 5).
+    * `Container Bag` unsynthesized — `emitInstanceUser` DROPPED the Container
+      instance whole. Cause: `empty :: a` has no value argument, so
+      `firstValArgTy` is `none` for `$cempty : Bag` and `findClassMethod
+      "$cempty" "Bag"` cannot match; the all-methods-or-nothing test then fails.
+      Task 4 owns replacing that silent whole-instance skip with a per-method
+      decision + eprintln, and this is a second, default-independent reason to.
+    * the `translateType` error is blaster's, downstream of the two above.
+
+    NOTE the honest limit of "loud" here: the transpiler itself is SILENT (exit 0,
+    empty stderr) and the loudness is entirely Lean's. That is the same posture as
+    today's other unsupported-class paths, not a new guarantee. -/
+
+-- Parser guards. `hasDefault` is tolerated as ABSENT (⇒ false) so a decls.json
+-- from a pre-M3 plugin still parses…
+#guard ((m3parseClass
+  "{\"name\":\"C\",\"tyVars\":[\"a\"],\"supers\":[],\"methods\":[{\"name\":\"m\",\"type\":{\"tag\":\"TyVar\",\"name\":\"a\"}}]}").toOption.map
+    (·.methods.map (·.hasDefault))) == some [false]
+-- …but present-and-not-a-boolean is an ERROR, never a silent `false`.
+#guard (m3parseClass
+  "{\"name\":\"C\",\"tyVars\":[\"a\"],\"supers\":[],\"methods\":[{\"name\":\"m\",\"hasDefault\":\"yes\",\"type\":{\"tag\":\"TyVar\",\"name\":\"a\"}}]}").toOption.isNone
+-- The four class-level keys are REQUIRED: a missing one means plugin/transpiler
+-- skew, and defaulting it would silently claim "no type parameters" / "no
+-- superclasses" — exactly the silent-wrong this channel exists to remove.
+#guard (m3parseClass "{\"name\":\"C\",\"tyVars\":[\"a\"],\"methods\":[]}").toOption.isNone
+#guard (m3parseClass "{\"name\":\"C\",\"supers\":[],\"methods\":[]}").toOption.isNone
+#guard (m3parseClass "{\"tyVars\":[\"a\"],\"supers\":[],\"methods\":[]}").toOption.isNone
+#guard (m3parseClass "{\"name\":\"C\",\"tyVars\":[\"a\"],\"supers\":[]}").toOption.isNone
+-- `hasDefault` round-trips true when the plugin says so (no fixture produces one
+-- yet — Task 4 — so this is the only place the `true` arm is exercised).
+#guard ((m3parseClass
+  "{\"name\":\"C\",\"tyVars\":[\"a\"],\"supers\":[\"P\"],\"methods\":[{\"name\":\"m\",\"hasDefault\":true,\"type\":{\"tag\":\"TyVar\",\"name\":\"a\"}}]}").toOption.map
+    (fun c => (c.supers, c.methods.map (·.hasDefault)))) == some (["P"], [true])
+
+-- `Program.classDecls` is optional in BOTH the ways it can be absent: key
+-- missing (legacy JSON, or `ghc-core-shim` run without `--decls`) and key
+-- present as `null` (what the shim's `mergeDecls` writes when the plugin
+-- produced no such key). Both ⇒ `[]` ⇒ Core reconstruction is the only source.
+#guard ((parseProgramFromString "{\"binds\":[]}").toOption.map (·.classDecls.length)) == some 0
+#guard ((parseProgramFromString "{\"binds\":[],\"classDecls\":null}").toOption.map
+          (·.classDecls.length)) == some 0
+#guard ((parseProgramFromString
+  ("{\"binds\":[],\"classDecls\":[" ++ m3SizedJson ++ "]}")).toOption.map
+    (·.classDecls.map (·.name))) == some ["Sized"]
+
+-- PRECEDENCE. Plugin shapes win whole-record over the reconstruction. Proven
+-- e2e too, by feeding the transpiler a hand-perturbed copy of the real
+-- `/tmp/transpile-UserClass.json` whose `classDecls` said `tyVars: ["zz"]`: the
+-- emitted block became `class Sized (zz : Type) where / size : (zz → Int)`,
+-- so the identical-output gate above means the two sources AGREE, not that the
+-- new channel is inert.
+def m3PluginSized : ClassDecl :=
+  { name := "Sized", tyVars := ["zz"], supers := ["P"],
+    methods := [ { name := "size", ty := .tyFun (.tyVar "zz") (.tyCon "Int" []), hasDefault := true } ] }
+def m3CoreSized : ClassDecl :=
+  { name := "Sized", tyVars := ["a"], supers := [],
+    methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+def m3CoreOther : ClassDecl :=
+  { name := "Other", tyVars := ["a"], supers := [], methods := [] }
+def m3PluginOnly : ClassDecl :=
+  { name := "NoInstance", tyVars := ["a"], supers := [], methods := [] }
+
+#guard (mergeClassDecls [m3PluginSized] [m3CoreSized]).map (·.tyVars) == [["zz"]]
+#guard (mergeClassDecls [m3PluginSized] [m3CoreSized]).map (·.supers) == [["P"]]
+#guard (mergeClassDecls [m3PluginSized] [m3CoreSized]).map (·.methods.map (·.hasDefault))
+         == [[true]]
+-- Empty plugin channel is the IDENTITY on the reconstruction — the no-sidecar
+-- path and every module that declares no class at all.
+#guard (mergeClassDecls [] [m3CoreSized, m3CoreOther]).map (·.name) == ["Sized", "Other"]
+#guard (mergeClassDecls [] []).length == 0
+-- ORDER comes from the reconstruction; a plugin-only class (no local instance, so
+-- the reconstruction never saw it) is APPENDED, never interleaved. Deliberate:
+-- class decls are emitted unsorted and Lean has no forward references, so
+-- reordering before `extends` exists (Task 5) would only churn output.
+#guard (mergeClassDecls [m3PluginOnly, m3PluginSized] [m3CoreOther, m3CoreSized]).map (·.name)
+         == ["Other", "Sized", "NoInstance"]
+-- Builtin class names are filtered out of the PLUGIN channel too. The plugin dumps
+-- only the module's own class TyCons so `Eq` cannot normally arrive, but a user
+-- class literally named `Eq` has no user-class Lean image (the name is routed to
+-- `BEq`/`deriving`) and must not be emitted as one.
+#guard (mergeClassDecls [{ name := "Eq", tyVars := ["a"], supers := [], methods := [] }] []).length == 0
+#guard (mergeClassDecls [{ name := "Ord", tyVars := ["a"], supers := [], methods := [] }]
+          [m3CoreSized]).map (·.name) == ["Sized"]
+
+-- EMISSION is unchanged for the only shape supported end-to-end (single
+-- parameter, no superclass) — pinned character-exact at "Dict Task 3" above.
+-- `supers` is dropped, silently in the emitter (loudly at the Lean use site):
+#guard emitClassDecl
+  { name := "Container", tyVars := ["a"], supers := ["Sized"],
+    methods := [ { name := "empty", ty := .tyVar "a" } ] }
+    == "class Container (a : Type) where\n  empty : a"
+-- A MULTI-parameter class now emits one binder per parameter rather than
+-- truncating to the reconstruction's invented single `a`. Pinned as today's
+-- behavior, NOT as support: `stripClassConstraints` and `findClassMethod` are
+-- still single-head (Task 7), so instances of such a class are still dropped and
+-- call sites still fail to synthesize. This is loud either way; the point of
+-- pinning it is that Task 7 must change this string deliberately, not by
+-- accident.
+#guard emitClassDecl
+  { name := "Convert", tyVars := ["a", "b"], supers := [],
+    methods := [ { name := "conv", ty := .tyFun (.tyVar "a") (.tyVar "b") } ] }
+    == "class Convert (a : Type) (b : Type) where\n  conv : (a → b)"
+
+/-! ### Plugin staleness — how the sandbox actually re-stages (the false-green trap)
+
+    Measured, not assumed. `shim/cabal.project` is `packages: .` ONLY, so
+    `cd shim && cabal build` rebuilds the `ghc-core-shim` BINARY and NOT the
+    decl-plugin. The plugin is built by the SANDBOX's own generated
+    `cabal.project`, which lists `${REPO}/shim/decl-plugin` as a local package, so
+    cabal's change detection rebuilds it on the next `./transpile.sh`:
+    `.transpile-sandbox/dist-newstyle/.../decl-plugin-0.1.0.0/build/GhcDeclDump.o`
+    went from `56688 bytes, Jun 9 08:11` to `95728 bytes, Aug 6 12:52` with no
+    manual clean. No force-clean of `decl-plugin-*` was needed or performed.
+    (transpile.sh's existing `rm -rf …/transpile-sandbox-*/` is a different
+    concern: forcing GHC to RE-RUN the plugins over unchanged staged sources.)
+
+    BOTH layers must be checked separately, because a fresh plugin with a stale
+    shim looks exactly like a stale plugin — correct `.decls.json`, no
+    `classDecls` in the transpiler's input. Verified at first observation:
+    `classDecls` present in `.transpile-sandbox/.decls/UserClass.decls.json` AND
+    in `/tmp/transpile-UserClass.json`.
+
+### Regression evidence (post-change)
+
+    * `Generated/UserClass.lean` BYTE-IDENTICAL to the pre-change baseline, in two
+      stages: (A) plugin+shim only, nothing consuming the channel; (B) after
+      Parse/AST/precedence, with the plugin shape provably driving emission.
+      `UserClass.decls.json`'s `module`/`typeDecls`/`instances` also identical.
+    * Two identical back-to-back runs produce identical `UserClass.lean`, so the
+      byte-identity gate is meaningful (uniques do not drift per run).
+    * `NewtypeBasic.lean`, `RecordOps.lean` byte-identical; `NewtypeInstances`
+      still REFUSED with a byte-identical error message.
+    * Whole top-level corpus (23 fixtures) transpiles `rc=0` except
+      `NewtypeInstances` (`rc=1`, by design). SCOPE OF THAT CLAIM: pre-change
+      baselines were captured for the four gate fixtures only, so "unchanged" is
+      byte-verified for those and argued by construction for the other nineteen —
+      `mergeClassDecls [] xs` reduces to `xs` (the `find?` over `[]` returns each
+      `cd` unchanged; `xs ++ []`), so a module declaring no class cannot be
+      affected, and `UserClass` is the only corpus module that declares one.
+    * `lake build GhcCoreToLean.Generated.<M>` green for NewtypeBasic, RecordOps,
+      RecordClient, Ratio, Arithmetic, OrdInstance, TupleBasics, ListLibrary.
+    * Known red, both PRE-EXISTING or expected: `UserClass` — the fixture's own
+      theorem `boxTotal boxes = total boxes + 1` is FALSE and blaster falsifies it
+      (it did so in the pre-change baseline run too; the emitted file is
+      byte-identical, so nothing about it changed); `SuperClass` — observation 4. -/
 
 end GhcCoreToLean.Tests

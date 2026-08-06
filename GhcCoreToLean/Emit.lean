@@ -485,11 +485,22 @@ def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
     else ""
   s!"inductive {leanName} where\n{body}\nderiving {derivs}{ordInsts}"
 
-/-- Emit a single-parameter user class as a Lean `class`. -/
+/-- Emit a user class as a Lean `class`, one `(v : Type)` binder per type
+    parameter. Single-parameter classes — the only ones supported end-to-end —
+    are unchanged from v1 (`class Sized (a : Type) where …`).
+
+    `c.supers` is deliberately NOT emitted yet: superclass emission (`extends`
+    for a user parent, an instance-implicit field for a builtin one) is M3
+    Task 5. Dropping it here is loud, not silent: the parent class's methods are
+    still rewritten to `Parent.method` at their call sites, so a function with
+    only the child constraint in scope fails to synthesize the parent instance.
+    Observed on `SuperClass.hs` — see the `M3 Task 1` block in
+    `GhcCoreToLean/Tests/Unit.lean`. -/
 def emitClassDecl (c : ClassDecl) : String :=
   let methodLines := c.methods.map fun m =>
     s!"  {sanitize m.name} : {emitType m.ty}"
-  s!"class {sanitize c.name} ({tyVarId c.tyVar} : Type) where\n" ++
+  let params := String.intercalate " " (c.tyVars.map fun tv => s!"({tyVarId tv} : Type)")
+  s!"class {sanitize c.name} {params} where\n" ++
     String.intercalate "\n" methodLines
 
 private partial def firstValArgTy : GHCType → Option GHCType
@@ -587,7 +598,20 @@ private def builtinClasses : List Name :=
 /-- Reconstruct `ClassDecl`s + a `(method, class)` map from the program's
     instance dict-builders (which reference their `$c<method>` bindings) and the
     `$c<method>` binding types (generalized to the class parameter). No GHC-plugin
-    support is needed: the dfun (`$f…`) body names the instance's methods. -/
+    support is needed: the dfun (`$f…`) body names the instance's methods.
+
+    This is the FALLBACK shape source since M3 Task 1 — the decl-plugin's
+    `classDecls` channel is ground truth (see `mergeClassDecls`). What it is still
+    the only source of is the `(method, class)` map, which is instance-driven by
+    construction and drives the call-site `size` → `Sized.size` rewrite; and it is
+    the whole story for a run with no decls sidecar (`ghc-core-shim` invoked
+    without `--decls`), where `Program.classDecls` is empty.
+
+    Its structural limits are why the plugin channel exists: `tyVars` is always
+    the single invented `"a"`, `supers` is always empty (a `$p` superclass
+    selector is not a top-level bind, so nothing here can see one), and
+    `hasDefault` is always `false` (a `$dm` bind is indistinguishable from an
+    ordinary one). A class with no local instance produces nothing at all. -/
 def reconstructClasses (binds : CoreProgram) (insts : List Instance)
     : List ClassDecl × List (Name × Name) :=
   let tv := "a"
@@ -601,12 +625,45 @@ def reconstructClasses (binds : CoreProgram) (insts : List Instance)
       let mname := cm.drop 2   -- strip "$c"
       some ({ name := mname, ty := generalizeTy headName tv mv.ty } : ClassMethod)
     let pairs := methods.map (fun m => (m.name, i.className))
-    some ({ name := i.className, tyVar := tv, methods }, pairs)
+    some ({ name := i.className, tyVars := [tv], supers := [], methods }, pairs)
   let results := insts.filterMap perInstance
   let classes := results.foldl (init := ([] : List ClassDecl)) fun acc (cd, _) =>
     if acc.any (·.name == cd.name) then acc else acc ++ [cd]
   let methodMap := (results.flatMap (·.2)).eraseDups
   (classes, methodMap)
+
+/-- Merge the two class-shape sources. The decl-plugin's `classDecls` (read out
+    of GHC's own `Class` records) WIN by name over `reconstructClasses`' output,
+    which is inferred from instance bodies and structurally cannot represent type
+    parameters beyond one, superclasses, or defaults.
+
+    Precedence is whole-record, not field-wise: the plugin's method list carries
+    real method types (`ppMethodTy` renders type variables, which the data-field
+    renderer cannot) in DECLARATION order, whereas the reconstruction's order is
+    the dfun body's and its types come from head-abstracting an instance's
+    specialized `$c` bind — the documented "primary correctness risk". Where both
+    sources describe a single-parameter class they agree exactly, which is the
+    byte-identical-`UserClass.lean` regression this task gates on.
+
+    ORDER is deliberately taken from the reconstruction, with plugin-only classes
+    (those with no local instance, which the reconstruction never sees) appended.
+    Emission puts class decls in the data block unsorted and Lean has no forward
+    references, so class order is load-bearing once `extends` appears — sorting by
+    superclass dependency is M3 Task 5's job, and reordering here before that
+    exists would only churn output.
+
+    `builtinClasses` are filtered defensively. The plugin dumps only the module's
+    OWN class TyCons, so `Eq`/`Ord`/… cannot arrive through it unless a user
+    declares a class of that name — which has no Lean image here (those names are
+    routed to `BEq`/`deriving`) and must not be emitted as a user class. -/
+def mergeClassDecls (fromPlugin : List ClassDecl) (fromCore : List ClassDecl)
+    : List ClassDecl :=
+  let plugin := fromPlugin.filter (fun c => !builtinClasses.contains c.name)
+  let merged := fromCore.map fun cd =>
+    match plugin.find? (·.name == cd.name) with
+    | some p => p
+    | none   => cd
+  merged ++ plugin.filter (fun p => !fromCore.any (·.name == p.name))
 
 /-- Find the `$c<method>` binding belonging to the instance whose head type
     matches `headTyStr`, returning its emitted (unique-suffixed) def name.
@@ -1456,8 +1513,12 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
     | .rec_ pairs =>
       let kept := pairs.filter (fun (v, _) => !isSuppressedMethod v)
       if kept.isEmpty then none else some (.rec_ kept)
-  -- Reconstruct user classes → class decls + method→class map (selector rewrite).
-  let (userClasses, methodMap) := reconstructClasses p.binds p.instances
+  -- User classes → class decls + method→class map (selector rewrite). The decl
+  -- plugin's shapes win over the instance-driven reconstruction (see
+  -- `mergeClassDecls`); the map stays reconstruction-only, since it is keyed by
+  -- the `$c` binds that only an instance provides.
+  let (coreClasses, methodMap) := reconstructClasses p.binds p.instances
+  let userClasses := mergeClassDecls p.classDecls coreClasses
   let classNames := userClasses.map (·.name)
   -- Dependency order: a decl with another local type as a field type must come
   -- after it (Lean has no forward references; the dump order is not topological).
