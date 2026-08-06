@@ -169,6 +169,33 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- data, which fails loud at `lake build` — this names the cause up front.
     for n in Emit.malformedNewtypes prog.typeDecls do
       IO.eprintln s!"warning: {Emit.malformedNewtypeWarning n}"
+    -- Refuse a local type name that ALSO names a type reachable through the
+    -- module graph. The Core dump spells imported type references BARE, so the
+    -- two are indistinguishable and every resolution order is a blind guess —
+    -- see Emit's "Local-vs-imported type-name collisions" section for the
+    -- end-to-end probe. FIRST of the two program-level refusals: under a
+    -- collision the newtype-instance message below would consult a substitution
+    -- list that is itself ambiguous, and could name the wrong underlying type.
+    --
+    -- The DATA channel carries a self-entry for every graph module, this one
+    -- included (`scripts/transpile_graph.py manifest` dumps all of them), so
+    -- entries defined by THIS module are dropped first — they are not imports.
+    -- With no module name we cannot tell a self-entry from an import, so the
+    -- data channel is skipped entirely rather than refusing every module that
+    -- declares a `data` type; the newtype channel needs no such filter (a
+    -- module's own newtype lines are appended only AFTER it emits).
+    let importedDataNames := match moduleName with
+      | some m => (ext.datas.filter (·.2 != m)).map (·.1)
+      | none   => []
+    -- `ext.ambiguous` is in the set too: those entries were DROPPED, which makes
+    -- an imported reference loud at `lake build` — but only while nothing else
+    -- resolves the needle, and a local decl of the same name does exactly that.
+    let importedNames := importedDataNames ++ ext.newtypes.map (·.1) ++ ext.ambiguous
+    let collisions := Emit.localImportCollisions prog.typeDecls importedNames
+    if !collisions.isEmpty then
+      for c in collisions do
+        IO.eprintln s!"error: {Emit.localImportCollisionError c}"
+      return 1
     -- Refuse any instance whose head type is a newtype — local or imported:
     -- erasure has nowhere to put it and both fallbacks are silent-wrong. See
     -- Emit's "Newtype-instance guard" section for the observed shapes and for the

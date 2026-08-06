@@ -1166,6 +1166,14 @@ The two ambiguity shapes that involve the NEWTYPE channel are NOT that benign, s
 
 In both refused shapes ALL of the name's entries are dropped and the name is
 reported: the reference stays opaque and fails loud at `lake build`.
+
+REACHABILITY, since the gate fix below landed: neither shape can arise from a
+normal `transpile.sh` run any more. Both graphs need TWO modules to declare the
+name, and the second one to be transpiled sees the first's entry — its own data
+self-entry excluded — so `localImportCollisions` refuses it and the run aborts
+before the manifest can hold the conflicting pair. These two checks therefore now
+guard a hand-assembled or stale manifest, which is exactly where a
+warn-and-drop (rather than a hard refusal) belongs.
 -/
 
 /-- The `newtype` channel's discriminator field. Lowercase and a Haskell keyword,
@@ -1236,6 +1244,84 @@ def parseExtManifest (s : String) : ExtManifest :=
     datas     := raw.datas.filter fun (t, _) => !clashing.contains t
     newtypes  := nts.filter       fun (t, _) => !clashing.contains t
     ambiguous := clashing }
+
+/-! ### Local-vs-imported type-name collisions (Program validation)
+
+`parseExtManifest` above can only see manifest-vs-manifest clashes. The module
+that DECLARES the second same-named type is invisible there, because its own
+newtype sidecar is appended to the manifest only AFTER it emits (`transpile.sh`),
+and its `data` self-entries are indistinguishable from an import at that point.
+That leaves a silent-wrong hole, proven end-to-end on the pre-fix binary:
+
+    NtSA: newtype Tag = Tag Int
+    NtSC: import qualified NtSA;  newtype Tag = Tag [Int]
+          foreignTag :: NtSA.Tag -> NtSA.Tag   -- i.e. Int -> Int
+
+`NtSC` transpiled with exit 0 and EMPTY stderr, emitting
+`def foreignTag (t : (List Int)) : (List Int)` for an `Int -> Int` function, and
+`theorem foreignTag_nil : foreignTag [] = [] := by blaster` reported `✅ Valid` —
+a verdict about the empty list for a function on integers.
+
+The root cause is not the ordering, and shadowing cannot be tuned to fix it: the
+Core dump records type references UNQUALIFIED. `NtSA.Tag` arrives in NtSC's dump
+as `{"name": "Tag", "tag": "TyCon"}`, byte-identical to a reference to NtSC's own
+`Tag`. Whatever the pipeline picks, it is picking blind. So the only sound
+behaviour is a loud refusal, and this is the function that detects it.
+
+BOTH local kinds and BOTH manifest channels are in scope, because all four
+pairings resolve blind and all four can typecheck afterwards:
+
+* local `newtype` / imported `newtype` — pass 1 skips erasable newtypes, so the
+  needle survives to pass 2, where `newtypeSubsts local ++ extNts` makes the
+  LOCAL underlying win. The probe above.
+* local `data` / imported `newtype` — pass 1 consumes the needle into a bare
+  local name BEFORE pass 2 runs, so the imported reference silently becomes the
+  local inductive and the manifest's erasure never fires.
+* local `data` / imported `data`, and local `newtype` / imported `data` — same
+  two mechanisms, with the imported type's `M.T` qualification (pass 4) never
+  reached because pass 1 or 2 already consumed the needle.
+
+DELIBERATE CONSERVATISM, recorded rather than fixed: the manifest is GRAPH-wide,
+not import-scoped, so two graph modules that share a type name without importing
+one another are refused too, even though neither is actually mis-resolved (each
+one's pass 1 makes its own name bare). Refusing is over-strict there, but it is
+LOUD and the remedy is the same rename; the alternative would be reconstructing
+import edges the manifest does not carry. -/
+
+/-- Local type names that ALSO name a type reachable through the module graph —
+    the collision the unqualified Core dump makes unresolvable (see the section
+    header). Order follows the local decl order; a name present in both manifest
+    channels is reported once.
+
+    `importedNames` is the manifest's name set: the DATA channel, the `newtype`
+    channel, and the names `parseExtManifest` DROPPED as ambiguous. The dropped
+    ones must be included — dropping only removes the entries, so a local decl of
+    that name would resolve the reference blind and silently, instead of leaving
+    the opaque needle that makes a dropped entry loud at `lake build`.
+
+    The caller is responsible for excluding this module's OWN data-channel
+    self-entries (`Type⇥ThisModule`, which `scripts/transpile_graph.py manifest`
+    emits for every graph module including the one being transpiled). They are not
+    collisions and are harmless — pass 1 makes the local name bare before pass 4
+    could qualify it — and not filtering them would refuse every module that
+    declares a `data` type. -/
+def localImportCollisions (decls : List DataDecl) (importedNames : List Name) : List Name :=
+  (decls.map (·.name) |>.filter importedNames.contains).eraseDups
+
+/-- The refusal message for one `localImportCollisions` name: both origins, the
+    root cause, and the remedy. Deliberately does NOT report which kind (`data` or
+    `newtype`) either side is: the point is that the dump cannot tell the two
+    REFERENCES apart, and naming a kind would invite the reader to believe some
+    combination is safe. -/
+def localImportCollisionError (n : Name) : String :=
+  s!"type name collision: `{n}` is declared locally and imported from the module\n" ++
+  s!"  graph. The Core dump records type references unqualified — an imported\n" ++
+  s!"  `{n}` arrives spelled exactly like this module's own `{n}` — so the\n" ++
+  s!"  transpiler cannot distinguish them and would resolve every reference to\n" ++
+  s!"  whichever type it happened to try first. That typechecks and is silently\n" ++
+  s!"  wrong (a function over the imported `{n}` emits with the local `{n}`'s\n" ++
+  s!"  representation, theorem text included), so transpilation is refused.\n" ++
+  s!"  Remedy: rename one of the types."
 
 /-- Rewrite `(GHCCore.tyConOpaque "T")` → `M.T` for each external type `T`
     declared in a transpiled dependency module `M` (the manifest's DATA channel,

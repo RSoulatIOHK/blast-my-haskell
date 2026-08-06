@@ -239,7 +239,8 @@ Development Host.)
   (`∀ (n : Int), bumpAge n = n + 1`). This works **cross-module** when the
   underlying type is a builtin/mapped one (`Int`, `List Int`, `(Int × Int)`, …):
   the defining module publishes the erasure for the modules that import it.
-  Three consequences of erasure, all of them loud:
+  Three consequences, all of them loud (the second is broader than newtypes —
+  cross-module `data` types share its root cause):
   - **No type-class instance on a newtype** — hand-written, `deriving`, or with
     the newtype nested anywhere in the instance head (`instance Eq (Celsius,
     Celsius)`, `instance Convert Int Celsius`) — is a **loud transpiler error**.
@@ -255,15 +256,32 @@ Development Host.)
     One gap: an instance on a newtype imported from a module *outside* the
     current transpile graph (so it contributes no manifest entry) is invisible
     to the check, and fails at `lake build` instead.
-  - **Same-name newtypes with different underlying types in one module graph are
-    refused.** The cross-module manifest keys on bare type names, so a graph with
-    `newtype Key = Key Int` in one module and `newtype Key = Key [Int]` in
-    another is ambiguous — and picking a winner would erase `Key` to the wrong
-    type and still *typecheck*. All of that name's manifest entries are dropped
-    with a warning, and references to it then fail at `lake build`; rename one of
-    the types. Same treatment when a name is a `newtype` in one graph module and
-    a `data` type in another. (Several modules publishing the *same* underlying
-    are interchangeable and dedup silently.)
+  - **Type names must be unique across a module graph** — the root cause is not
+    newtype-specific: the Core dump records type references *unqualified*, so an
+    imported `Other.Tag` reaches the importing module's dump spelled exactly like
+    that module's own `Tag`, and no resolution order can be better than a guess.
+    Two boundaries follow, with *different* loudness:
+    - A module declaring a type whose name is also declared by a type it imports
+      through the graph is a **hard transpiler error** (nonzero exit, nothing
+      emitted for that module, and the run aborts before any later one).
+      Both kinds on both sides: local `data` or `newtype` against an
+      imported `data` or `newtype`. Picking either side typechecks and is
+      silently wrong — `foreignTag :: Other.Tag -> Other.Tag` over
+      `newtype Tag = Tag Int` emitted as `List Int → List Int` because the
+      importing module happened to declare its own `newtype Tag = Tag [Int]`.
+      Rename one of the types. (Deliberately over-strict in one direction: the
+      manifest is graph-wide rather than import-scoped, so two modules sharing a
+      type name are refused even when neither imports the other.)
+    - A clash recorded in the cross-module *manifest* — `newtype Key = Key Int`
+      in one module and `newtype Key = Key [Int]` in another, or a `newtype` in
+      one and a `data` type in another — is **not** a hard error: all of that
+      name's manifest entries are dropped with a warning, so references to it
+      then fail at `lake build` (its type reference stays opaque). Same remedy.
+      Note that a normal `transpile.sh` run now hits the hard error above
+      *first* — the second module to declare the name sees the first one's
+      manifest entry and refuses — so this softer path is only reached with a
+      hand-assembled or stale manifest. (Several modules publishing the *same*
+      underlying are interchangeable and dedup silently, with no warning.)
   - **A newtype over a user-defined type is not yet erasable across module
     boundaries** — same-module use is fine. Only underlyings built entirely from
     mapped types are published to importers, because the local `Q` in

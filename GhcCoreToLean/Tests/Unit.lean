@@ -2009,4 +2009,121 @@ def eqWrapPInst : Instance :=
 --     `Age` is a newtype (erased → `Int`). …
 --   transpile.sh exit 1, no `Generated/NtOrphanProbe.lean` written.
 
+-- LOCAL NEWTYPE OVER AN IMPORTED NEWTYPE (`newtype Wrapped = Wrapped Age`, `Age`
+-- imported). The chain crosses the module boundary, and it works only because
+-- pass 2 folds the LOCAL substitutions BEFORE `extNts`: `newtypeSubsts` cannot
+-- resolve `Age` (no local decl), so it leaves the needle in the underlying
+-- string, and the ext entry consumes that needle on a LATER fold step.
+def wrappedNtDecl : DataDecl :=
+  {name := "Wrapped", kind := "newtype",
+   ctors := [ {name := "Wrapped", fields := [ {name := "_", ty := .tyCon "Age" []} ]} ]}
+#guard newtypeSubsts [wrappedNtDecl] == [("Wrapped", "(GHCCore.tyConOpaque \"Age\")")]
+#guard resolveNewtypes (newtypeSubsts [wrappedNtDecl] ++ [("Age", "Int")])
+         "(GHCCore.tyConOpaque \"Wrapped\")" == "Int"
+-- The ORDER is load-bearing, not incidental: reversed, the ext entry folds first
+-- over a source that does not mention `Age` yet, and the local step then splices
+-- a LIVE needle in behind it — pinned as the exact string, so this guard shows
+-- the failure rather than merely denying the success.
+#guard resolveNewtypes ([("Age", "Int")] ++ newtypeSubsts [wrappedNtDecl])
+         "(GHCCore.tyConOpaque \"Wrapped\")" == "(GHCCore.tyConOpaque \"Age\")"
+-- Same conclusion at the emitter, which is where the order actually lives: a
+-- signature mentioning `Wrapped` erases all the way through to `Int`, with no
+-- needle left for pass 4 to turn into a `NewtypeBasic.Age` that does not exist.
+def wrappedV : Var :=
+  {name := "useWrapped", unique := 4010,
+   ty := .tyFun (.tyCon "Wrapped" []) (.tyCon "Wrapped" []), role := .id}
+def wrappedX : Var := {name := "x", unique := 4011, ty := .tyCon "Wrapped" [], role := .id}
+def wrappedProg : Program :=
+  { binds := [.nonRec wrappedV (.lam wrappedX (.var wrappedX))],
+    typeDecls := [wrappedNtDecl], instances := [] }
+#guard ((emitFullProgram [] wrappedProg [("Age", "Int")]).splitOn
+         "(x_4011 : Int) : Int").length == 2
+#guard ((emitFullProgram [] wrappedProg [("Age", "Int")]).splitOn "tyConOpaque").length == 1
+-- Without the imported half the chain stops mid-way and the needle SURVIVES —
+-- loud at `lake build`, never a silently-wrong `Wrapped`-shaped type.
+#guard ((emitFullProgram [] wrappedProg []).splitOn
+         "(GHCCore.tyConOpaque \"Age\")").length == 3
+-- An imported newtype in the underlying is NOT re-exportable (the needle is still
+-- there pre-`resolveUserTypes`), so a third module cannot erase `Wrapped` — it
+-- gets the surviving needle, loud at `lake build`. Same skip rule as a local
+-- user-typed underlying.
+#guard newtypeExports [wrappedNtDecl] == []
+
+/-! ## M2 gate fix — local/imported type-name collisions
+
+The hole `parseExtManifest`'s ambiguity check cannot see: it compares manifest
+entries against each other, so the module DECLARING the second same-named type is
+invisible (its own newtype line is appended only after it emits). Proven
+silent-wrong end-to-end on the pre-fix binary — see Emit's "Local-vs-imported
+type-name collisions" section for the probe and the four resolution paths. -/
+
+-- The probe's exact shape: local `newtype Tag = Tag [Int]`, imported
+-- `Tag⇥newtype⇥Int`.
+def tagLocalNtDecl : DataDecl :=
+  {name := "Tag", kind := "newtype",
+   ctors := [ {name := "Tag",
+               fields := [ {name := "_", ty := .tyCon "[]" [.tyCon "Int" []]} ]} ]}
+#guard localImportCollisions [tagLocalNtDecl] ["Tag"] == ["Tag"]
+-- Local DATA over an imported name is refused identically: there pass 1 consumes
+-- the needle into the bare local name before pass 2's erasure can fire, so the
+-- imported reference silently becomes the local inductive. Different mechanism,
+-- same blindness — hence both kinds are in scope.
+def tagLocalDataDecl : DataDecl :=
+  {name := "Tag", kind := "data",
+   ctors := [ {name := "Tag", fields := [ {name := "t", ty := .tyCon "Int" []} ]} ]}
+#guard localImportCollisions [tagLocalDataDecl] ["Tag"] == ["Tag"]
+-- Which manifest CHANNEL the imported name came from is not a distinction the
+-- caller passes down, and a name in both channels is reported once.
+#guard localImportCollisions [tagLocalDataDecl] ["Tag", "Tag"] == ["Tag"]
+-- Report order follows the LOCAL decl order (the dump's), and unrelated local
+-- decls do not perturb it.
+#guard localImportCollisions [tagLocalNtDecl, pointDecl, ageNewtypeDecl]
+         ["Age", "Point", "Tag"] == ["Tag", "Point", "Age"]
+-- NO OVER-FIRE. A module whose local names are disjoint from the manifest is
+-- untouched, and so is every module in a graph with no imported types at all —
+-- the check is exactly the identity when either list is empty.
+#guard localImportCollisions [tagLocalNtDecl, pointDecl] ["Age", "Rect"] == []
+#guard localImportCollisions [] ["Tag", "Age"] == []
+#guard localImportCollisions [pointDecl, rectDecl, ageNewtypeDecl] [] == []
+-- The self-entry the DATA channel always carries for the module being transpiled
+-- (`Point⇥RecordOps` while transpiling `RecordOps`) is NOT a collision — filtered
+-- by defining module at the call site, since this function sees names only.
+-- Pinned here as the shape that would otherwise refuse every `data`-declaring
+-- module: with the filter, `RecordOps`' imported set is empty.
+#guard localImportCollisions [pointDecl, rectDecl]
+         (([("Point", "RecordOps"), ("Rect", "RecordOps")].filter (·.2 != "RecordOps")).map
+           (·.1)) == []
+-- …and the same manifest seen from a CLIENT (defining module ≠ this one) does
+-- collide, if the client declares its own `Point`.
+#guard localImportCollisions [pointDecl]
+         (([("Point", "RecordOps")].filter (·.2 != "RecordClient")).map (·.1)) == ["Point"]
+
+-- THE MESSAGE names the type, both origins, the root cause and the remedy. It
+-- deliberately states no kind for either side: the dump cannot tell the two
+-- references apart whatever they are, and naming one would suggest some pairing
+-- is safe.
+#guard ((localImportCollisionError "Tag").splitOn "`Tag`").length > 1
+#guard ((localImportCollisionError "Tag").splitOn
+         "declared locally and imported from the module").length == 2
+#guard ((localImportCollisionError "Tag").splitOn
+         "records type references unqualified").length == 2
+#guard ((localImportCollisionError "Tag").splitOn "rename one of the types").length == 2
+
+-- OBSERVED end-to-end (probe modules `NtSA.hs`/`NtSC.hs`, not committed — the
+-- regression loop keeps one expected-fail fixture only).
+--   BEFORE: `./transpile.sh examples/haskell/NtSC.hs` → exit 0, EMPTY stderr,
+--     `def foreignTag (t_2516 : (List Int)) : (List Int)` for a `NtSA.Tag ->
+--     NtSA.Tag` (i.e. `Int -> Int`) function, and `lake build` reported
+--     `GhcCoreToLean/Generated/NtSC.lean:16:50: ✅ Valid` for
+--     `theorem foreignTag_nil : foreignTag [] = [] := by blaster` — a verdict
+--     about the empty list for a function on integers.
+--   AFTER: exit 1 before any emission, with
+--     error: type name collision: `Tag` is declared locally and imported from
+--     the module graph. …
+--   The DATA-channel arm was probed the same way (`NtSD.hs`: `import qualified
+--   RecordOps` + a local `data Point`) — refused naming `Point`, no
+--   `Generated/NtSD.lean` written — while `RecordOps` itself still transpiles
+--   with `Point⇥RecordOps` and `Rect⇥RecordOps` in its own manifest, which is
+--   what the call site's defining-module filter buys.
+
 end GhcCoreToLean.Tests
