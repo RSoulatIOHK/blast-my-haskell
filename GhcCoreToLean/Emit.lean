@@ -80,6 +80,7 @@ mutual
     | .cast e      => occursInExpr n e
     | .tick e      => occursInExpr n e
     | .type_ _     => false
+    | .coercion    => false
 
   partial def occursInBind (n : Name) : Bind → Bool
     | .nonRec _ e => occursInExpr n e
@@ -277,6 +278,12 @@ mutual
     | .cast e  => emitExpr mm top e
     | .tick e  => emitExpr mm top e
     | .type_ _ => "(GHCCore.typeArg : GHCCore.GHCType)"
+    -- LOUD residue. `Lower` erases coercion arguments, and a coercion cannot
+    -- occur in head position, so reaching here means an unhandled shape (e.g. a
+    -- coercion *binder*, see the M2 Task 2 notes in Tests/Unit.lean). Like
+    -- `GHCCore.typeArg`, this identifier is deliberately not defined anywhere:
+    -- the generated file must fail to elaborate rather than pick some value.
+    | .coercion => "GHCCore.coercionResidue"
 
   partial def emitAlt (mm : List (Name × Name)) (top : List Name) : Alt → String
     | .mk con bndrs rhs =>
@@ -510,6 +517,7 @@ private partial def usesTagPrim : Expr → Bool
   | .cast e      => usesTagPrim e
   | .tick e      => usesTagPrim e
   | .type_ _     => false
+  | .coercion    => false
 
 /-- Class-method binder names, by class. Used both to detect derived instances
     and to suppress their (untranslatable) method defs. -/
@@ -672,27 +680,435 @@ def userDataConMap (decls : List DataDecl) : Name → Option String := fun n =>
           some (sanitize c.name)
       else none
 
+/-! ## Name-resolution post-passes
+
+Emitted text passes through an ORDERED pipeline of textual resolution passes.
+Both the order and each pass's site list are load-bearing.
+
+  1. `resolveUserTypes`      opaque local tycon → bare       — bodies, data block,
+                                                               spec text (3 sites)
+  2. `resolveNewtypes`       newtype → underlying type       — after 1, before 3,
+                                                               SAME 3 sites
+  3. `resolveUserCtors`      ctor in application position → `T.C`
+                                                             — bodies + spec text
+                                                               ONLY, never the
+                                                               data block
+  4. `resolveExternalTypes`  remaining opaque → `M.T`        — whole output, last;
+                                                               requires 1 to have
+                                                               run on EVERY section
+
+Pass 1's three sites are, concretely: `emitFullProgram`'s `bodyResolved`
+(bodies + instances), its `dataBlock`, and `resolveSpecText` (user `@lean` theorem
+text). Passes 3 and 4 run at the first and third of those — pass 4 covering the
+whole joined output rather than the body section alone. Pass 3 must never see the
+data block: it would rewrite the inductive's own `| Ctor ` lines. Pass 4 must run
+last, and pass 1 must have reached every section before it, or a local type still
+spelled opaque gets rewritten to `M.T` for its OWN module `M`.
+
+Newtype erasure (pass 2) adds two constraints of its own, both live:
+
+* Passes 1 and 3 take `keptTypeDecls`, NOT `p.typeDecls`. Pass 1 on the full set
+  would consume the `(GHCCore.tyConOpaque "Age")` needle and rewrite it to a bare
+  `Age` that pass 2 can no longer see (and that no `inductive` declares).
+* Newtypes stay IN `sortDataDecls`' input (dependency chains thread through them
+  transitively, e.g. `Point` → `Wrapper`(newtype) → `Q`); they are filtered out
+  only at the emission map — filtering before the sort loses the chain and
+  reintroduces the forward-reference bug. Pass 2's substituted STRINGS are
+  themselves pre-resolved (`newtypeSubsts`) for the same chain reason: a newtype
+  wrapping a local type must not splice a needle back in after pass 1 has run.
+
+IMPORTED newtypes are erased at pass 2 as well, from the manifest's `newtype`
+channel (`extNts`) appended AFTER the local substitutions. Pass 2 is the only slot
+that works: pass 1 is keyed off local decls (the client has none for an imported
+type), and pass 4 would rewrite the needle to a `NewtypeBasic.Age` that does not
+exist — so the erasure has to consume the needle before pass 4 sees it. Sound
+because the published underlying string is module-independent by construction
+(`newtypeExports`), and because instance MATCHING still happens on the opaque
+spelling: `derivedEqTypes`/`ordTypes`/`findClassMethod` keys are built before any
+of these passes run, so erasing `Age` → `Int` here cannot cross-match instances.
+-/
+
 /-- Rewrite occurrences of `(GHCCore.tyConOpaque "X")` to the bare name `X`
     for every user-declared type. The Core dump types user types as opaque
     (since the shim doesn't know the lakefile's type-ctor map); after the
     transpiler emits `inductive X where …`, opaque references should resolve
-    to that inductive directly. -/
+    to that inductive directly.
+
+    Takes the KEPT decls (`keptTypeDecls`), not every `typeDecls` entry: an
+    erased newtype must keep its opaque spelling through this pass so that
+    `resolveNewtypes` (pass 2) still finds its needle. -/
 def resolveUserTypes (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     let needle := s!"(GHCCore.tyConOpaque \"{d.name}\")"
     let replacement := sanitize d.name
     s.replace needle replacement
 
+/-! ### Newtype erasure (pass 2)
+
+A `newtype` has no Lean image at all: Core already identifies it with its
+underlying type (GHC erases wrap/unwrap into `Cast`s that never reach the shim —
+see the M2 Task 3 observation in `Tests/Unit.lean`), so the emitted VALUES are
+plain identities and only the emitted TYPES still mention it. Erasing the type
+makes those values typecheck.
+-/
+
+/-- Newtypes that erase, as (declared name, underlying type as `emitType` gives
+    it — the single ctor's single field).
+
+    A "newtype" with ≠1 ctor or ≠1 field is a MALFORMED dump (Haskell admits
+    neither shape), so it is not erased: it is absent from this list and every
+    consumer below therefore treats it exactly like a `data` decl — emitted as
+    an `inductive`, its ctors qualified. That is loud downstream rather than
+    silent, because GHC has already erased the value level: identity bodies
+    against a surviving one-field-per-ctor inductive are type MISMATCHES. No
+    `panic!`, no invented recovery. -/
+def newtypeDecls (decls : List DataDecl) : List (Name × String) :=
+  decls.filterMap fun d =>
+    if d.kind != "newtype" then none
+    else match d.ctors with
+      | [c] => match c.fields with
+        | [f] => some (d.name, emitType f.ty)
+        | _   => none
+      | _   => none
+
+/-- The decls that keep a Lean image: everything except the newtypes
+    `newtypeDecls` erases. THE key for every newtype suppression site
+    (`resolveUserTypes`, `resolveUserCtors`, `ctorNames`, the `datas` emission
+    map), so a malformed newtype is uniformly treated as data. -/
+def keptTypeDecls (decls : List DataDecl) : List DataDecl :=
+  let erased := (newtypeDecls decls).map (·.1)
+  decls.filter fun d => !erased.contains d.name
+
+/-- Wrap an underlying type string for substitution into the fully-bracketed
+    hole a nullary opaque tycon leaves. `(GHCCore.tyConOpaque "Ages")` may sit in
+    application-argument position (`List (GHCCore.tyConOpaque "Ages")`), so an
+    unbracketed juxtaposition like `List Int` has to become `(List Int)` or
+    `List List Int` results. Same rule (and the same closed set of `emitType`
+    shapes) as `Maps.parenArg`. -/
+private def newtypeArg (u : String) : String :=
+  if u.contains ' ' && !u.startsWith "(" then s!"({u})" else u
+
+/-- Rewrite `(GHCCore.tyConOpaque "N")` → the underlying type of newtype `N`.
+    Runs AFTER `resolveUserTypes` (whose decl set excludes these newtypes, so
+    the needle survives) and BEFORE `resolveUserCtors`. The needle is the whole
+    opaque form, so there is no substring bleed between related names (`Age` vs.
+    `Wage`: the needle's `"` delimiters block it).
+
+    The underlying strings must already be pipeline-resolved — use
+    `newtypeSubsts`, never `newtypeDecls` directly. -/
+def resolveNewtypes (nts : List (Name × String)) (src : String) : String :=
+  nts.foldl (init := src) fun s (n, u) =>
+    let needle := s!"(GHCCore.tyConOpaque \"{n}\")"
+    s.replace needle (newtypeArg u)
+
+/-- `newtypeDecls` with each underlying string put through the OTHER newtypes'
+    erasures: `newtype A = A B` where `B` is itself a newtype. Fuel-bounded (a
+    chain of n newtypes needs n-1 rounds) and self-references are excluded, so
+    the legal-but-useless `newtype A = A A` cannot diverge (it stays opaque →
+    loud). Saturating the MAP rather than re-scanning the source also makes the
+    result independent of dump order.
+
+    The shared basis of the two consumers, which differ in exactly one step:
+    `newtypeSubsts` (for splicing into THIS module's text) additionally resolves
+    local opaque tycons to bare names; `newtypeExports` (for DEPENDENT modules)
+    must not, because a bare local name means nothing there — it filters those
+    newtypes out instead. -/
+def newtypeChainSubsts (decls : List DataDecl) : List (Name × String) :=
+  let raw := newtypeDecls decls
+  let rec saturate (fuel : Nat) (nts : List (Name × String)) : List (Name × String) :=
+    match fuel with
+    | 0        => nts
+    | fuel + 1 => saturate fuel (nts.map fun (n, u) =>
+                    (n, resolveNewtypes (nts.filter (·.1 != n)) u))
+  saturate raw.length raw
+
+/-- The substitution list the pipeline actually applies: `newtypeChainSubsts`
+    with each underlying string put through the passes that have ALREADY run on
+    the text it gets spliced into, so no substitution can reintroduce a stale
+    needle — local opaque tycons made bare. `newtype Wrapper = Wrapper Q` for a
+    local `data Q` yields `(GHCCore.tyConOpaque "Q")` from `emitType`, and pass 1
+    has already run over the source; splicing that raw would leave a live needle
+    for `resolveExternalTypes` to rewrite to a nonexistent `M.Q`. -/
+def newtypeSubsts (decls : List DataDecl) : List (Name × String) :=
+  (newtypeChainSubsts decls).map fun (n, u) => (n, resolveUserTypes (keptTypeDecls decls) u)
+
+/-! ### Cross-module newtype erasure (the manifest's `newtype` channel)
+
+An imported newtype reaches a client module's Core as a BARE tycon — observed
+`{"name": "Age", "tag": "TyCon"}` in `RecordClient`'s dump, the same convention
+imported `data` types use — so `emitType` hands the client the same
+`(GHCCore.tyConOpaque "Age")` needle the defining module produced. But the client
+has no `typeDecls` entry for `Age` (the decl plugin dumps only the current
+module's `tcg_tcs`), so pass 2 knows nothing to rewrite it to, and the
+data-channel manifest deliberately carries no `Age` entry (there is no
+`NewtypeBasic.Age` to point at). The needle would survive into the generated Lean
+— loud, but the client cannot be transpiled at all.
+
+The defining module therefore PUBLISHES its erasable newtypes as a second
+manifest channel (`newtypeExports` → `newtypeManifestLine` → `transpile.sh`
+appends → `parseExtManifest` → pass 2's substitution list). Sound because the
+published string is module-INDEPENDENT: see `newtypeExports`' filter.
+-/
+
+/-- THIS module's newtypes that a DEPENDENT module can erase, as (name,
+    underlying) manifest pairs.
+
+    The filter is the whole soundness argument: an underlying string is
+    exportable iff it contains no `GHCCore.tyConOpaque` needle, i.e. iff it is
+    built entirely out of `typeConMap`-mapped tycons (`Int`, `List Int`,
+    `(Int × Int)`, …). `emitType` emits the opaque needle for PRECISELY the
+    unmapped tycons, so that one substring test subsumes every case where the
+    string would be meaningless in another module:
+
+    * a local user type (`newtype Wrapper = Wrapper Q`) — skipped, because the
+      client has no `Q` in scope and the correct spelling would be `M.Q` (which
+      needs qualified-underlying resolution: deliberately out of M2 scope);
+    * an imported or otherwise unknown user type — skipped identically;
+    * a chain that does not bottom out in a mapped type, and the recursive
+      `newtype R = R R` — skipped, since `newtypeChainSubsts` leaves the needle.
+
+    Skipping is loud, not silent: the client's needle survives into the emitted
+    Lean, where `GHCCore.tyConOpaque` is undefined. Note the underlying string is
+    taken PRE-`resolveUserTypes` (`newtypeChainSubsts`, not `newtypeSubsts`) —
+    that pass would rewrite a local `(GHCCore.tyConOpaque "Q")` to a bare `Q` and
+    hide it from this filter. -/
+def newtypeExports (decls : List DataDecl) : List (Name × String) :=
+  (newtypeChainSubsts decls).filter fun (_, u) =>
+    (u.splitOn "GHCCore.tyConOpaque").length == 1
+
+/-! ### Newtype-instance guard (Program validation, NOT a resolution pass)
+
+Erasure identifies a newtype with its underlying type, so an instance whose head
+is a newtype has nowhere to go — and both places it *can* go are silent-wrong,
+the one failure mode this project forbids:
+
+* **Eq relocates.** `newtype Mod7 = Mod7 Int` + a hand-written `Eq Mod7` emits
+  `instance : BEq Int where beq := <mod-7 function>` inside the module namespace,
+  so every `==` on `Int` in the module (theorem text included) silently means
+  mod-7. Observed: `((1 : Int) == 8) = false` is *refuted* by `decide`.
+* **Ord vanishes.** `newtype Coin = Coin Int` + `instance Ord Coin where compare
+  (Coin a) (Coin b) = compare b a` matches `ordTypes` on the opaque head, so
+  `isSuppressedMethod` drops every `$c` method, while the newtype is filtered out
+  of `datas` and gets no `deriving Ord` either. The user's reversed `compare` is
+  gone and Lean's own `Int` order takes over — with zero diagnostics.
+
+So: ANY instance whose head type is a newtype is a hard transpiler error.
+
+Derived-vs-hand-written is not distinguishable here (`tcg_insts` carries no
+origin marker and GND instances have no `$c` methods to sniff — M2 spec
+correction 3), so `deriving (Show)` on a newtype is refused for the same reason.
+Relaxable later by extending the decl-plugin to dump instance origin.
+
+Detection is STRUCTURAL: every newtype mentioned anywhere in a head type is
+flagged, argument positions included. A newtype in argument position was the
+sharpest silent-wrong hole here — `instance Eq (Celsius, Celsius)` reads as head
+`(,)`, so a head-only check let it through and emitted
+`instance : BEq (Int × Int)` with zero diagnostics, relocating Eq onto every pair
+of `Int`s in the module. Observed on the pre-fix binary: exit 0, empty stderr,
+and `theorem _ : ((1,2) == (1,3)) = true := by decide` builds.
+
+CROSS-MODULE (M2 Task 6). The check must see IMPORTED newtypes too, and this is
+soundness-critical rather than cosmetic. Task 5 could scope the check to the
+current module's `typeDecls` only because nothing then erased an imported
+newtype's needle, so an orphan `instance Eq Age` in a client failed loud at `lake
+build` (`GHCCore.tyConOpaque` is undefined — `GhcCoreToLean/Runtime.lean` declares
+no such symbol; grep: its only occurrences in this repo are the emitter's own
+needle-construction and needle-rewriting sites). Task 6's manifest `newtype`
+channel erases that needle, which would have turned the very same input into
+failure mode (a) above — `instance : BEq Int` in the client's namespace, silently.
+So `newtypeInstanceViolations` takes the imported newtype names as well, and the
+INVARIANT tying the two features together is:
+
+  the guard's newtype-name set ⊇ the set pass 2 erases.
+
+Locally that holds because the guard keys off `newtypeNames` (ALL newtypes)
+while pass 2 erases only `newtypeDecls` (well-formed ones). Across modules it
+holds because both sides read the SAME manifest channel: an imported newtype is
+erased iff `newtypeExports` published it, and exactly those names are handed to
+the guard. An imported newtype `newtypeExports` skipped (underlying not fully
+mapped) is erased by neither, and stays loud at `lake build` as before.
+
+One deliberate scope limit remains, recorded rather than fixed:
+
+* An instance on an imported newtype whose defining module is NOT in the current
+  transpile graph (hence contributes no manifest entry) is still invisible here —
+  and still loud at `lake build`, by the surviving-needle argument above.
+-/
+
+/-- Names of ALL `newtype` decls — well-formed or not.
+
+    The guard keys off THIS, deliberately not off `newtypeDecls`: a malformed
+    newtype does not erase, but it is still a newtype at the source level (GHC has
+    still erased its value level), so an instance on it is just as unrepresentable
+    and must be refused just as loudly. -/
+def newtypeNames (decls : List DataDecl) : List Name :=
+  (decls.filter (·.kind == "newtype")).map (·.name)
+
+/-- `newtype` decls dumped with a shape Haskell does not admit (≠1 ctor or ≠1
+    field) and which therefore do NOT erase — see `newtypeDecls`. Reported as a
+    warning at the validation site so the shape's only diagnostic isn't an
+    indirect Lean type mismatch. -/
+def malformedNewtypes (decls : List DataDecl) : List Name :=
+  let erased := (newtypeDecls decls).map (·.1)
+  (newtypeNames decls).filter fun n => !erased.contains n
+
+mutual
+  /-- Every name from `nts` MENTIONED anywhere in a type — head position, tycon
+      arguments, either side of an application or arrow, or a `∀` body.
+      Duplicates are kept; the caller dedups.
+
+      Structural rather than head-only because the head tycon alone misses the
+      worst case: `instance Eq (Celsius, Celsius)` has head `(,)`, so a head-only
+      check passed it through and emitted `instance : BEq (Int × Int)` — see the
+      section header. Written as a `mutual` pair with `newtypeMentionsAll` so the
+      recursion through `.tyCon`'s argument LIST is structural: `partial` would
+      make this opaque to kernel reduction and the `#guard`s pinning it in
+      `Tests/Unit.lean` would not elaborate. -/
+  private def newtypeMentions (nts : List Name) : GHCType → List Name
+    | .tyCon n args => (if nts.contains n then [n] else []) ++ newtypeMentionsAll nts args
+    | .tyApp f x    => newtypeMentions nts f ++ newtypeMentions nts x
+    | .tyFun a r    => newtypeMentions nts a ++ newtypeMentions nts r
+    | .forAll _ b   => newtypeMentions nts b
+    | .tyVar _      => []
+    | .tyLit _      => []
+
+  /-- `newtypeMentions` over a list of types — the recursive half that walks
+      `.tyCon`'s arguments and, at the top level, an instance's `headTypes`. -/
+  private def newtypeMentionsAll (nts : List Name) : List GHCType → List Name
+    | []      => []
+    | t :: ts => newtypeMentions nts t ++ newtypeMentionsAll nts ts
+end
+
+/-- Instances the transpiler must REFUSE, as `(className, newtypeName)` pairs.
+
+    Every element of `headTypes` is scanned (not just the first — `instance
+    Convert Int Celsius` is as unrepresentable as `instance Eq Celsius`), and each
+    is scanned STRUCTURALLY, not just for its head tycon (`instance Eq (Celsius,
+    Celsius)` is unrepresentable too, and was the silent-wrong hole this closed).
+    One pair per distinct `(class, newtype)`: a head naming the same newtype twice
+    is one problem reported once, while a multi-parameter class mentioning two
+    different newtypes still reports both. Dedup keeps the first occurrence, so
+    report order follows the dump.
+
+    `extNtNames` are IMPORTED newtype names (the manifest's `newtype` channel).
+    Passing them is soundness-critical, not optional politeness: those are exactly
+    the names pass 2 now erases across module boundaries, so without them an
+    orphan `instance Eq Age` in a client would silently relocate onto `Int`. See
+    the section header's invariant. -/
+def newtypeInstanceViolations (insts : List Instance) (decls : List DataDecl)
+    (extNtNames : List Name := []) : List (Name × Name) :=
+  let nts := newtypeNames decls ++ extNtNames
+  (insts.flatMap fun i =>
+    (newtypeMentionsAll nts i.headTypes).map fun n => (i.className, n)).eraseDups
+
+/-- The refusal message for one `newtypeInstanceViolations` pair: names the class,
+    the newtype, its underlying type when the newtype is well-formed enough to
+    have one, and the remedy.
+
+    `extNts` (the manifest's `newtype` channel) is consulted for the underlying
+    type as well, so a violation on an IMPORTED newtype names `Int` rather than
+    claiming the dump is malformed — the local `typeDecls` never contain an
+    imported decl. Local entries take precedence, matching pass 2's shadowing. -/
+def newtypeInstanceError (decls : List DataDecl) (v : Name × Name)
+    (extNts : List (Name × String) := []) : String :=
+  let (cls, nt) := v
+  let under? := (newtypeSubsts decls ++ extNts).find? (·.1 == nt) |>.map (·.2)
+  let erasedTo := match under? with
+    | some u => s!" (erased → `{u}`)"
+    | none   => " (malformed dump: it does not even erase cleanly)"
+  let remedy := match under? with
+    | some u => s!"write the instance — and any property about it — against\n" ++
+                s!"  the underlying type `{u}`, or drop the instance"
+    | none   => "write the instance — and any property about it — against\n" ++
+                "  the underlying type, or drop the instance"
+  s!"newtype instance not representable: `instance {cls} {nt}`\n" ++
+  s!"  `{nt}` is a newtype{erasedTo}. Newtypes are erased to their underlying\n" ++
+  s!"  type, so an instance on one has no Lean image: it would either silently\n" ++
+  s!"  reattach to the underlying type (changing the meaning of every use of\n" ++
+  s!"  `{cls}`'s methods at that type in this module, theorem text included) or be\n" ++
+  s!"  dropped outright. Both are silent-wrong, so transpilation is refused.\n" ++
+  s!"  Remedy: {remedy}.\n" ++
+  s!"  Note: a `deriving` clause on a newtype is refused for the same reason —\n" ++
+  s!"  the dump carries no derived-vs-hand-written marker to tell them apart.\n" ++
+  s!"  Note: `{nt}` may sit NESTED in the instance head (e.g. `instance {cls}\n" ++
+  s!"  ({nt}, {nt})`) rather than be the head itself; that is refused identically,\n" ++
+  s!"  because the head's Lean image is built from the erased type."
+
+/-- The warning for a malformed `newtype` (see `malformedNewtypes`). Not an error:
+    Haskell admits neither shape, so only a corrupt or out-of-date decl sidecar
+    can produce one, and the downstream failure is already loud (GHC erased the
+    value level, so identity bodies against a surviving one-field inductive are
+    type MISMATCHES). Erroring here would newly refuse input that currently
+    transpiles; warning names the consequence up front instead. -/
+def malformedNewtypeWarning (n : Name) : String :=
+  s!"malformed newtype `{n}`: dumped with ≠1 constructor or ≠1 field, a shape\n" ++
+  s!"  Haskell does not admit, so it is NOT erased and is emitted as an ordinary\n" ++
+  s!"  data type. GHC has already erased its value level, so the generated Lean is\n" ++
+  s!"  expected to FAIL to typecheck (identity bodies against a one-field\n" ++
+  s!"  inductive). This indicates a corrupt or out-of-date decl sidecar."
+
+/-- Characters that continue (or qualify) a Lean identifier. A ctor-name
+    occurrence flanked by one of these is part of a LONGER name — `mkPoint`,
+    `Points`, `Point.Point` — and must never be rewritten. -/
+private def isIdentish (c : Char) : Bool :=
+  c.isAlphanum || c == '_' || c == '\'' || c == '.'
+
+/-- Characters that can START a Lean value argument, i.e. that mark the
+    preceding identifier as being APPLIED.
+
+    Deliberately EXCLUDES lowercase letters: `instance : BEq CustomRatio where`
+    would otherwise read `where` as an argument and rewrite a *type* to a ctor.
+    The cost is that a ctor applied to a bare variable (`Point x y` in a user
+    spec) is not rewritten — Lean then fails loud ("function expected at
+    Point"), never silently. `-` is excluded for the same fail-loud reason:
+    `Point -1 2` is subtraction in Lean, so a negative literal argument has to
+    be parenthesised anyway (and then `(` fires). -/
+private def isArgStart (c : Char) : Bool :=
+  c == '(' || c == '[' || c == '⟨' || c.isDigit
+
+/-- Boundary-aware rewrite of `bare` → `qual` at every APPLICATION-position
+    occurrence: identifier boundaries on both sides (so `mkPoint` and an
+    already-qualified `Point.Point` are left alone) and an argument following
+    (`isArgStart`). This is what covers a ctor applied to a *literal*
+    argument — `Rect (Point 0 0) 1 1` — which the fixed needles in
+    `resolveUserCtors` cannot express: they all require a `(` immediately
+    after the ctor name. -/
+def replaceCtorApps (bare qual : String) (src : String) : String :=
+  match src.splitOn bare with
+  | []              => src
+  | first :: pieces =>
+    -- `pieces` are the gaps AFTER each occurrence; occurrence `i` sits between
+    -- gap `i-1` and gap `i` (`next`). The LEFT boundary is read straight off the
+    -- output built so far, which is always the text immediately preceding this
+    -- occurrence: a non-empty preceding gap ends `acc`, and an EMPTY one means
+    -- the previous occurrence was adjacent — that one's `appOK` was then false
+    -- (its gap started with `bare`, not an arg), so it emitted `bare` and left
+    -- `acc` ending identifier-ish, correctly blocking this one too. `acc` starts
+    -- as `first`, so `acc.isEmpty` also covers the start-of-string case.
+    let rec go (pieces : List String) (acc : String) : String :=
+      match pieces with
+      | []           => acc
+      | next :: more =>
+        let leftOK  := acc.isEmpty || !isIdentish acc.back
+        let rightOK := next.isEmpty || !isIdentish next.front
+        let after   := next.dropWhile (· == ' ')
+        let appOK   := !after.isEmpty && isArgStart after.front
+        let repl    := if leftOK && rightOK && appOK then qual else bare
+        go more (acc ++ repl ++ next)
+    go pieces first
+
 /-- Qualify user-defined data constructors in any position where Lean's
     elaborator would otherwise be ambiguous (type vs. ctor under the same
-    name). Three call-shapes are recognised:
+    name). The recognised call-shapes are:
 
       *  `| Ctor `                              ← alt-pattern
       *  `(Ctor)`                               ← App in transpiler-emitted style
       *  `Ctor (` (preceded by whitespace)      ← App in user `[lean| … |]` spec
+      *  `Ctor <arg>` at identifier boundaries  ← App to a literal/bracketed
+                                                  argument (`replaceCtorApps`)
 
-    Type annotations like `(x : T)` or `→ T →` don't match any of these
-    needles, so they remain `T` and resolve to the type. -/
+    Type annotations like `(x : T)` or `→ T →` match none of these, so they
+    remain `T` and resolve to the type. -/
 def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     d.ctors.foldl (init := s) fun s c =>
@@ -703,36 +1119,322 @@ def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
         , (s!"({bareCtor})",   s!"({qualCtor})")
         , (s!" {bareCtor} (",  s!" {qualCtor} (")
         , (s!"({bareCtor} (",  s!"({qualCtor} (") ]
-      rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
+      let s := rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
+      replaceCtorApps bareCtor qualCtor s
+
+/-! ### The imported-type manifest (`EXT_TYPES_MANIFEST`)
+
+Tab-separated, one entry per line, built per run by `transpile.sh`. TWO channels:
+
+    Point⇥RecordOps      DATA — imported type `Point` is declared by module
+                         `RecordOps`, so it emits as `RecordOps.Point`
+                         (`resolveExternalTypes`, pass 4). Written by
+                         `scripts/transpile_graph.py manifest`.
+    Age⇥newtype⇥Int      NEWTYPE — imported newtype `Age` has no Lean name at
+                         all; it ERASES to `Int` (`resolveNewtypes`, pass 2).
+                         Written by the defining module's own transpile
+                         (`newtypeExports`, appended by `transpile.sh`).
+
+The channels cannot collide: a data line's second field is a MODULE name, and
+`newtype` is a lowercase Haskell keyword, so no module can be called that. The
+two lists must also stay DISJOINT downstream — a newtype leaking into the data
+channel would emit `newtype.Age`.
+
+Keys are BARE type names, so two graph modules declaring the same type name are
+ambiguous. WITHIN the DATA channel that is a pre-existing property and first entry
+wins (dependency order); its consequence is a mis-qualified `WrongModule.Point`,
+which is loud almost always.
+
+The two ambiguity shapes that involve the NEWTYPE channel are NOT that benign, so
+`parseExtManifest` refuses both rather than picking a winner:
+
+  * ACROSS the channels. Graph `{A: newtype Age = Age Int, B: data Age = …,
+    C: imports B's Age}`: the manifest carries both `Age⇥B` and `Age⇥newtype⇥Int`,
+    and pass 2 runs first, so C's `f :: Age -> Int` over B's DATA type emits
+    `f : Int → Int` and a `@lean` theorem verifies a property about `Int` instead.
+    That typechecks — silent-wrong.
+
+  * WITHIN the newtype channel, with two DISTINCT underlyings. Graph
+    `{A: newtype Key = Key Int, B: newtype Key = Key [Int], C: imports B's Key}`:
+    the manifest carries `Key⇥newtype⇥Int` and `Key⇥newtype⇥List Int`,
+    `resolveNewtypes` folds left so the FIRST wins, and C's `idKey :: Key -> Key`
+    over B's `[Int]` emits `idKey : Int → Int` — with `∀ (k : Int), idKey k = k`
+    reported valid. Also silent-wrong, and with no wrong-module name anywhere in
+    the output to make it loud the way the data channel's clash is. The SAME
+    underlying published by several modules is NOT this case: those entries are
+    interchangeable, so they dedup to one.
+
+In both refused shapes ALL of the name's entries are dropped and the name is
+reported: the reference stays opaque and fails loud at `lake build`.
+
+REACHABILITY, since the gate fix below landed: neither shape can arise from a
+normal `transpile.sh` run any more. Both graphs need TWO modules to declare the
+name, and the second one to be transpiled sees the first's entry — its own data
+self-entry excluded — so `localImportCollisions` refuses it and the run aborts
+before the manifest can hold the conflicting pair. These two checks therefore now
+guard a hand-assembled or stale manifest, which is exactly where a
+warn-and-drop (rather than a hard refusal) belongs.
+-/
+
+/-- The `newtype` channel's discriminator field. Lowercase and a Haskell keyword,
+    hence never a module name — see the manifest section header. -/
+def newtypeChannelTag : String := "newtype"
+
+/-- The manifest line the DEFINING module publishes for one exported newtype (see
+    `newtypeExports`). The underlying string may contain SPACES (`List Int`) but
+    never a tab, so the 3-field split back out is unambiguous. -/
+def newtypeManifestLine (n : Name) (u : String) : String :=
+  s!"{n}\t{newtypeChannelTag}\t{u}"
+
+/-- The manifest's two channels, plus the lines that parsed as neither. -/
+structure ExtManifest where
+  /-- DATA channel: (type name, defining module) → `resolveExternalTypes`. -/
+  datas    : List (String × String) := []
+  /-- NEWTYPE channel: (newtype name, underlying type) → `resolveNewtypes`. -/
+  newtypes : List (Name × String)   := []
+  /-- Lines that matched no channel; the caller warns and drops them. -/
+  rejected : List String            := []
+  /-- Irreconcilably ambiguous names — found in BOTH channels, or in the newtype
+      channel with two DIFFERENT underlyings. ALL their entries are dropped in
+      either channel, and the caller warns. -/
+  ambiguous : List Name             := []
+  deriving BEq, Repr, Inhabited
+
+/-- Parse an `EXT_TYPES_MANIFEST` file body into its two disjoint channels (see
+    the manifest section header for the line formats).
+
+    A 2-field line whose module field is exactly `newtype` is a TRUNCATED newtype
+    line: rejected, never read as data (as data it would emit `newtype.Age`).
+    That check is what makes the "channels cannot collide" claim hold at the
+    parser and not merely at the writers.
+
+    Unparseable lines are REJECTED (reported by the caller) and dropped, not
+    fatal: a dropped entry leaves the `(GHCCore.tyConOpaque "T")` needle in the
+    emitted Lean, where `GHCCore.tyConOpaque` is undefined — so the failure mode
+    of skipping is loud at `lake build`, whereas aborting would refuse a module
+    over a corrupt line the user never wrote. Empty lines (the trailing newline
+    always yields one) are neither parsed nor reported.
+
+    A newtype-channel name is dropped from BOTH channels and reported in
+    `ambiguous` when it also appears in the data channel, OR when it appears with
+    two DIFFERENT underlying types — the two configurations where picking a winner
+    would be silent-wrong rather than loud (see the section header's two graphs).
+    Repeats of the SAME underlying are interchangeable, so they dedup to one entry
+    and are not ambiguous. -/
+def parseExtManifest (s : String) : ExtManifest :=
+  let raw : ExtManifest := (s.splitOn "\n").foldl (init := {}) fun m line =>
+    let reject := { m with rejected := m.rejected ++ [line] }
+    if line.isEmpty then m else
+    match line.splitOn "\t" with
+    | [t, modName] =>
+      if t.isEmpty || modName.isEmpty || modName == newtypeChannelTag then reject
+      else { m with datas := m.datas ++ [(t, modName)] }
+    | [t, tag, u] =>
+      if t.isEmpty || u.isEmpty || tag != newtypeChannelTag then reject
+      else { m with newtypes := m.newtypes ++ [(t, u)] }
+    | _ => reject
+  -- Dedup FIRST: the same (name, underlying) pair from two modules says the same
+  -- thing, so it must not count as a conflict below.
+  let nts := raw.newtypes.eraseDups
+  let clashing := (nts.filterMap fun (n, u) =>
+    if raw.datas.any (·.1 == n) || nts.any (fun (n', u') => n' == n && u' != u)
+    then some n else none).eraseDups
+  if clashing.isEmpty then { raw with newtypes := nts } else
+  { raw with
+    datas     := raw.datas.filter fun (t, _) => !clashing.contains t
+    newtypes  := nts.filter       fun (t, _) => !clashing.contains t
+    ambiguous := clashing }
+
+/-! ### Local-vs-imported type-name collisions (Program validation)
+
+`parseExtManifest` above can only see manifest-vs-manifest clashes. The module
+that DECLARES the second same-named type is invisible there, because its own
+newtype sidecar is appended to the manifest only AFTER it emits (`transpile.sh`),
+and its `data` self-entries are indistinguishable from an import at that point.
+That leaves a silent-wrong hole, proven end-to-end on the pre-fix binary:
+
+    NtSA: newtype Tag = Tag Int
+    NtSC: import qualified NtSA;  newtype Tag = Tag [Int]
+          foreignTag :: NtSA.Tag -> NtSA.Tag   -- i.e. Int -> Int
+
+`NtSC` transpiled with exit 0 and EMPTY stderr, emitting
+`def foreignTag (t : (List Int)) : (List Int)` for an `Int -> Int` function, and
+`theorem foreignTag_nil : foreignTag [] = [] := by blaster` reported `✅ Valid` —
+a verdict about the empty list for a function on integers.
+
+The root cause is not the ordering, and shadowing cannot be tuned to fix it: the
+Core dump records type references UNQUALIFIED. `NtSA.Tag` arrives in NtSC's dump
+as `{"name": "Tag", "tag": "TyCon"}`, byte-identical to a reference to NtSC's own
+`Tag`. Whatever the pipeline picks, it is picking blind. So the only sound
+behaviour is a loud refusal, and this is the function that detects it.
+
+BOTH local kinds and BOTH manifest channels are in scope, because all four
+pairings resolve blind and all four can typecheck afterwards:
+
+* local `newtype` / imported `newtype` — pass 1 skips erasable newtypes, so the
+  needle survives to pass 2, where `newtypeSubsts local ++ extNts` makes the
+  LOCAL underlying win. The probe above.
+* local `data` / imported `newtype` — pass 1 consumes the needle into a bare
+  local name BEFORE pass 2 runs, so the imported reference silently becomes the
+  local inductive and the manifest's erasure never fires.
+* local `data` / imported `data`, and local `newtype` / imported `data` — same
+  two mechanisms, with the imported type's `M.T` qualification (pass 4) never
+  reached because pass 1 or 2 already consumed the needle.
+
+DELIBERATE CONSERVATISM, recorded rather than fixed: the manifest is GRAPH-wide,
+not import-scoped, so two graph modules that share a type name without importing
+one another are refused too, even though neither is actually mis-resolved (each
+one's pass 1 makes its own name bare). Refusing is over-strict there, but it is
+LOUD and the remedy is the same rename; the alternative would be reconstructing
+import edges the manifest does not carry. -/
+
+/-- Local type names that ALSO name a type reachable through the module graph —
+    the collision the unqualified Core dump makes unresolvable (see the section
+    header). Order follows the local decl order; a name present in both manifest
+    channels is reported once.
+
+    `importedNames` is the manifest's name set: the DATA channel, the `newtype`
+    channel, and the names `parseExtManifest` DROPPED as ambiguous. The dropped
+    ones must be included — dropping only removes the entries, so a local decl of
+    that name would resolve the reference blind and silently, instead of leaving
+    the opaque needle that makes a dropped entry loud at `lake build`.
+
+    The caller is responsible for excluding this module's OWN data-channel
+    self-entries (`Type⇥ThisModule`, which `scripts/transpile_graph.py manifest`
+    emits for every graph module including the one being transpiled). They are not
+    collisions and are harmless — pass 1 makes the local name bare before pass 4
+    could qualify it — and not filtering them would refuse every module that
+    declares a `data` type. -/
+def localImportCollisions (decls : List DataDecl) (importedNames : List Name) : List Name :=
+  (decls.map (·.name) |>.filter importedNames.contains).eraseDups
+
+/-- The refusal message for one `localImportCollisions` name: both origins, the
+    root cause, and the remedy. Deliberately does NOT report which kind (`data` or
+    `newtype`) either side is: the point is that the dump cannot tell the two
+    REFERENCES apart, and naming a kind would invite the reader to believe some
+    combination is safe. -/
+def localImportCollisionError (n : Name) : String :=
+  s!"type name collision: `{n}` is declared locally and imported from the module\n" ++
+  s!"  graph. The Core dump records type references unqualified — an imported\n" ++
+  s!"  `{n}` arrives spelled exactly like this module's own `{n}` — so the\n" ++
+  s!"  transpiler cannot distinguish them and would resolve every reference to\n" ++
+  s!"  whichever type it happened to try first. That typechecks and is silently\n" ++
+  s!"  wrong (a function over the imported `{n}` emits with the local `{n}`'s\n" ++
+  s!"  representation, theorem text included), so transpilation is refused.\n" ++
+  s!"  Remedy: rename one of the types."
 
 /-- Rewrite `(GHCCore.tyConOpaque "T")` → `M.T` for each external type `T`
-    declared in a transpiled dependency module `M` (built from the dependency
-    `.decls.json`). Applied after `resolveUserTypes`, so locally-declared types
-    are already bare; only imported types are rewritten, and genuinely unknown
-    types stay opaque. -/
+    declared in a transpiled dependency module `M` (the manifest's DATA channel,
+    built from the dependency `.decls.json`). Applied after `resolveUserTypes`,
+    so locally-declared types are already bare; only imported types are
+    rewritten, and genuinely unknown types stay opaque.
+
+    Imported NEWTYPES never reach here: they have no `M.T` image and are erased
+    one pass earlier (pass 2) from the manifest's separate `newtype` channel. -/
 def resolveExternalTypes (extTypes : List (String × String)) (src : String) : String :=
   extTypes.foldl (init := src) fun s (tyName, modName) =>
     let needle      := s!"(GHCCore.tyConOpaque \"{tyName}\")"
     let replacement := s!"{modName}.{sanitize tyName}"
     s.replace needle replacement
 
+/-- Every type-constructor name mentioned anywhere in a type. -/
+private partial def tyConNames : GHCType → List Name
+  | .tyCon n args => n :: args.flatMap tyConNames
+  | .tyApp f a    => tyConNames f ++ tyConNames a
+  | .tyFun a b    => tyConNames a ++ tyConNames b
+  | .forAll _ b   => tyConNames b
+  | .tyVar _      => []
+  | .tyLit _      => []
+
+/-- Locally-declared types that a decl's constructor fields refer to, deduplicated
+    in first-occurrence order (self-references dropped: `data T = C T` needs no
+    ordering, Lean inductives are self-recursive by construction). Consumers only
+    test membership, but two fields of the same type — `data L = L Point Point` —
+    would otherwise report `Point` twice. -/
+def dataDeclDeps (localNames : List Name) (d : DataDecl) : List Name :=
+  let mentioned := d.ctors.flatMap fun c => c.fields.flatMap fun f => tyConNames f.ty
+  dedup (mentioned.filter fun n => n != d.name && localNames.contains n)
+
+/-- Order data decls so that a decl using another local type as a field type is
+    emitted AFTER it. Lean has no forward references and the decl-plugin's
+    `tcg_tcs` dump order is not dependency order, so `inductive Rect` would
+    otherwise reference a not-yet-declared `Point`.
+
+    CONSTRAINT: the result is always exactly the input decls, reordered. Elements
+    only move from `pending` to `acc` and never duplicate, so a preserved length
+    implies a permutation; the closing length check is the totality fallback for
+    the one input GHC cannot emit — two decls sharing a name, where
+    `pending.filter (·.name != d.name)` drops both while placing one. On a
+    dependency CYCLE (mutually recursive records, which would need a Lean
+    `mutual` block) the remaining decls are appended in dump order. Either way
+    Lean fails loud on a forward reference instead of a decl silently vanishing.
+
+    The `| 0, pending` arm is DEAD: `go` starts at `fuel = ds.length` and every
+    step consumes one fuel while removing one decl from `pending`, so `pending`
+    empties first. It exists only to satisfy the termination checker. -/
+def sortDataDecls (ds : List DataDecl) : List DataDecl :=
+  let names := ds.map (·.name)
+  let rec go (fuel : Nat) (pending : List DataDecl) (placed : List Name)
+      (acc : List DataDecl) : List DataDecl :=
+    match fuel, pending with
+    | _, []            => acc.reverse
+    | 0, pending       => acc.reverse ++ pending
+    | fuel + 1, pending =>
+      match pending.find? (fun d => (dataDeclDeps names d).all (fun n => placed.contains n)) with
+      | some d => go fuel (pending.filter (·.name != d.name)) (d.name :: placed) (d :: acc)
+      | none   => acc.reverse ++ pending
+  let result := go ds.length ds [] []
+  -- Totality fallback: any length change ⇒ hand back the input untouched.
+  if result.length != ds.length then ds else result
+
 /-- Apply the same name-resolution post-passes used on emitted bodies to a
-    single user spec string: local types → bare, imported types → `M.T`,
-    user ctors → `T.C`. -/
+    single user spec string: local types → bare, newtypes → underlying, imported
+    types → `M.T`, user ctors → `T.C`.
+
+    Only the transpiler-emitted OPAQUE spelling of a newtype erases here; a user
+    spec that writes the newtype's name by hand (`∀ (a : Age)`) is left alone and
+    fails loud (unknown identifier) — newtype properties are written against the
+    underlying type.
+
+    `extNts` is the manifest's `newtype` channel (imported newtypes); local
+    newtypes come FIRST in the substitution list, so a local decl shadows an
+    imported entry of the same bare name. -/
 def resolveSpecText (typeDecls : List DataDecl) (extTypes : List (String × String))
-    (s : String) : String :=
-  resolveExternalTypes extTypes (resolveUserCtors typeDecls (resolveUserTypes typeDecls s))
+    (s : String) (extNts : List (Name × String) := []) : String :=
+  let kept := keptTypeDecls typeDecls
+  resolveExternalTypes extTypes
+    (resolveUserCtors kept
+      (resolveNewtypes (newtypeSubsts typeDecls ++ extNts) (resolveUserTypes kept s)))
 
 /-- Top-level entry: emit a full Program (data decls, value defs, instances).
-    The user-type and user-ctor post-passes are applied only to the
-    value-binding / instance sections; the data declarations themselves
-    must keep their original names. `extTypes` maps imported type names to
-    their defining module so cross-module references resolve. -/
-def emitFullProgram (extTypes : List (String × String)) (p : Program) : String :=
+    Name resolution runs as the pipeline documented under "Name-resolution
+    post-passes" above: the TYPE pass (`resolveUserTypes`) runs on ALL sections —
+    bodies/instances, the data block, and user spec text (via `resolveSpecText`)
+    — because a local type used as another decl's FIELD type arrives opaque in the
+    data block exactly as it does in a body. The CTOR pass (`resolveUserCtors`)
+    runs on bodies and spec text ONLY, never the data block, where it would
+    corrupt the inductive's own `| Ctor ` lines. The NEWTYPE pass
+    (`resolveNewtypes`) runs between them on both sections; newtypes emit no decl
+    at all. `extTypes` maps imported type names to their defining module so
+    cross-module references resolve; `extNts` maps imported NEWTYPES to their
+    underlying type (the manifest's two channels — see its section header). -/
+def emitFullProgram (extTypes : List (String × String)) (p : Program)
+    (extNts : List (Name × String) := []) : String :=
+  -- Newtypes have no Lean image: they are erased at the type level (pass 2) and
+  -- suppressed from every decl/ctor site. `kept` is the single suppression key.
+  let kept := keptTypeDecls p.typeDecls
+  -- LOCAL newtypes first: `resolveNewtypes` folds left and the needle is consumed
+  -- by the first entry that matches, so a local decl shadows an imported entry of
+  -- the same bare name (the manifest's keys are unqualified).
+  let nts  := newtypeSubsts p.typeDecls ++ extNts
   -- User-declared ctors (e.g. `CustomRatio`) participate in the top-name
   -- set so App-position refs to them emit bare, not as `Name_<unique>`.
+  -- A newtype ctor is NOT in this set: at pass-0000 it never reaches the emitter
+  -- (M2 Task 3's positional census: 0 Var/DataAlt occurrences), and if a future
+  -- compiler ever emits one, `Age_<unique>` / `| Age …` is an unknown identifier
+  -- — loud, never a silent identity.
   let ctorNames : List Name :=
-    p.typeDecls.flatMap fun d => d.ctors.map (·.name)
+    kept.flatMap fun d => d.ctors.map (·.name)
   -- Eq: detect *derived* Eq (tag-primop `$c==`) → route through `deriving
   -- DecidableEq` and suppress the untranslatable method defs; hand-written Eq
   -- keeps body-translation. Ord: any type with an Ord instance is reconstructed
@@ -757,7 +1459,13 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   -- Reconstruct user classes → class decls + method→class map (selector rewrite).
   let (userClasses, methodMap) := reconstructClasses p.binds p.instances
   let classNames := userClasses.map (·.name)
-  let datas := p.typeDecls.map fun d =>
+  -- Dependency order: a decl with another local type as a field type must come
+  -- after it (Lean has no forward references; the dump order is not topological).
+  -- Newtypes stay in the SORT's input — chains thread through them transitively
+  -- (`Point` → `Wrapper`(newtype) → `Q`), and filtering first loses the edge —
+  -- and are dropped only here, at the emission map.
+  let datas := ((sortDataDecls p.typeDecls).filter fun d =>
+      kept.any (·.name == d.name)).map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
   let classDecls := userClasses.map emitClassDecl
@@ -778,13 +1486,26 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program) : String 
   let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
   let instStr := String.intercalate "\n\n" insts
   let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
-  let bodyResolved := resolveUserTypes p.typeDecls bodyRaw
-                    |> resolveUserCtors p.typeDecls
+  let bodyResolved := resolveUserTypes kept bodyRaw
+                    |> resolveNewtypes nts
+                    |> resolveUserCtors kept
+  -- `resolveUserTypes` (opaque → bare) must run on the data block too: a local
+  -- type used as another decl's FIELD type arrives as
+  -- `(GHCCore.tyConOpaque "Point")` there, exactly as in a body. Only the
+  -- *type* pass runs here — `resolveUserCtors` would rewrite the `| Ctor `
+  -- lines of the inductive itself.
   let dataBlock :=
-    String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))
+    resolveNewtypes nts
+      (resolveUserTypes kept
+        (String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))))
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
-  -- External-type resolution runs over the whole output (data fields included);
-  -- it only rewrites imported types, so local inductive names are untouched.
+  -- External-type resolution runs over the whole output (data fields included).
+  -- It is safe because `resolveUserTypes` has already made every LOCAL type bare
+  -- in every section (data block included), so the opaque needle can only match
+  -- an imported type. Note the shared manifest does carry the current module's
+  -- own types (`Point → RecordOps`); those entries are dead for exactly that
+  -- reason — before the data block was resolved they fired here and emitted a
+  -- self-qualified `RecordOps.Point` field type.
   resolveExternalTypes extTypes (String.intercalate "\n\n" sections)
 
 end GHCCore.Emit

@@ -5,9 +5,12 @@ namespace GHCCore.Lower
 open GHCCore.Maps
 
 private def isTypeOrDictArg : Expr → Bool
-  | .type_ _ => true
-  | .var v   => match v.role with | .dict => true | _ => false
-  | _        => false
+  | .type_ _  => true
+  -- A coercion in argument position is a proof term with no Lean image and no
+  -- runtime content; it erases exactly like a type or dict argument.
+  | .coercion => true
+  | .var v    => match v.role with | .dict => true | _ => false
+  | _         => false
 
 private def isTypeOrDictBinder (v : Var) : Bool :=
   match v.role with

@@ -1,6 +1,8 @@
 import GhcCoreToLean.Maps
 import GhcCoreToLean.Emit
 import GhcCoreToLean.AST
+import GhcCoreToLean.Parse
+import GhcCoreToLean.Lower
 import GhcCoreToLean.Runtime
 
 namespace GhcCoreToLean.Tests
@@ -788,5 +790,1340 @@ def mkPartialBind (nm : String) : Bind :=
 #guard valueMap "GHC.List.cycle"      == none
 #guard valueMap "GHC.Enum.enumFrom"     == none
 #guard valueMap "GHC.Enum.enumFromThen" == none
+
+/-! ## M2 Task 1 — records audit -/
+
+-- AUDIT (examples/haskell/RecordOps.hs → Generated/RecordOps.lean, GHC 9.2.7
+-- pass-0000). Hypothesis under test: record construction / update / selectors
+-- desugar to plain Core that the transpiler already handles. CONFIRMED at the
+-- Core level; the two things that broke were *emission*-level, both fixed below.
+--
+-- Features exercised and the observed Core spines, verbatim from
+-- /tmp/transpile-RecordOps.json (`@ty` = an erased type application; names are
+-- `<name>_<unique>` as the shim delivers them):
+--
+--  1. LABELED CONSTRUCTION `Point { px = x, py = y }` → positional ctor app,
+--     labels gone (no field-name residue anywhere in the dump):
+--       mkPoint = \x_2144 -> \y_2145 -> ((Point_2301 x_2144) y_2145)
+--  2. SELECTORS are ordinary top-level Core defs — one case with one alt, GHC
+--     names every binder `ds` (they are `wild`-scrutinised, binder unique 0):
+--       px      = \ds_2446 -> (case ds_2446 as wild_0 of
+--                               { Point ds_2447 ds_2448 -> ds_2447 })
+--       topLeft = \ds_2434 -> (case ds_2434 as wild_0 of
+--                               { Rect ds_2435 ds_2436 ds_2437 -> ds_2435 })
+--  3. SINGLE-FIELD UPDATE `p { px = px p + d }` → case-and-rebuild. Note the
+--     asymmetry: the new-value expression re-reads through the SELECTOR on the
+--     ORIGINAL variable (`(px_2136 p_2147)`) and the matching binder `ds_2429`
+--     goes unused — GHC does not reuse the case binder for the read:
+--       shiftX = \d_2146 -> \p_2147 -> (case p_2147 as wild_0 of
+--         { Point ds_2429 ds_2430 ->
+--             ((Point_2301 ((((GHC.Num.+_1300 @ty) GHC.Num.$fNumInt_2248)
+--                            (px_2136 p_2147)) d_2146)) ds_2430) })
+--  4. MULTI-FIELD UPDATE `r { width = w, height = h }` → same case-and-rebuild;
+--     here the UNTOUCHED field does come from the case binder (`ds_2424`):
+--       resize = \w_2287 -> \h_2288 -> \r_2289 -> (case r_2289 as wild_0 of
+--         { Rect ds_2424 ds_2425 ds_2426 -> (((Rect_2319 ds_2424) w_2287) h_2288) })
+--  5. SELECTOR AS A FIRST-CLASS FUNCTION `map px ps` → the selector is passed as
+--     an ordinary Var; no wrapper, no eta-reduction of `xs` (the type args sit
+--     between `map` and its value args):
+--       xs = \ps_2290 -> ((((GHC.Base.map_121 @ty) @ty) px_2136) ps_2290)
+--     `GHC.Base.map` is the already-mapped key (→ `List.map`), so nothing new.
+--  6. Nested record FIELD of user type: `Rect`'s `topLeft :: Point`.
+--
+-- NEGATIVES worth recording (later M2 tasks rest on them):
+--   * TAG CENSUS — every `"tag"` PRESENT in this dump, with counts: TyCon ×177,
+--     Var ×78, App ×73, NonRec ×23, Lit ×18, Lam ×14, TyFun ×14, LitWord ×8,
+--     Case ×7, DataAlt ×7, Type ×7, LitString ×6, LitInt ×4 (13 distinct tags).
+--     ABSENT: `"tag":"Cast"` ×0, `"tag":"Coercion"` ×0, `"tag":"Let"` ×0.
+--     Scope of the coercion negative: none of the record shapes in THIS dump
+--     produced one, so M2 Task 2's `ECoercion` plumbing is unexercised *here*.
+--     That is not a claim about records in general — newtype fields, strict
+--     fields and GND-derived selectors are Task 2-3's probes for it.
+--     The LitString ×6 and LitWord ×8 sit ENTIRELY in the Typeable binds that
+--     `isJunkName` drops: `$trModule` (2 × LitString) and `$tcPoint`/`$tcRect`/
+--     `$tc'Point`/`$tc'Rect` (1 × LitString + 2 × LitWord each). No value bind
+--     carries either tag.
+--   * `.transpile-sandbox/.decls/RecordOps.decls.json` gives BOTH decls
+--     `"kind": "data"` (the field Task 4 filters newtypes on), each ctor
+--     carrying named `fields` (`topLeft`/`width`/`height`, `px`/`py`) — so
+--     record-ness is visible in the sidecar even though Core has erased it.
+--   * decls.json order is REVERSE SOURCE ORDER (`Rect` before `Point`) — this
+--     is what made the sort below necessary, and it means dump order must never
+--     be trusted as dependency order.
+--   * No `$sel:`-style selector names and no `tyConOpaque`/`GHC.`/`$c` residue
+--     in the generated file; the only `$`-binds in the dump are the
+--     `$trModule`/`$tcPoint`/`$tc'Rect`/`$krep` Typeable junk already dropped.
+--
+-- TWO EMISSION BUGS SURFACED (both loud compile errors, neither silent-wrong):
+--
+-- (A) DECL ORDER + a local type as another decl's FIELD type. With `Rect`
+--     emitted first (dump order) and its field type still opaque in the data
+--     block, the output was
+--       inductive Rect where | Rect : RecordOps.Point → Int → Int → Rect
+--     i.e. `Unknown identifier RecordOps.Point` — two faults at once: the data
+--     block never got `resolveUserTypes` (so the field stayed
+--     `(GHCCore.tyConOpaque "Point")` and the shared ext-types manifest, which
+--     also lists the CURRENT module's types, rewrote it to `RecordOps.Point`),
+--     and `Point` was declared after `Rect`. Fix: `sortDataDecls` (dependency
+--     order) + `resolveUserTypes` over the data block. Manifest self-entries are
+--     now dead rather than removed (that file belongs to Task 4).
+-- (B) SPEC-TEXT ctor application to a LITERAL argument. `resolveUserCtors`'s
+--     four fixed needles all require a `(` right after the ctor name, so in
+--     `Rect (Point 0 0) 1 1` only the outer `Rect` was qualified; the inner
+--     `Point 0 0` stayed bare → `Function expected at Point`. Arithmetic never
+--     caught this: its spec's ctor args are all parenthesised
+--     (`CustomRatio (-numerator r2) (denominator r2)`). Fix: `replaceCtorApps`,
+--     a boundary-aware application-position rewrite.
+--
+-- For every shape the fixtures exercise, fix (B) is loud in both directions —
+-- a false positive puts a TERM where a type is expected (`BEq Point.Point`), a
+-- false negative leaves a type where a function is expected, both elaboration
+-- errors — EXCEPT inside a hand-written string literal, the one silent-rewrite
+-- hedge below.
+--
+-- KNOWN HEDGE (the single non-loud exposure): the rewrite is textual, so a ctor
+-- name followed by args inside a hand-written STRING LITERAL in a spec block is
+-- rewritten too — `"s = \"Point 1\""` becomes `Point.Point 1` inside the
+-- literal. That is pre-existing exposure of the ` Ctor (` needle as well, not
+-- new to `replaceCtorApps`. No fixture emits a `LitString` outside the dropped
+-- `$tr`/`$tc` binds (6 there, see the census above), and no Haskell string
+-- literal can reach the emitter at all — the AIRTIGHT reason is upstream of
+-- `valueMap`: the shim DISCARDS string payloads entirely (`shim/Main.hs:291`
+-- emits `"value": "<bs>"` for `MachStr`), so a string literal cannot round-trip
+-- regardless of what the maps do. (Belt and braces: Core spells the literal
+-- `unpackCString# "…"#` and `unpackCString#` has no `valueMap` arm, so outside
+-- the `error`/`undefined` spine — where the whole application collapses to
+-- `default` — it would emit as a loud unknown identifier anyway. And note the
+-- narrower claim: the string TYPE is mapped — `String` is `[Char]` in Core,
+-- which `typeConMap` sends to `List Char`. It is literal PRODUCTION that cannot
+-- compile today, not String-typed code in general.) So the residual risk is a
+-- hand-authored literal in theorem text — rare, and reviewable in the spec
+-- block itself.
+
+def pointDecl : DataDecl :=
+  {name := "Point", kind := "data",
+   ctors := [ {name := "Point",
+               fields := [ {name := "px", ty := .tyCon "Int" []},
+                           {name := "py", ty := .tyCon "Int" []} ]} ]}
+
+def rectDecl : DataDecl :=
+  {name := "Rect", kind := "data",
+   ctors := [ {name := "Rect",
+               fields := [ {name := "topLeft", ty := .tyCon "Point" []},
+                           {name := "width",   ty := .tyCon "Int" []},
+                           {name := "height",  ty := .tyCon "Int" []} ]} ]}
+
+-- Fix (B): the exact fixture spec line that failed. Both ctors get qualified —
+-- the outer one by the pre-existing ` Ctor (` needle, the inner one only by the
+-- new boundary-aware pass.
+#guard resolveSpecText [rectDecl, pointDecl] []
+         "area (resize w h (Rect (Point 0 0) 1 1)) = w * h"
+       == "area (resize w h (Rect.Rect (Point.Point 0 0) 1 1)) = w * h"
+
+-- Boundary NEGATIVES. The first is load-bearing for this fixture specifically:
+-- `Point` is a SUBSTRING of `mkPoint`, which appears in four of the five
+-- theorems (Arithmetic never tested this — `CustomRatio` is not a substring of
+-- `addRatio`/`subRatio`).
+#guard replaceCtorApps "Point" "Point.Point" "mkPoint 1 2"     == "mkPoint 1 2"
+#guard replaceCtorApps "Point" "Point.Point" "Points 0"        == "Points 0"
+#guard replaceCtorApps "Point" "Point.Point" "Point.Point 0 0" == "Point.Point 0 0"  -- idempotent
+#guard replaceCtorApps "Point" "Point.Point" "(p : Point) → Int" == "(p : Point) → Int"
+#guard replaceCtorApps "Point" "Point.Point" "List Point"      == "List Point"
+-- THE negative that documents why `isArgStart` excludes lowercase letters: with
+-- a lowercase arm this line becomes `BEq Point.Point where` and every
+-- hand-written-Eq fixture (Arithmetic, Ratio) breaks.
+#guard replaceCtorApps "Point" "Point.Point" "instance : BEq Point where"
+       == "instance : BEq Point where"
+-- Accepted (fail-loud) GAP of that same choice: a ctor applied to a bare
+-- VARIABLE is left alone → Lean reports "function expected at Point". Not
+-- silent-wrong, and no fixture writes this shape.
+#guard replaceCtorApps "Point" "Point.Point" "Point x y" == "Point x y"
+-- Positives: every occurrence in a string is rewritten, and the bracket/⟨ arms
+-- exist (both UNOBSERVED in fixtures so far — kept as hedges).
+#guard replaceCtorApps "Point" "Point.Point" "[Point 1 2, Point 3 4]"
+       == "[Point.Point 1 2, Point.Point 3 4]"
+#guard replaceCtorApps "Point" "Point.Point" "f (Point ⟨1, 2⟩)" == "f (Point.Point ⟨1, 2⟩)"
+#guard replaceCtorApps "Point" "Point.Point" "Point (-1) 2" == "Point.Point (-1) 2"
+-- Contrast with the line above, pinning the `isArgStart` alphabet exactly: a
+-- PARENTHESISED negative argument rewrites (`(` is an arg start), an
+-- UNPARENTHESISED one does not (`-` is not) and stays bare — the same
+-- documented, fail-loud false negative as `Point x y`, via the full
+-- `resolveUserCtors` pipeline so no fixed needle rescues it either.
+#guard resolveUserCtors [pointDecl] "px (Point -1 2)" == "px (Point -1 2)"
+-- The four pre-existing needles still fire (never remove a hedge): pattern
+-- position, transpiler-emitted App position.
+#guard resolveUserCtors [pointDecl] "| Point ds_1 ds_2 =>" == "| Point.Point ds_1 ds_2 =>"
+#guard resolveUserCtors [pointDecl] "((Point) (x_1)) (y_2)" == "((Point.Point) (x_1)) (y_2)"
+
+-- Fix (A): dependency order over data decls, both input orders.
+#guard dataDeclDeps ["Point", "Rect"] rectDecl  == ["Point"]
+#guard dataDeclDeps ["Point", "Rect"] pointDecl == []
+#guard (sortDataDecls [rectDecl, pointDecl]).map (·.name) == ["Point", "Rect"]
+#guard (sortDataDecls [pointDecl, rectDecl]).map (·.name) == ["Point", "Rect"]
+
+-- `dataDeclDeps` must see THROUGH type wrappers — the most load-bearing
+-- property of the sort, since a record field is far more often `[Point]` or
+-- `Maybe Point` than a bare `Point`. Without it the original forward-reference
+-- bug returns (loud, but only after emission). `tyConNames` recurses into
+-- `.tyCon` args, so the wrapper itself (`List`/`Maybe`) is also reported —
+-- filtered out by `localNames`, which is why these come back as just `Point`.
+def rectListDecl : DataDecl :=
+  {name := "RectList", kind := "data",
+   ctors := [ {name := "RectList",
+               fields := [ {name := "pts", ty := .tyCon "List" [.tyCon "Point" []]} ]} ]}
+def rectMaybeDecl : DataDecl :=
+  {name := "RectMaybe", kind := "data",
+   ctors := [ {name := "RectMaybe",
+               fields := [ {name := "p", ty := .tyCon "Maybe" [.tyCon "Point" []]} ]} ]}
+#guard dataDeclDeps ["Point"] rectListDecl  == ["Point"]
+#guard dataDeclDeps ["Point"] rectMaybeDecl == ["Point"]
+#guard (sortDataDecls [rectListDecl, pointDecl]).map (·.name) == ["Point", "RectList"]
+#guard (sortDataDecls [rectMaybeDecl, pointDecl]).map (·.name) == ["Point", "RectMaybe"]
+
+-- `dataDeclDeps` DEDUPLICATES. Consumers only test membership, so duplicates are
+-- harmless today — this pins the docstring's claim so it stays true. Without the
+-- `dedup` wrapper this returns `["Point", "Point"]`; every other guard in this
+-- block has at most one dependency per decl and so passes either way.
+def segDecl : DataDecl :=
+  {name := "Seg", kind := "data",
+   ctors := [ {name := "Seg",
+               fields := [ {name := "a", ty := .tyCon "Point" []},
+                           {name := "b", ty := .tyCon "Point" []} ]} ]}
+#guard dataDeclDeps ["Point"] segDecl == ["Point"]
+#guard (sortDataDecls [segDecl, pointDecl]).map (·.name) == ["Point", "Seg"]
+
+-- A self-recursive decl is NOT a dependency (Lean inductives are self-recursive
+-- by construction), so it must not deadlock the sort.
+def intListDecl : DataDecl :=
+  {name := "IntList", kind := "data",
+   ctors := [ {name := "Nil", fields := []},
+              {name := "Cons",
+               fields := [ {name := "hd", ty := .tyCon "Int" []},
+                           {name := "tl", ty := .tyCon "IntList" []} ]} ]}
+#guard dataDeclDeps ["IntList"] intListDecl == []
+#guard (sortDataDecls [intListDecl]).map (·.name) == ["IntList"]
+
+-- TOTALITY on a dependency CYCLE (mutually recursive records, which would need
+-- a Lean `mutual` block): every decl is still emitted, in dump order, so Lean
+-- fails loud on the forward reference. A sort that DROPPED a decl would be the
+-- one silent-wrong failure mode of this change — this is the pin against it.
+def mutADecl : DataDecl :=
+  {name := "A", kind := "data",
+   ctors := [ {name := "A", fields := [ {name := "getB", ty := .tyCon "B" []} ]} ]}
+def mutBDecl : DataDecl :=
+  {name := "B", kind := "data",
+   ctors := [ {name := "B", fields := [ {name := "getA", ty := .tyCon "A" []} ]} ]}
+#guard (sortDataDecls [mutADecl, mutBDecl]).length == 2
+#guard (sortDataDecls [mutADecl, mutBDecl]).map (·.name) == ["A", "B"]
+
+-- Totality fallback: pathological inputs (e.g. duplicate names) fall back to
+-- dump order rather than dropping decls. The `pending.filter (·.name != d.name)`
+-- step removes BOTH same-named decls while placing only one, so without the
+-- length check at the end of `sortDataDecls` this returns a single decl and the
+-- other is silently gone. GHC cannot emit two decls with one name; the guard is
+-- what makes the docstring's "always exactly the input decls" TRUE rather than
+-- merely claimed.
+def dupDeclA : DataDecl :=
+  {name := "Dup", kind := "data",
+   ctors := [ {name := "DupA", fields := [ {name := "ax", ty := .tyCon "Int" []} ]} ]}
+def dupDeclB : DataDecl :=
+  {name := "Dup", kind := "data",
+   ctors := [ {name := "DupB", fields := [ {name := "bx", ty := .tyCon "Bool" []} ]} ]}
+#guard (sortDataDecls [dupDeclA, dupDeclB]).length == 2
+-- …and the fallback hands back the INPUT, so both ctors survive in dump order.
+#guard (sortDataDecls [dupDeclA, dupDeclB]).flatMap (·.ctors.map (·.name))
+       == ["DupA", "DupB"]
+
+-- Whole-program pin for fix (A), with a manifest entry for the module's OWN
+-- type (`Point → RecordOps`) — exactly what transpile.sh passes: the field type
+-- must come out BARE (not `RecordOps.Point`), and `Point` must be declared
+-- before the `Rect` that uses it.
+def recordProg : Program :=
+  {binds := [], typeDecls := [rectDecl, pointDecl], instances := []}
+-- This guard also pins the INVARIANT "`resolveUserCtors` never runs on the data
+-- block" (pipeline step 3 in Emit.lean's Name-resolution post-passes header). The
+-- ctor `Rect` shares its type's name, and the `| Ctor ` needle matches the
+-- inductive's own constructor line verbatim — so if the ctor pass were ever
+-- applied to the data block, this line would come out
+-- `| Rect.Rect : Point → …` (and `Point` in field position would become
+-- `Point.Point`), splitting into 1 piece instead of 2.
+#guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn
+          "| Rect : Point → Int → Int → Rect").length == 2
+#guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "RecordOps.Point").length == 1
+#guard ((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "tyConOpaque").length == 1
+#guard (((emitFullProgram [("Point", "RecordOps")] recordProg).splitOn "inductive Rect").head!
+          |>.splitOn "inductive Point").length == 2
+
+-- BLASTER DATA POINT (from `lake build GhcCoreToLean.Generated.RecordOps` after
+-- the two fixes): all FIVE quantified record goals go through on the first try —
+-- `mkPoint_px`, `shiftX_moves`, `shiftX_keeps_py`, `resize_area`, and
+-- `topLeft_resize` (`px (topLeft (resize w h (Rect (Point 3 4) 1 1))) = 3`, the
+-- nested selector-through-update path, which also re-exercises fix (B) on a
+-- MULTI-LINE spec) — plus the `decide` list goal `xs_example`. Blaster also
+-- FALSIFIES the near-miss variants with real counterexamples (checked:
+-- `px (shiftX d (mkPoint x y)) = x` → d := 1; `py (mkPoint x y) = x` → x := 1,
+-- y := 0; `area (resize w h (Rect (Point 0 0) 1 1)) = w + h` → w := -1, h := 0;
+-- and `px (topLeft (resize w h (Rect (Point 3 4) 1 1))) = 4` → falsified with no
+-- variable assignment needed, since it is false for every w and h). So the ✅s
+-- are not vacuous: blaster is genuinely modelling construction, update and
+-- selection rather than discharging everything by reflexivity.
+
+/-! ## M2 Task 2 — coercion token -/
+
+-- OBSERVATIONS (read out of ghc-dump-core-0.2.1.0 and shim/Main.hs; NOT from a
+-- dump — no fixture produces a coercion yet, see the coverage note at the end).
+--
+--  1. There is NO `Cast` node in ghc-dump's AST at all. `GhcDump/Ast.hs` `Expr'`
+--     lists exactly EVar/EVarGlobal/ELit/EApp/ETyLam/ELam/ELet/ECase/ETick/
+--     EType/ECoercion, and `GhcDump/Convert.hs:233` is `Cast x _ -> cvtExpr x`
+--     — the cast is thrown away, only its body survives. So the shim can only
+--     ever see `ECoercion` (`Convert.hs:239`, `Coercion _ -> ECoercion`), and
+--     Parse.lean's `"Cast"` arm was never reachable from a real coercion; the
+--     one thing that DID reach it was the old shim's own
+--     `{"tag":"Cast","expr":{}}`, whose empty `expr` it could not parse (hard
+--     abort of the entire dump). Hence: shim now emits `{"tag":"Coercion"}`,
+--     and the legacy `"Cast"` arm degrades payload-free shapes to `.coercion`
+--     instead of aborting (exact enumeration at the PARSE guards below).
+--  2. `ECoercion` carries NO payload (nullary constructor) — there is nothing to
+--     round-trip, which is why `Expr.coercion` is an atom rather than wrapping a
+--     type or a pair of types.
+--  3. COERCION BINDERS arrive with role `.id`, i.e. they are NOT erased today.
+--     Chain: `Convert.cvtBinder` (Convert.hs:114-115) branches on `Var.isId`,
+--     and a GHC CoVar IS an Id → it emits `Binder{…}`, not `TyBinder{…}`;
+--     `cvtIdDetails` (Convert.hs:177) maps `IdInfo.CoVarId{} -> Ast.CoVarId`;
+--     `shim/Main.hs` `binderRole` (~line 150) only recognises `DFunId` plus a
+--     `$d`/`$f` NAME prefix, so `CoVarId` falls through to `"id"`. Therefore
+--     `Lower.isTypeOrDictBinder` says false, `\(co :: a ~R# b) -> …` survives
+--     lowering, and `emitExpr` produces `(fun co_N => …)`: a Lean abstraction
+--     over a value that does not exist. NOT IMPLEMENTED HERE (would be
+--     speculative — no dump exhibits it). Candidate Task 3 fix: teach
+--     `binderRole` about `CoVarId` (either `-> "dict"` or a new `"coercion"`
+--     role), which makes BOTH `isTypeOrDictBinder` and `isTypeOrDictArg` erase
+--     it for free. The guard below pins the Lean-side lowering of a role-`.id`
+--     binder as it arrives TODAY; it is INSENSITIVE to the shim-side fix (the
+--     role literal is hard-coded here) — the parse-layer tripwire below is what
+--     fires when Task 3 changes the shim. And that tripwire covers only ONE of
+--     the two candidate fixes: a NEW role string ("coercion") is rejected by
+--     `parseVarRole` today, so introducing it flips the tripwire, whereas
+--     mapping `CoVarId -> "dict"` reuses a string that already parses and that
+--     `isTypeOrDictBinder` already erases — NOTHING Lean-side moves, so this
+--     observation must then be re-verified by hand.
+
+-- A Coercion in ARGUMENT position erases like a type/dict arg: `f co` → `f`.
+-- `Expr` derives no `BEq` (see the deriving-free mutual block in AST.lean), so
+-- these compare emitted strings, like the `headApp`/`maximumApp` guards above.
+def coF : Var := {name := "f", unique := 1, ty := .tyCon "Int" [], role := .id}
+#guard emitExpr [] [] (Lower.lowerExpr (.app (.var coF) .coercion))
+       == emitExpr [] [] (Expr.var coF)
+#guard emitExpr [] [] (Lower.lowerExpr (.app (.var coF) .coercion)) == "f_1"
+-- …and it is erased, not merely emitted-as-nothing: the residue name is absent.
+#guard ((emitExpr [] [] (Lower.lowerExpr (.app (.var coF) .coercion))).splitOn
+          "coercionResidue").length == 1
+
+-- A SURVIVING bare coercion must be LOUD. `GHCCore.coercionResidue` is defined
+-- NOWHERE (Runtime.lean is namespace `Hs`), exactly like `GHCCore.typeArg`, so
+-- the generated file fails to elaborate rather than silently picking a value.
+#guard emitExpr [] [] Expr.coercion == "GHCCore.coercionResidue"
+
+-- Coercion BINDER, pinning observation 3: role `.id` ⇒ the lambda SURVIVES.
+-- Lean-side lowering ONLY: the role literal is hard-coded below, so this guard
+-- cannot notice Task 3's shim fix — the parse-layer tripwire further down can.
+def coBinder : Var := {name := "co", unique := 9, ty := .tyCon "~R#" [], role := .id}
+#guard emitExpr [] [] (Lower.lowerExpr (.lam coBinder .coercion))
+       == "(fun co_9 => GHCCore.coercionResidue)"
+
+-- PARSE (pure, `Except String Expr`, so guard-testable — no IO involved).
+def coTyJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "TyCon"), ("name", .str "Int"), ("args", .arr #[])]
+def coVarJson : Lean.Json :=
+  Lean.Json.mkObj [("name", .str "f"), ("unique", .num 1),
+                   ("type", coTyJson), ("role", .str "id")]
+-- TRIPWIRE for Task 3: today `parseVarRole` accepts exactly "id"/"tyVar"/"dict"
+-- (Parse.lean:13-19), so a var carrying role "coercion" is REJECTED. That
+-- function is `private` to Parse.lean, hence pinning it through `parseVar`,
+-- whose only other failure modes are shape errors — which is why the positive
+-- control on the SAME object with a known role is part of the guard, not
+-- decoration: without it this would pass equally well for a typo'd `unique`.
+-- If Task 3 introduces a "coercion" role this flips and the M2 Task 2
+-- observations above must be revisited. It does NOT fire for the other
+-- candidate fix (`CoVarId -> "dict"`), which changes only Haskell and reuses a
+-- string Lean already accepts and already erases — see observation 3.
+def coRoleVarJson (r : String) : Lean.Json :=
+  Lean.Json.mkObj [("name", .str "co"), ("unique", .num 9),
+                   ("type", coTyJson), ("role", .str r)]
+#guard (match parseVar (coRoleVarJson "coercion") with
+        | .ok _ => false | .error _ => true)
+#guard (match parseVar (coRoleVarJson "dict") with
+        | .ok _ => true  | .error _ => false)
+
+def coercionJson : Lean.Json := Lean.Json.mkObj [("tag", .str "Coercion")]
+def legacyCastJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"), ("expr", Lean.Json.mkObj [])]
+-- Note the two levels: the nested `expr` of a `Cast` is an *Expr* object
+-- (`{"tag":"Lit", …}`), whose `lit` field is the *Literal* object.
+def litExprJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Lit"),
+                   ("lit", Lean.Json.mkObj [("tag", .str "LitInt"), ("value", .num 7)])]
+def nestedCastJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"), ("expr", litExprJson)]
+def bogusCastJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"),
+                   ("expr", Lean.Json.mkObj [("tag", .str "Bogus")])]
+-- The remaining degrading shapes, so that EVERY case the enumeration below
+-- names is pinned by a guard rather than merely asserted: no `expr` field at
+-- all, an `expr` that is not an object, and an `expr` object whose `tag` is
+-- present but not a string (`legacyCastJson`'s `{}` covers the absent-`tag`
+-- case).
+def castNoExprJson : Lean.Json := Lean.Json.mkObj [("tag", .str "Cast")]
+def castNonObjExprJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"), ("expr", .num 5)]
+def castNonStrTagJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "Cast"),
+                   ("expr", Lean.Json.mkObj [("tag", .num 5)])]
+-- `f <arg>` as the shim would deliver it, for the COMPOSED parse→lower→emit path.
+def appCoJson (argJ : Lean.Json) : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "App"),
+                   ("fun", Lean.Json.mkObj [("tag", .str "Var"), ("var", coVarJson)]),
+                   ("arg", argJ)]
+-- Errors are folded into the string so a parse failure reports WHY, not just "≠".
+def parseEmit (j : Lean.Json) : String :=
+  match parseExpr j with
+  | .ok e    => emitExpr [] [] e
+  | .error m => s!"ERR: {m}"
+def parseLowerEmit (j : Lean.Json) : String :=
+  match parseExpr j with
+  | .ok e    => emitExpr [] [] (Lower.lowerExpr e)
+  | .error m => s!"ERR: {m}"
+
+#guard parseEmit coercionJson == "GHCCore.coercionResidue"
+-- The legacy `{"tag":"Cast","expr":{}}` no longer ABORTS (it used to fail with
+-- an "expected tag" error that killed the whole dump); it degrades to the atom.
+-- EXACTLY WHICH SHAPES DEGRADE — the single statement of this claim, which
+-- Parse.lean's `"Cast"` arm and observation 1 both point at: `expr` missing,
+-- `expr` present but not an object, and `expr` an object whose `tag` is absent
+-- or not a string. The last two degrade because `getTag` itself errors on them,
+-- not via any explicit shape check. This is DELIBERATE, not lenience-by-
+-- accident: the `"Cast"` tag has zero producers (observation 1), and a
+-- payload-free `Cast` is indistinguishable from a coercion token. A TAGGED
+-- `expr` engages the normal parser and stays LOUD — an unknown tag STRING, or a
+-- well-formed tag with a bad payload, propagates its error (loud guard below).
+#guard parseEmit legacyCastJson == "GHCCore.coercionResidue"
+#guard parseEmit castNoExprJson == "GHCCore.coercionResidue"
+#guard parseEmit castNonObjExprJson == "GHCCore.coercionResidue"
+#guard parseEmit castNonStrTagJson == "GHCCore.coercionResidue"
+-- A well-formed TAGGED nested `expr` still parses as `.cast` (transparent in
+-- emission) — backwards compatibility for any dump that does carry one.
+#guard parseEmit nestedCastJson == "(7 : Int)"
+-- …and the loud half: matched on the CONSTRUCTOR, not on the message text, so
+-- rewording a parse error does not break this guard.
+#guard (match parseExpr bogusCastJson with | .ok _ => false | .error _ => true)
+-- COMPOSED path, the guard that piecewise ones cannot replace: parse ∘ lower
+-- must erase the argument. `isTypeOrDictArg` has no `.cast` arm, so if Parse
+-- ever yielded `.cast .coercion` here instead of a bare `.coercion` the arg
+-- would NOT be erased and this would read `(f_1) (GHCCore.coercionResidue)`.
+#guard parseLowerEmit (appCoJson coercionJson) == "f_1"
+#guard parseLowerEmit (appCoJson legacyCastJson) == "f_1"
+
+-- COVERAGE NOTE: no fixture reaches any of this yet — 0 `"Cast"`/`"Coercion"`
+-- tags across all existing dumps, and the Ratio/RecordOps regression exercises
+-- none of the lines above (it only proves nothing else broke). These guards are
+-- the SOLE coverage of the new path, and they REMAIN so after Task 3: the
+-- newtype fixture did NOT trigger it either (0 `Cast`/0 `Coercion` in
+-- `NewtypeBasic` too — census in the M2 Task 3 block below), because ghc-dump
+-- discards the newtype cast before the shim can see it.
+
+/-! ## M2 Task 3 — newtype observation -/
+
+-- OBSERVATION (examples/haskell/NewtypeBasic.hs → /tmp/transpile-NewtypeBasic.json,
+-- GHC 9.2.7 pass-0000). The load-bearing M2 unknown: what shape does newtype
+-- wrap/unwrap have at pass-0000 as delivered through ghc-dump?
+--
+-- ANSWER: BOTH SIDES ARE ALREADY GONE. The three non-Typeable binds, verbatim
+-- from the dump in Task 1's house style (`@ty` = an erased type application):
+--
+--   mkAge_2131   :: Int -> Age         = \n_2135 -> n_2135
+--   getAge_2132  :: Age -> Int         = \ds_2348 -> ds_2348
+--   addAges_2133 :: Age -> Age -> Age
+--     = \a_2137 -> \b_2138 ->
+--         ((((GHC.Num.+_1300 @ty) GHC.Num.$fNumInt_2239) (getAge_2132 a_2137))
+--          (getAge_2132 b_2138))
+--
+-- (The other six binds are the `$trModule` / `$tcAge` / `$tc'Age` / `$krep`×3
+-- Typeable junk that `isJunkName` drops — same shape as RecordOps.)
+--
+--  (a) CONSTRUCTION `Age n` → the BARE VALUE `n_2135`. No ctor application, no
+--      cast, no coercion, no wrapper of any kind. This is M2 Task 2's
+--      observation 1 in action: GHC wraps `n` in a `Cast`, and
+--      `GhcDump/Convert.hs:233` (`Cast x _ -> cvtExpr x`) throws the cast away
+--      before the shim runs, leaving only the body.
+--  (b) PATTERN `getAge (Age n) = n` → NO case at all: `\ds_2348 -> ds_2348`.
+--      Not a case on the `Age` ctor, not a `let`. GHC compiles a newtype match
+--      to a cast of the scrutinee too, so the same `Convert.hs:233` erasure
+--      removes it. (The binder is GHC's `ds`, as with RecordOps' selectors.)
+--  (c) COERCION tokens: ZERO of them — see the census.
+--  (d) `.transpile-sandbox/.decls/NewtypeBasic.decls.json` (note the `.decls/`
+--      subdirectory — the plan's path is stale), verbatim and complete:
+--        {"instances":[],"module":"NewtypeBasic","typeDecls":[{"constructors":
+--         [{"fields":[{"name":"_","type":{"args":[],"name":"Int","tag":"TyCon"}}],
+--          "name":"Age"}],"kind":"newtype","name":"Age"}]}
+--      `"kind":"newtype"` is present, exactly the field Task 4 filters on, with
+--      one ctor carrying one field. That field's `name` is `"_"` — the decl
+--      plugin's placeholder for an UNNAMED field (contrast RecordOps, whose
+--      fields carry real labels `px`/`topLeft`). So Task 4's "single ctor's
+--      single field" underlying-type lookup yields `Int` here, and its
+--      ≠1-ctor / ≠1-field malformed-dump error path is UNEXERCISED by this
+--      fixture (`newtype`s cannot have either shape in Haskell, so only a
+--      corrupt sidecar reaches it).
+--
+-- TAG CENSUS — every `"tag"` PRESENT in this dump, with counts: TyCon ×49,
+-- App ×32, Var ×28, Lit ×10, NonRec ×9, TyFun ×4, Lam ×4, LitString ×4,
+-- LitWord ×4, Type ×3, LitInt ×2 (11 distinct tags).
+-- ABSENT: `Cast` ×0, `Coercion` ×0, `Let` ×0, `Case` ×0, `DataAlt` ×0, `Rec` ×0.
+--   * `Case` ×0 / `DataAlt` ×0 is result (b) stated as a negative: this dump
+--     contains no pattern match anywhere. POSITIONAL CENSUS of the name `Age`,
+--     which is what selects the plan's decision rule: 0 occurrences as a `Var`
+--     name (the Var names are exactly n, ds, a, b, getAge, $trModule, $tcAge,
+--     $krep, GHC.Num.+, GHC.Num.$fNumInt and the GHC.Types Typeable ctors),
+--     0 occurrences as a `DataAlt` name, and 11 occurrences as `TyCon "Age"`.
+--     Every single `Age` in the Core is a TYPE reference — which is the whole of
+--     Task 4's remaining work, and nothing at the value level.
+--   * `Cast` ×0 / `Coercion` ×0 CLOSES the newtype half of Task 1's scope
+--     sentence ("newtype fields, strict fields and GND-derived selectors are
+--     Task 2-3's probes for it"): a monomorphic, non-GND newtype yields neither,
+--     because its coercions live only inside `Cast` nodes that never reach the
+--     shim. STILL UNPROBED, explicitly not closed: strict fields, GND-derived
+--     instances, and coercion VALUES. So M2 Task 2's `ECoercion` plumbing has
+--     no fixture coverage still.
+--   * `Lam` ×4 = the four value binders (n, ds, a, b), ALL role `"id"`. No
+--     `\(co :: a ~R# b) -> …` binder appeared — the direct negative for M2 Task
+--     2's observation 3, which is therefore still unexercised. The shim was NOT
+--     touched by this task (`binderRole` unchanged, no `CoVarId` arm), so no
+--     re-verification of that observation is owed.
+--
+-- DECISION RULE APPLIED: the plan's FIRST rule — "ghc-dump already erased
+-- wrap/unwrap ⇒ nothing to do at value level". Consequently NOTHING was
+-- implemented: no shim change, no `dataConMap` arm for `Age`, no program-derived
+-- unwrapping-ctor set, `lowerProgram`'s signature untouched. The guards below
+-- pin that negative so a later task cannot quietly assume the mechanism exists.
+
+-- The two observed spines, reconstructed exactly as the dump delivers them
+-- (uniques included). The EXISTING pipeline already emits identity — there is
+-- no newtype-aware step anywhere in it.
+def ntN  : Var := {name := "n",  unique := 2135, ty := .tyCon "Int" [], role := .id}
+def ntDs : Var := {name := "ds", unique := 2348, ty := .tyCon "Age" [], role := .id}
+#guard emitExpr [] [] (Lower.lowerExpr (.lam ntN (.var ntN)))   == "(fun n_2135 => n_2135)"
+#guard emitExpr [] [] (Lower.lowerExpr (.lam ntDs (.var ntDs))) == "(fun ds_2348 => ds_2348)"
+
+-- No static-list hack: `Age` is NOT an unwrapping data con. If a later task
+-- reaches for the tempting one-line "fix" (adding it beside `I#`/`W#`/`C#`),
+-- this fires and forces the program-derived-set question the plan raises.
+#guard isUnwrappingDataCon "Age" == false
+
+-- …and no program-derived set was threaded through lowering. A type ascription
+-- rather than a `#guard`, because the plan's rule-3 mechanism would change
+-- exactly this signature: that change stops this line compiling, forcing the
+-- observations above to be re-read first.
+example : CoreProgram → CoreProgram := Lower.lowerProgram
+
+-- HEDGE. The whole negative result rests on GHC + ghc-dump doing the erasure
+-- for us, so pin what happens if a future compiler/flag combination stops. Both
+-- unimplemented positions route through `ctorNames` + `resolveUserCtors`, and
+-- Task 4 removed newtypes from BOTH sets, so a surviving newtype ctor now emits
+-- as an ordinary unknown reference: `Age_9` (a Var that is no longer a top-level
+-- name, hence the `_<unique>` suffix) in value position, bare `| Age …` in
+-- pattern position. Neither identifier exists — the `inductive` is suppressed —
+-- so both are loud, and no identity arm was invented for either. That is also
+-- the concrete reason the plan's "no global `dataConMap` arm" rule costs nothing.
+-- RE-POINTED BY TASK 4 (the pre-erasure strings were `(Age.Age) (n_2135)` and
+-- `| Age.Age n_2135 =>`, both produced by qualification against a then-emitted
+-- `inductive Age`). The `emitDataDecl` guard after them was NOT re-pointed:
+-- suppression lives at `emitFullProgram`'s `datas` map, not inside
+-- `emitDataDecl`, which still renders any decl it is handed.
+def ageNewtypeDecl : DataDecl :=
+  {name := "Age", kind := "newtype",
+   ctors := [ {name := "Age", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
+def ageCtorV : Var := {name := "Age", unique := 9, ty := .tyCon "Age" [], role := .id}
+def mkAgeV : Var :=
+  {name := "mkAge", unique := 2131,
+   ty := .tyFun (.tyCon "Int" []) (.tyCon "Age" []), role := .id}
+def hypValueProg : Program :=
+  { binds := [.nonRec mkAgeV (.lam ntN (.app (.var ageCtorV) (.var ntN)))],
+    typeDecls := [ageNewtypeDecl], instances := [] }
+#guard ((emitFullProgram [] hypValueProg).splitOn "(Age_9) (n_2135)").length == 2
+def ntWild  : Var := {name := "wild", unique := 0, ty := .tyCon "Age" [], role := .id}
+def getAgeV : Var :=
+  {name := "getAge", unique := 2132,
+   ty := .tyFun (.tyCon "Age" []) (.tyCon "Int" []), role := .id}
+def hypPatBody : Expr :=
+  .lam ntDs (.case_ (.var ntDs) ntWild (.tyCon "Int" [])
+              [.mk (.dataCon "Age") [ntN] (.var ntN)])
+def hypPatProg : Program :=
+  { binds := [.nonRec getAgeV hypPatBody],
+    typeDecls := [ageNewtypeDecl], instances := [] }
+#guard ((emitFullProgram [] hypPatProg).splitOn "| Age n_2135 => n_2135").length == 2
+
+-- The DECL side. `emitDataDecl` still reads no `kind` — hand it a newtype and it
+-- renders an `inductive` — because Task 4's suppression is a FILTER on the decls
+-- reaching it (`emitFullProgram`'s `datas` map), not a case inside it. The Task 4
+-- section's emission guard pins the other half: that filter never hands it one.
+#guard ((emitDataDecl false false ageNewtypeDecl).splitOn "inductive Age where").length == 2
+
+-- E2E RESOLUTION of the status recorded above: with Task 4's erasure in place
+-- `GhcCoreToLean.Generated.NewtypeBasic` builds and `addAges_sum` is `✅ Valid`,
+-- which confirms hand-check (i) of error 4's cascade diagnosis.
+
+-- E2E STATUS — `lake build GhcCoreToLean.Generated.NewtypeBasic` FAILS, exactly
+-- as the plan stages it. ALL FOUR errors, verbatim, against the generated file
+-- (`inductive Age`; `def mkAge (n_2135 : Int) : Age := n_2135`;
+-- `def getAge (ds_2348 : Age) : Int := ds_2348`;
+-- `def addAges (a_2137 : Age) (b_2138 : Age) : Age := …`):
+--
+--   19:2  Type mismatch / n_2135 has type Int but is expected to have type Age
+--   22:2  Type mismatch / ds_2348 has type Age but is expected to have type Int
+--   25:5  failed to synthesize / HAdd Int Int Age
+--   27:88 translateType: unexpected sort type
+--         Lean.Expr.sort (Lean.Level.succ (Lean.Level.zero))
+--
+-- Errors 1-3 are the type-level `Age` reference and nothing else: the VALUES are
+-- already the erased identities the plan wants, and only the SIGNATURES still
+-- say `Age`. Note the failure MODE — `inductive Age` elaborates fine, so these
+-- are type MISMATCHES, not unknown identifiers.
+-- Error 4 (the theorem) is a CASCADE of errors 1-3, not an independent blaster
+-- limitation. Checked by hand, three scratch modules: (i) the Task-4-expected
+-- shape (`Age` erased, `mkAge`/`getAge` identities on `Int`) → `✅ Valid`;
+-- (ii) `Age` KEPT as an inductive with well-typed bodies (`Age.Age n` /
+-- `match`) → also `✅ Valid`, so blaster handles the single-field inductive
+-- perfectly well; (iii) `Age` kept with `sorry` bodies (standing in for the
+-- errored defs, which elaborate to `sorryAx`) → reproduces error 4's message
+-- CHARACTER FOR CHARACTER. `sorryAx`'s first explicit argument is a `Type`, and
+-- blaster's `translateType` rejects a sort — hence "unexpected sort type".
+-- Consequence for Task 4: the erasure is needed to make the emitted VALUES
+-- typecheck, NOT to make blaster cope with the inductive.
+--
+-- One extra Task-4 hazard observed while checking this, currently DORMANT. The
+-- shared manifest for this module is `Age\tNewtypeBasic`
+-- (`scripts/transpile_graph.py manifest .transpile-sandbox/.decls NewtypeBasic`),
+-- yet the generated file says bare `Age`, never `NewtypeBasic.Age`: the
+-- self-entry is dead because `resolveUserTypes` and `resolveExternalTypes`
+-- consume the SAME needle `(GHCCore.tyConOpaque "Age")` and the user pass runs
+-- first (`Emit.lean`, `resolveSpecText`/`emitFullProgram`). The moment Task 4
+-- drops newtypes from the user decl set, that entry goes LIVE and rewrites
+-- `Age` → `NewtypeBasic.Age` (a type that no longer exists) — which is exactly
+-- why Task 4 Step 3's manifest suppression is not optional.
+
+/-! ## M2 Task 4 — newtype erasure -/
+
+-- The pass itself. `resolveNewtypes` rewrites the OPAQUE spelling of a newtype
+-- tycon to its underlying type, running after `resolveUserTypes` (whose decl set
+-- excludes newtypes precisely so this needle survives) and before
+-- `resolveUserCtors`.
+#guard resolveNewtypes [("Age", "Int")] "(x : (GHCCore.tyConOpaque \"Age\"))" == "(x : Int)"
+-- NO SUBSTRING BLEED: the needle is the whole opaque form, so a name that merely
+-- CONTAINS the newtype's name is untouched (the `"` delimiter does the work).
+#guard resolveNewtypes [("Age", "Int")] "(GHCCore.tyConOpaque \"Wage\")"
+       == "(GHCCore.tyConOpaque \"Wage\")"
+-- …and the reverse containment (`Age` a suffix of `Wage`) is equally blocked, so
+-- neither direction depends on which name is declared.
+#guard resolveNewtypes [("Wage", "Int")] "(GHCCore.tyConOpaque \"Age\")"
+       == "(GHCCore.tyConOpaque \"Age\")"
+-- Every occurrence in a string is rewritten (a signature mentions the newtype
+-- once per argument), and a type with no newtype in it is returned unchanged.
+#guard resolveNewtypes [("Age", "Int")]
+         "((GHCCore.tyConOpaque \"Age\") → (GHCCore.tyConOpaque \"Age\"))"
+       == "(Int → Int)"
+#guard resolveNewtypes [] "(x : Int)" == "(x : Int)"
+
+-- EXTRACTION, well-formed branch: one ctor, one field, underlying type as
+-- `emitType` renders it. The field NAME is the decl-plugin's `_` placeholder for
+-- an unnamed field (M2 Task 3 observation (d)) and is deliberately not read.
+#guard newtypeDecls [ageNewtypeDecl] == [("Age", "Int")]
+#guard newtypeDecls [pointDecl] == []          -- `kind == "data"` ⇒ never erased
+-- (`DataDecl` derives no `BEq`, so the kept set is compared by name.)
+#guard (keptTypeDecls [ageNewtypeDecl, pointDecl]).map (·.name) == ["Point"]
+
+-- EXTRACTION, malformed branch. Haskell admits neither shape, so only a corrupt
+-- sidecar reaches here; both are left UNERASED, which means `keptTypeDecls` keeps
+-- them and every suppression site treats them as ordinary data. That is loud
+-- rather than silent: GHC has already erased the value level, so identity bodies
+-- against a surviving inductive are type mismatches (exactly the pre-Task-4
+-- failure recorded in the Task 3 block above). No `panic!`, no invented recovery.
+def badNewtypeTwoCtors : DataDecl :=
+  {name := "Bad2", kind := "newtype",
+   ctors := [ {name := "B1", fields := [ {name := "_", ty := .tyCon "Int" []} ]},
+              {name := "B2", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
+def badNewtypeTwoFields : DataDecl :=
+  {name := "BadF", kind := "newtype",
+   ctors := [ {name := "BadF", fields := [ {name := "_", ty := .tyCon "Int" []},
+                                           {name := "_", ty := .tyCon "Bool" []} ]} ]}
+def badNewtypeNoFields : DataDecl :=
+  {name := "BadN", kind := "newtype", ctors := [ {name := "BadN", fields := []} ]}
+#guard newtypeDecls [badNewtypeTwoCtors]  == []
+#guard newtypeDecls [badNewtypeTwoFields] == []
+#guard newtypeDecls [badNewtypeNoFields]  == []
+#guard (keptTypeDecls [badNewtypeTwoCtors, ageNewtypeDecl]).map (·.name) == ["Bad2"]
+-- The malformed decl therefore still emits its `inductive` — pre-Task-4 behavior
+-- verbatim — while a well-formed newtype beside it is suppressed.
+#guard ((emitFullProgram []
+          {binds := [], typeDecls := [badNewtypeTwoCtors, ageNewtypeDecl],
+           instances := []}).splitOn "inductive Bad2 where").length == 2
+
+-- NESTED underlying type. `emitType` renders `[Int]` by JUXTAPOSITION (`List
+-- Int`, unbracketed — see `Maps.parenArg`), and the hole the opaque needle leaves
+-- can be an application ARGUMENT, so the substitution must bracket it or
+-- `List (GHCCore.tyConOpaque "Ages")` becomes the ill-typed `List List Int`.
+#guard emitType (.tyCon "List" [.tyCon "Int" []]) == "List Int"
+def agesNewtypeDecl : DataDecl :=
+  {name := "Ages", kind := "newtype",
+   ctors := [ {name := "Ages",
+               fields := [ {name := "_", ty := .tyCon "List" [.tyCon "Int" []] } ]} ]}
+#guard newtypeDecls [agesNewtypeDecl] == [("Ages", "List Int")]
+#guard resolveNewtypes [("Ages", "List Int")] "(xs : (GHCCore.tyConOpaque \"Ages\"))"
+       == "(xs : (List Int))"
+#guard resolveNewtypes [("Ages", "List Int")] "(List (GHCCore.tyConOpaque \"Ages\"))"
+       == "(List (List Int))"
+-- An underlying type `emitType` ALREADY brackets is not double-bracketed
+-- (`(Int × Int)`, `(Int → Int)`) — the same closed-set invariant `parenArg` rests on.
+#guard emitType (.tyCon "(,)" [.tyCon "Int" [], .tyCon "Int" []]) == "(Int × Int)"
+#guard resolveNewtypes [("Pair", "(Int × Int)")] "(p : (GHCCore.tyConOpaque \"Pair\"))"
+       == "(p : (Int × Int))"
+
+-- EMISSION MAP: a program whose only type decl is a newtype emits NO inductive
+-- for it, and its ctor is not qualified (both halves of the suppression).
+#guard ((emitFullProgram [] hypValueProg).splitOn "inductive").length == 1
+#guard ((emitFullProgram [] hypValueProg).splitOn "Age.Age").length == 1
+-- …and the erasure reaches the SIGNATURE, which is the whole point: `mkAge`'s
+-- `Int → Age` becomes `Int → Int`. (The body is the loud `Age_9` hedge above —
+-- this guard is about the type, which no longer mentions `Age` at all.)
+#guard ((emitFullProgram [] hypValueProg).splitOn "(n_2135 : Int) : Int").length == 2
+#guard ((emitFullProgram [] hypValueProg).splitOn "tyConOpaque").length == 1
+
+-- SORT-INPUT CONSTRAINT (the pipeline header's chain, `Point` → `Wrapper`
+-- (newtype) → `Q`): the newtype must stay in `sortDataDecls`' input or the
+-- `Point`-needs-`Q` edge is lost and `Point` can be emitted before `Q`.
+def qDecl : DataDecl :=
+  {name := "Q", kind := "data",
+   ctors := [ {name := "Q", fields := [ {name := "qv", ty := .tyCon "Int" []} ]} ]}
+def wrapperNtDecl : DataDecl :=
+  {name := "Wrapper", kind := "newtype",
+   ctors := [ {name := "Wrapper", fields := [ {name := "_", ty := .tyCon "Q" []} ]} ]}
+def pointWrapDecl : DataDecl :=
+  {name := "PointW", kind := "data",
+   ctors := [ {name := "PointW", fields := [ {name := "w", ty := .tyCon "Wrapper" []} ]} ]}
+-- The sort sees the chain transitively, from the dump order that breaks naively.
+#guard (sortDataDecls [pointWrapDecl, wrapperNtDecl, qDecl]).map (·.name)
+       == ["Q", "Wrapper", "PointW"]
+-- `newtypeSubsts` pre-resolves the underlying string through `resolveUserTypes`:
+-- `emitType` gives `(GHCCore.tyConOpaque "Q")` for a LOCAL data type, and pass 1
+-- has already run over the text this gets spliced into, so splicing it raw would
+-- leave a live needle for `resolveExternalTypes` to rewrite to a nonexistent `M.Q`.
+#guard newtypeDecls  [pointWrapDecl, wrapperNtDecl, qDecl]
+       == [("Wrapper", "(GHCCore.tyConOpaque \"Q\")")]
+#guard newtypeSubsts [pointWrapDecl, wrapperNtDecl, qDecl] == [("Wrapper", "Q")]
+-- End to end over the chain: `Q` and `PointW` emit (in dependency order), the
+-- newtype does not, `PointW`'s field is the erased `Q`, and no needle survives.
+def chainProg : Program :=
+  { binds := [], typeDecls := [pointWrapDecl, wrapperNtDecl, qDecl], instances := [] }
+#guard ((emitFullProgram [] chainProg).splitOn "inductive").length == 3
+#guard ((emitFullProgram [] chainProg).splitOn "inductive Wrapper").length == 1
+#guard ((emitFullProgram [] chainProg).splitOn "| PointW : Q → PointW").length == 2
+#guard ((emitFullProgram [] chainProg).splitOn "tyConOpaque").length == 1
+#guard (emitFullProgram [] chainProg).splitOn "inductive Q where" |>.head!.isEmpty  -- Q first
+
+-- CHAINED NEWTYPES (`newtype A = A B` where `B` is itself a newtype).
+-- `newtypeSubsts` saturates the MAP with fuel = #newtypes, so the result is the
+-- same for either dump order — a single fold over the source would resolve `A`
+-- only when it happened to precede `B`.
+def ntBDecl : DataDecl :=
+  {name := "NB", kind := "newtype",
+   ctors := [ {name := "NB", fields := [ {name := "_", ty := .tyCon "Int" []} ]} ]}
+def ntADecl : DataDecl :=
+  {name := "NA", kind := "newtype",
+   ctors := [ {name := "NA", fields := [ {name := "_", ty := .tyCon "NB" []} ]} ]}
+#guard newtypeSubsts [ntADecl, ntBDecl] == [("NA", "Int"), ("NB", "Int")]
+#guard newtypeSubsts [ntBDecl, ntADecl] == [("NB", "Int"), ("NA", "Int")]
+-- A recursive newtype (`newtype R = R R`) is legal Haskell and has no underlying
+-- type to erase to; self-references are excluded from the saturation, so it
+-- terminates and leaves the needle in place — loud, not divergent.
+def ntRDecl : DataDecl :=
+  {name := "R", kind := "newtype",
+   ctors := [ {name := "R", fields := [ {name := "_", ty := .tyCon "R" []} ]} ]}
+#guard newtypeSubsts [ntRDecl] == [("R", "(GHCCore.tyConOpaque \"R\")")]
+
+-- SPEC TEXT (pass site 3): the transpiler-emitted opaque form erases there too,
+-- while a hand-written `Age` in theorem text is NOT rewritten — properties on a
+-- newtype are written against the underlying type, and anything else fails loud.
+#guard resolveSpecText [ageNewtypeDecl] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int"
+       == "(a : Int) → Int"
+#guard resolveSpecText [ageNewtypeDecl] [] "∀ (a : Age), getAge (mkAge a) = a"
+       == "∀ (a : Age), getAge (mkAge a) = a"
+-- The ext-types manifest carries no entry for an erased newtype
+-- (`scripts/transpile_graph.py` skips `kind == "newtype"`), but even if a stale
+-- one is passed in, pass 2 has already consumed the needle — this pins that the
+-- self-entry hazard recorded in the Task 3 block is closed at BOTH ends.
+#guard resolveSpecText [ageNewtypeDecl] [("Age", "NewtypeBasic")]
+         "(a : (GHCCore.tyConOpaque \"Age\")) → Int"
+       == "(a : Int) → Int"
+
+-- ZERO CHURN for newtype-free programs: with no newtype decl, `newtypeSubsts` is
+-- empty and every pass is the identity it was before Task 4.
+#guard newtypeSubsts [pointDecl, rectDecl] == []
+#guard resolveSpecText [rectDecl, pointDecl] []
+         "area (resize w h (Rect (Point 0 0) 1 1)) = w * h"
+       == "area (resize w h (Rect.Rect (Point.Point 0 0) 1 1)) = w * h"
+
+/-! ## M2 Task 5 — newtype-instance loud-fail guard -/
+
+-- ANY instance MENTIONING a newtype anywhere in its head types — head position or
+-- nested in an argument — is REFUSED (loud): erasure cannot
+-- represent it, and derived-vs-hand-written is indistinguishable in `tcg_insts`
+-- (GND instances carry no `$c` methods to sniff). Relaxable later via a
+-- decl-plugin origin dump.
+--
+-- OBSERVED at HEAD before this guard existed — both shapes built with ZERO
+-- diagnostics, which is why the guard is soundness-critical and not a
+-- representability nicety:
+--
+--   (a) `newtype Mod7 = Mod7 Int` + hand-written `Eq Mod7` (`a mod 7 == b mod 7`)
+--       emitted, inside `namespace Mod7Probe`:
+--         instance : BEq Int where
+--           beq := _dollar_c_eq__eq__3186     -- the mod-7 function
+--       i.e. the Eq RELOCATED onto `Int`. Canary: `example : ((1 : Int) == 8) =
+--       false := by decide` → "Tactic `decide` proved that the proposition
+--       (1 == 8) = false is false". Every `==` on Int in the module — theorem text
+--       included — silently meant mod-7.
+--   (b) `newtype Coin = Coin Int` + `instance Ord Coin where compare (Coin a)
+--       (Coin b) = compare b a` (REVERSED) emitted no Ord anything: `ordTypes`
+--       matched the opaque head so `isSuppressedMethod` dropped all nine `$c`
+--       defs, and the newtype was filtered out of `datas` so no `deriving Ord`
+--       replaced them. `richer a b = a > b` came out as
+--       `(fun a b => decide (a > b))` on plain Int — the OPPOSITE order from the
+--       Haskell, with the user's `compare` nowhere in the file.
+--
+--   (c) `newtype Celsius = Celsius Int` + `instance Eq (Celsius, Celsius)` —
+--       ARGUMENT position, which the FIRST version of this guard (head-tycon only)
+--       still let through. See the argument-position block below for the observed
+--       output and the false theorem it made provable.
+--
+-- All three are silent-wrong; the guard now makes them exit 1 before anything is
+-- written. `examples/haskell/NewtypeInstances.hs` is the committed negative
+-- fixture (excluded from the green-regression list).
+
+def eqAgeInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Age" []], dfunName := "$fEqAge", dfunUnique := 0}
+def eqPointInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Point" []], dfunName := "$fEqPoint", dfunUnique := 0}
+
+-- A violation is detected…
+#guard newtypeInstanceViolations [eqAgeInst] [ageNewtypeDecl] == [("Eq", "Age")]
+-- …and an instance on a DATA type is not flagged (the guard must not over-fire:
+-- `Arithmetic`'s hand-written `Eq CustomRatio` has to keep working).
+#guard newtypeInstanceViolations [eqPointInst] [ageNewtypeDecl, pointDecl] == []
+-- ZERO CHURN: a newtype-free decl set, and an instance-free program, are both `[]`.
+#guard newtypeInstanceViolations [eqPointInst] [pointDecl, rectDecl] == []
+#guard newtypeInstanceViolations [] [ageNewtypeDecl] == []
+
+-- KEYED OFF ALL NEWTYPE DECLS, not the erased-pair list: a MALFORMED newtype does
+-- not erase (`newtypeDecls` skips it, `keptTypeDecls` keeps it) yet an instance on
+-- it is just as unrepresentable — GHC has still erased its value level — so it is
+-- still refused. `newtypeNames` is the key, deliberately not `newtypeDecls`.
+#guard newtypeDecls [badNewtypeTwoCtors] == []
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "Bad2" []],
+           dfunName := "$fEqBad2", dfunUnique := 0}]
+         [badNewtypeTwoCtors] == [("Eq", "Bad2")]
+#guard newtypeNames [ageNewtypeDecl, pointDecl, badNewtypeTwoCtors] == ["Age", "Bad2"]
+
+-- EVERY head type is scanned, not just `headTypes.head?`: a multi-parameter class
+-- whose SECOND parameter is the newtype is equally unrepresentable.
+#guard newtypeInstanceViolations
+         [{className := "Convert", headTypes := [.tyCon "Int" [], .tyCon "Age" []],
+           dfunName := "$fConvertIntAge", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("Convert", "Age")]
+-- Ord — shape (b) above, the silently-DROPPED one — is caught by the same rule;
+-- nothing about the guard is Eq-specific, and both instances of a two-instance
+-- type are reported.
+#guard newtypeInstanceViolations
+         [{className := "Ord", headTypes := [.tyCon "Age" []],
+           dfunName := "$fOrdAge", dfunUnique := 0}, eqAgeInst]
+         [ageNewtypeDecl] == [("Ord", "Age"), ("Eq", "Age")]
+
+-- ARGUMENT POSITION, formerly a recorded scope limit and in fact SILENT-WRONG:
+-- head-only detection read `instance Eq (Maybe Age)` as head `Maybe` and let it
+-- through. Detection is now STRUCTURAL, so a newtype nested anywhere in a head
+-- type is flagged.
+--
+-- OBSERVED on the pre-fix binary (`f323c5f`), the reason this is a soundness fix
+-- and not a completeness nicety. `newtype Celsius = Celsius Int` +
+-- `instance {-# OVERLAPPING #-} Eq (Celsius, Celsius) where
+--    (Celsius a, _) == (Celsius b, _) = a == b`
+-- transpiled with exit 0 and EMPTY stderr, emitting inside the module namespace:
+--     def _dollar_c_eq__eq__3286 (ds_3425 : (Int × Int)) (ds_3426 : (Int × Int)) : Bool := …
+--     instance : BEq (Int × Int) where
+--       beq := _dollar_c_eq__eq__3286        -- compares FIRST COMPONENTS ONLY
+-- i.e. Eq relocated onto `Int × Int`, so
+--     theorem _ : (((1,2) : Int × Int) == ((1,3) : Int × Int)) = true := by decide
+-- BUILT (`lake build` succeeded). Every `==` on a pair of Ints in the module,
+-- theorem text included, silently meant "first components equal".
+--
+-- The shape below is exactly what the shim dumps for that head:
+-- `.tyCon "(,)" [.tyCon "Celsius" [], .tyCon "Celsius" []]` — unqualified inner
+-- names, matching `newtypeNames`. Reported ONCE despite two mentions (dedup).
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "(,)" [.tyCon "Age" [], .tyCon "Age" []]],
+           dfunName := "$fEq(,)", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("Eq", "Age")]
+-- …the `Maybe`-argument shape that the old comment pinned as UNFLAGGED.
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "Maybe" [.tyCon "Age" []]],
+           dfunName := "$fEqMaybeAge", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("Eq", "Age")]
+-- …either side of a function arrow (`instance C (Age -> Int)`, `instance C (Int -> Age)`)…
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyFun (.tyCon "Age" []) (.tyCon "Int" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyFun (.tyCon "Int" []) (.tyCon "Age" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+-- …either side of a curried `.tyApp` (the un-saturated dump shape)…
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyApp (.tyCon "Maybe" []) (.tyCon "Age" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+-- …and under a `∀`.
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.forAll "a" (.tyCon "Maybe" [.tyCon "Age" []])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == [("C", "Age")]
+-- NO OVER-FIRE: a DATA type in each of those same positions is still fine. This
+-- is what keeps `Hs.splitAt`-style pair types and `Arithmetic`'s hand-written
+-- `Eq CustomRatio` working — the recursion must be newtype-keyed, not tuple-shy.
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "(,)" [.tyCon "Point" [], .tyCon "Point" []]],
+           dfunName := "$fEq(,)", dfunUnique := 0}]
+         [ageNewtypeDecl, pointDecl] == []
+#guard newtypeInstanceViolations
+         [{className := "Eq", headTypes := [.tyCon "Maybe" [.tyCon "Point" []]],
+           dfunName := "$fEqMaybePoint", dfunUnique := 0}]
+         [ageNewtypeDecl, pointDecl] == []
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyFun (.tyCon "Point" []) (.tyCon "Int" [])],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl, pointDecl] == []
+-- Type VARIABLES and type LITERALS are not names to match against either.
+#guard newtypeInstanceViolations
+         [{className := "C", headTypes := [.tyCon "Maybe" [.tyVar "Age"], .tyLit (.nat 7)],
+           dfunName := "$fC", dfunUnique := 0}]
+         [ageNewtypeDecl] == []
+
+-- DEDUP is per (class, newtype) PAIR, not per newtype: a head mentioning the same
+-- newtype twice reports once (above), while two DIFFERENT newtypes in one head
+-- still report both, in dump order.
+#guard newtypeInstanceViolations
+         [{className := "Convert",
+           headTypes := [.tyCon "(,)" [.tyCon "Age" [], .tyCon "Bad2" []]],
+           dfunName := "$fConvert", dfunUnique := 0}]
+         [ageNewtypeDecl, badNewtypeTwoCtors] == [("Convert", "Age"), ("Convert", "Bad2")]
+
+-- ORPHAN INSTANCES (was a recorded scope limit here; CLOSED by Task 6, which had
+-- to close it — see that section for the observed refusal). With no local decls
+-- and no imported-newtype names, the newtype set is empty and nothing is reported:
+-- this pins that the empty-set path is total (no crash).
+#guard newtypeInstanceViolations [eqAgeInst] [] == []
+-- The loudness of THAT configuration rests on the needle surviving into the
+-- generated Lean, where `GHCCore.tyConOpaque` is undefined (nothing in
+-- `GhcCoreToLean/Runtime.lean` declares it). Task 6 OBSERVED that failure verbatim
+-- for a newtype the manifest cannot carry:
+--   error: …/NtUserUnderClient.lean:13:23: Unknown identifier `GHCCore.tyConOpaque`
+-- But once the manifest DOES carry the newtype, the needle is erased and the same
+-- input would silently relocate the instance — so the guard now takes the imported
+-- names too (Task 6 section).
+
+-- The message names the class, the newtype, the underlying type and the remedy.
+#guard ((newtypeInstanceError [ageNewtypeDecl] ("Eq", "Age")).splitOn "instance Eq Age").length == 2
+#guard ((newtypeInstanceError [ageNewtypeDecl] ("Eq", "Age")).splitOn
+         "underlying type `Int`").length == 2
+-- …and degrades honestly for a malformed newtype, which has no underlying type to
+-- name (the `newtypeSubsts` lookup misses).
+#guard ((newtypeInstanceError [badNewtypeTwoCtors] ("Eq", "Bad2")).splitOn
+         "malformed dump").length == 2
+
+-- MALFORMED-NEWTYPE diagnostic (WARNING, not error — Haskell admits neither
+-- shape, so only a corrupt sidecar reaches it, and the downstream Lean type
+-- mismatch is already loud; erroring would newly refuse input that transpiles).
+#guard malformedNewtypes [ageNewtypeDecl, pointDecl] == []
+#guard malformedNewtypes
+         [badNewtypeTwoCtors, badNewtypeTwoFields, badNewtypeNoFields, ageNewtypeDecl]
+       == ["Bad2", "BadF", "BadN"]
+#guard ((malformedNewtypeWarning "Bad2").splitOn "Bad2").length == 2
+#guard ((malformedNewtypeWarning "Bad2").splitOn "FAIL to typecheck").length == 2
+
+/-! ## M2 Task 6 — cross-module records & newtypes (`RecordClient.hs`) -/
+
+-- OBSERVED (`/tmp/transpile-RecordClient.json`, GHC 9.2.7 pass-0000, module
+-- importing `RecordOps (Point, mkPoint, px)` + `NewtypeBasic (Age, mkAge, getAge)`):
+--
+--   (a) An imported newtype in a SIGNATURE arrives as a BARE tycon, the same
+--       convention imported `data` types use (Task 1's observation for `Point`):
+--         "binder": {"name":"bumpAge", …
+--           "type":{"arg":{"args":[],"name":"Age","tag":"TyCon"},
+--                   "res":{"args":[],"name":"Age","tag":"TyCon"},"tag":"TyFun"}}
+--       compare the imported data type, same dump:
+--           {"arg":{"args":[],"name":"Point","tag":"TyCon"}, …}   -- originDist
+--       So `emitType` produces the SAME `(GHCCore.tyConOpaque "Age")` needle a
+--       local newtype would, and the client's `typeDecls` is `[]` (the decl plugin
+--       dumps only `tcg_tcs`), which is why pass 2 needs the manifest channel.
+--
+--   (b) PLAN CORRECTION. The plan's Step 2 expected `clientAge`'s Core type to
+--       carry `Age`. It does NOT: `clientAge :: Int -> Int` dumps as
+--           "type":{"arg":{…"name":"Int"…},"res":{…"name":"Int"…},"tag":"TyFun"}
+--       and the value level is already GHC-erased, so that function transpiled and
+--       verified (`✅ Valid`) even BEFORE this task — it proves the value half of
+--       cross-module newtype use, not the type half. `bumpAge :: Age -> Age` was
+--       added to the fixture as the function that actually reaches the type level;
+--       without it the fixture never touches the gap the task exists to close.
+--
+--   (c) NEW LIMITATION observed (records half, not newtypes). Imported VALUE names
+--       in `@lean` spec text are NOT qualified — only types are (pass 4 rewrites
+--       type needles; nothing rewrites a bare function name). The plan's
+--       `theorem originDist_mk : … originDist (mkPoint x y) = x` failed loud:
+--           error: RecordClient.lean:22:51: Function expected at
+--             mkPoint
+--           but this term has type ?m.1
+--       Fixed IN THE FIXTURE by writing `RecordOps.mkPoint`. Same family as the
+--       bare-ctor-application limitation Task 7's README bullet already covers;
+--       imported selectors used in DEFS (`px` → `RecordOps.px`) are unaffected —
+--       those come from Core, where the name arrives qualified.
+--
+--   (d) PLAN CORRECTION. The plan's Step 1 expected the manifest to carry `Point`
+--       but NOT `Age` ("a newtype has no Lean name to qualify"). It now carries
+--       `Age⇥newtype⇥Int` as well: the plan predates the two-CHANNEL design, under
+--       which the newtype line publishes the UNDERLYING type rather than a module
+--       to qualify with. The plan's claim is still true of the DATA channel —
+--       `scripts/transpile_graph.py manifest` skips newtypes, and it is the
+--       defining module's own transpile that appends the newtype line.
+
+-- EXPORT SET. `newtypeExports` publishes a newtype iff its underlying string is
+-- built entirely from `typeConMap`-mapped tycons, which is exactly "contains no
+-- `GHCCore.tyConOpaque` needle". Builtin and mapped-compound underlyings export…
+#guard newtypeExports [ageNewtypeDecl]  == [("Age", "Int")]
+#guard newtypeExports [agesNewtypeDecl] == [("Ages", "List Int")]
+-- …and the export is the RAW `emitType` form (`List Int`, unbracketed): the
+-- consumer's `resolveNewtypes` re-applies `newtypeArg`, so bracketing exactly once
+-- keeps argument position right on the client side too.
+#guard resolveNewtypes [("Ages", "List Int")] "(List (GHCCore.tyConOpaque \"Ages\"))"
+       == "(List (List Int))"
+-- A newtype over a LOCAL user type is SKIPPED (documented M2 limitation): the
+-- correct spelling in a client is `M.Q`, which needs qualified-underlying
+-- resolution. Note the test must read the PRE-`resolveUserTypes` string —
+-- `newtypeSubsts` has already turned the needle into a bare `Q` by then, which is
+-- why the filter runs on `newtypeChainSubsts`.
+#guard newtypeSubsts [wrapperNtDecl, qDecl] == [("Wrapper", "Q")]
+#guard newtypeChainSubsts [wrapperNtDecl, qDecl]
+       == [("Wrapper", "(GHCCore.tyConOpaque \"Q\")")]
+#guard newtypeExports [wrapperNtDecl, qDecl] == []
+-- A newtype over an IMPORTED/unknown user type is skipped by the same rule (`Point`
+-- is not among the decls here, so nothing resolves it away either). This is the
+-- probe fixture's `newtype WrapP = WrapP Point`, reconstructed.
+def wrapPNtDecl : DataDecl :=
+  {name := "WrapP", kind := "newtype",
+   ctors := [ {name := "WrapP", fields := [ {name := "_", ty := .tyCon "Point" []} ]} ]}
+#guard newtypeExports [wrapPNtDecl] == []
+-- The recursive newtype is skipped too — its needle is its own name.
+#guard newtypeExports [ntRDecl] == []
+-- CHAINS export once flattened to a mapped type, in either dump order, and a
+-- malformed newtype exports nothing (`newtypeDecls` never lists it).
+#guard newtypeExports [ntADecl, ntBDecl] == [("NA", "Int"), ("NB", "Int")]
+#guard newtypeExports [ntBDecl, ntADecl] == [("NB", "Int"), ("NA", "Int")]
+#guard newtypeExports [badNewtypeTwoCtors, badNewtypeTwoFields, badNewtypeNoFields] == []
+-- ZERO CHURN: a newtype-free module publishes nothing (the sidecar is written but
+-- empty, so `transpile.sh` appends nothing).
+#guard newtypeExports [pointDecl, rectDecl] == []
+
+-- MANIFEST FORMAT. Data lines are byte-identical to what they always were; the
+-- newtype channel is a third field behind the `newtype` tag.
+#guard newtypeManifestLine "Age" "Int" == "Age\tnewtype\tInt"
+#guard parseExtManifest "Point\tRecordOps\nRect\tRecordOps\n"
+       == {datas := [("Point", "RecordOps"), ("Rect", "RecordOps")]}
+#guard parseExtManifest "Age\tnewtype\tInt\n" == {newtypes := [("Age", "Int")]}
+-- Both channels in one file, in file order, kept DISJOINT — a newtype leaking into
+-- the data channel would emit the nonexistent `newtype.Age`. This is the exact
+-- content `transpile.sh` produced for `RecordClient`.
+#guard parseExtManifest "Rect\tRecordOps\nPoint\tRecordOps\nAge\tnewtype\tInt\n"
+       == {datas := [("Rect", "RecordOps"), ("Point", "RecordOps")],
+           newtypes := [("Age", "Int")]}
+-- An underlying type may contain SPACES but never a tab, so the 3-field split is
+-- unambiguous for compound types.
+#guard parseExtManifest "Ages\tnewtype\tList Int\n" == {newtypes := [("Ages", "List Int")]}
+#guard parseExtManifest "Pair\tnewtype\t(Int × Int)\n" == {newtypes := [("Pair", "(Int × Int)")]}
+-- MALFORMED lines are REJECTED (the caller warns) and dropped, never guessed at.
+-- Dropping is the safe failure: the un-erased needle is loud at `lake build`.
+#guard parseExtManifest "Age\n"                == {rejected := ["Age"]}
+#guard parseExtManifest "\tRecordOps\n"        == {rejected := ["\tRecordOps"]}
+#guard parseExtManifest "Point\t\n"            == {rejected := ["Point\t"]}
+#guard parseExtManifest "Age\tnewtype\t\n"     == {rejected := ["Age\tnewtype\t"]}
+#guard parseExtManifest "Age\tnewtype\tInt\tX\n" == {rejected := ["Age\tnewtype\tInt\tX"]}
+#guard parseExtManifest "Age\tdata\tInt\n"     == {rejected := ["Age\tdata\tInt"]}
+-- A TRUNCATED newtype line is rejected, NOT read as data — this is what makes
+-- "the channels cannot collide" true at the parser and not only at the writers
+-- (as data it would rewrite `Age` → `newtype.Age`).
+#guard parseExtManifest "Age\tnewtype\n"       == {rejected := ["Age\tnewtype"]}
+-- Empty lines (every file ends with one) are neither parsed nor reported, and a
+-- good line beside a bad one still lands.
+#guard parseExtManifest "" == {}
+#guard parseExtManifest "\n\n" == {}
+#guard parseExtManifest "Point\tRecordOps\nAge\n"
+       == {datas := [("Point", "RecordOps")], rejected := ["Age"]}
+-- AMBIGUITY. Two manifest configurations would be SILENT-wrong rather than loud,
+-- so both are refused rather than resolved. Both drop ALL of the name's entries —
+-- the reference stays opaque and fails loud — and report the name for the caller
+-- to warn about.
+--
+-- (1) CROSS-CHANNEL: with `data Age` in module B and `newtype Age = Age Int` in
+-- module A, a client using B's Age would have it ERASED to `Int` by pass 2 (which
+-- runs before pass 4), and a theorem over `Int` typechecks.
+#guard parseExtManifest "Age\tB\nAge\tnewtype\tInt\n" == {ambiguous := ["Age"]}
+#guard parseExtManifest "Age\tnewtype\tInt\nAge\tB\n" == {ambiguous := ["Age"]}
+-- Unrelated entries in the same file are unaffected, and the report is deduped.
+#guard parseExtManifest "Point\tRecordOps\nAge\tB\nAge\tnewtype\tInt\nAge\tnewtype\tBool\n"
+       == {datas := [("Point", "RecordOps")], ambiguous := ["Age"]}
+-- (2) WITHIN THE NEWTYPE CHANNEL with DIFFERENT underlyings — verified silent-wrong
+-- on a live 3-module probe before this check existed: `A: newtype Key = Key Int`,
+-- `B: newtype Key = Key [Int]`, client importing B's `Key`. `resolveNewtypes` folds
+-- left, so the client emitted `idKey : Int → Int` for a `[Int] -> [Int]` function
+-- and `∀ (k : Int), idKey k = k` reported `✅ Valid`, with zero diagnostics. Refused
+-- in EITHER dump order (which one comes first is dependency order, not a property
+-- of the clash).
+#guard parseExtManifest "Key\tnewtype\tInt\nKey\tnewtype\tList Int\n"
+       == {ambiguous := ["Key"]}
+#guard parseExtManifest "Key\tnewtype\tList Int\nKey\tnewtype\tInt\n"
+       == {ambiguous := ["Key"]}
+-- All THREE entries go, not just the two that disagree, and neighbours survive.
+#guard parseExtManifest "Point\tRecordOps\nKey\tnewtype\tInt\nAge\tnewtype\tInt\nKey\tnewtype\tBool\n"
+       == {datas := [("Point", "RecordOps")], newtypes := [("Age", "Int")],
+           ambiguous := ["Key"]}
+-- The SAME underlying published by two modules is NOT a clash: the entries say the
+-- same thing, so they DEDUP to one and nothing is refused. (This is the reachable
+-- benign case — re-exported/duplicated newtype definitions across a graph.)
+#guard parseExtManifest "Key\tnewtype\tInt\nKey\tnewtype\tInt\n"
+       == {newtypes := [("Key", "Int")]}
+#guard parseExtManifest "Key\tnewtype\tInt\nAge\tnewtype\tBool\nKey\tnewtype\tInt\n"
+       == {newtypes := [("Key", "Int"), ("Age", "Bool")]}
+-- MIXED: a cross-channel clash on one name and a distinct-underlying clash on
+-- another, in one file — both names are reported, in file order.
+#guard parseExtManifest "Age\tB\nAge\tnewtype\tInt\nKey\tnewtype\tInt\nKey\tnewtype\tBool\n"
+       == {ambiguous := ["Age", "Key"]}
+-- The SAME name twice in the DATA channel is NOT refused (first entry wins, as it
+-- always has): there the consequence is a mis-qualified `WrongModule.Point`, which
+-- is loud, so no silent-wrong path needs closing. That asymmetry is the whole
+-- reason the newtype channel is treated more strictly than the data one.
+#guard parseExtManifest "Point\tA\nPoint\tB\n" == {datas := [("Point", "A"), ("Point", "B")]}
+#guard resolveExternalTypes [("Point", "A"), ("Point", "B")] "(GHCCore.tyConOpaque \"Point\")"
+       == "A.Point"
+
+-- SUBSTITUTION SLOT. Imported newtypes are erased at PASS 2, from `extNts`. This
+-- is the client's exact emitted signature shape: no local decls at all, the needle
+-- erased to `Int`, and no `tyConOpaque` left for pass 4 to turn into a
+-- `NewtypeBasic.Age` that does not exist.
+def clientBumpV : Var :=
+  {name := "bumpAge", unique := 4002,
+   ty := .tyFun (.tyCon "Age" []) (.tyCon "Age" []), role := .id}
+def clientA : Var := {name := "a", unique := 4002, ty := .tyCon "Age" [], role := .id}
+def clientProg : Program :=
+  { binds := [.nonRec clientBumpV (.lam clientA (.var clientA))],
+    typeDecls := [], instances := [] }
+#guard ((emitFullProgram [] clientProg [("Age", "Int")]).splitOn
+         "(a_4002 : Int) : Int").length == 2
+#guard ((emitFullProgram [] clientProg [("Age", "Int")]).splitOn "tyConOpaque").length == 1
+-- Without the channel the needle SURVIVES — the pre-Task-6 state, loud at `lake
+-- build` (`Unknown identifier GHCCore.tyConOpaque`), never silent.
+#guard ((emitFullProgram [] clientProg []).splitOn "tyConOpaque").length == 3
+-- Pass 4 must NOT see the needle: with a (hypothetical, python-suppressed) data
+-- entry for `Age` present as well, the newtype channel still wins because pass 2
+-- runs first. Both directions of the manifest hazard are now pinned.
+#guard ((emitFullProgram [("Age", "NewtypeBasic")] clientProg [("Age", "Int")]).splitOn
+         "NewtypeBasic.Age").length == 1
+-- LOCAL SHADOWING: a local newtype of the same bare name wins over the imported
+-- entry (local substitutions are prepended, and the first match consumes the
+-- needle). The manifest's keys are unqualified, so this rule has to be stated.
+#guard ((emitFullProgram [] {clientProg with typeDecls := [ageNewtypeDecl]}
+          [("Age", "Bool")]).splitOn "(a_4002 : Int) : Int").length == 2
+-- SPEC TEXT (pass site 3) takes the same channel, so a theorem about an imported
+-- newtype-typed function elaborates against the underlying type.
+#guard resolveSpecText [] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int" [("Age", "Int")]
+       == "(a : Int) → Int"
+-- ZERO CHURN for every existing call site: `extNts` defaults to `[]`, and with it
+-- empty both passes are exactly the pre-Task-6 identity.
+#guard emitFullProgram [] clientProg == emitFullProgram [] clientProg []
+#guard resolveSpecText [ageNewtypeDecl] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int"
+       == resolveSpecText [ageNewtypeDecl] [] "(a : (GHCCore.tyConOpaque \"Age\")) → Int" []
+
+-- THE SOUNDNESS COUPLING (why this task had to touch Task 5's guard). Erasing an
+-- imported newtype's needle makes an ORPHAN instance on it silent-wrong — exactly
+-- Task 5 failure mode (a), now reachable from a module whose `typeDecls` is empty.
+-- What the emitter WOULD produce, pinned so the coupling cannot be re-broken: a
+-- client-side `$c==` on the imported newtype plus the orphan instance, i.e. the
+-- shape `NtOrphanProbe.hs` dumps.
+def eqAgeMethodV : Var :=
+  {name := "$c==", unique := 3186,
+   ty := .tyFun (.tyCon "Age" []) (.tyFun (.tyCon "Age" []) (.tyCon "Bool" [])),
+   role := .id}
+def clientB : Var := {name := "b", unique := 4003, ty := .tyCon "Age" [], role := .id}
+def orphanEqProg : Program :=
+  { binds := [.nonRec eqAgeMethodV (.lam clientA (.lam clientB (.var clientB)))],
+    typeDecls := [], instances := [eqAgeInst] }
+#guard ((emitFullProgram [] orphanEqProg [("Age", "Int")]).splitOn "BEq Int").length == 2
+-- So the guard takes the IMPORTED names too, and reports the same violation it
+-- would for a local decl…
+#guard newtypeInstanceViolations [eqAgeInst] [] ["Age"] == [("Eq", "Age")]
+-- …with an honest underlying type in the message (the local `newtypeSubsts` lookup
+-- cannot find an imported newtype, so `extNts` is consulted as well — otherwise
+-- the message would claim the dump is malformed).
+#guard ((newtypeInstanceError [] ("Eq", "Age") [("Age", "Int")]).splitOn
+         "underlying type `Int`").length == 2
+#guard ((newtypeInstanceError [] ("Eq", "Age")).splitOn "malformed dump").length == 2
+-- INVARIANT (Emit's guard-section header): the guard's name set ⊇ the set pass 2
+-- erases. Cross-module both sides read the same channel, so for any manifest the
+-- one is the other's key list.
+#guard (newtypeExports [ageNewtypeDecl]).map (·.1) == ["Age"]
+-- NO OVER-FIRE from the new parameter: an instance on a local DATA type is still
+-- fine while imported newtype names are in scope.
+#guard newtypeInstanceViolations [eqPointInst] [pointDecl] ["Age"] == []
+-- …and an imported newtype the manifest did NOT carry (skip rule) is invisible to
+-- the guard, unchanged from Task 5 — and still loud downstream, since nothing
+-- erased its needle either. OBSERVED end-to-end (probe modules, not committed):
+--   `newtype WrapP = WrapP Point` (Point imported) → sidecar EMPTY, no manifest
+--   entry; the defining module still transpiles and builds (its own erasure goes
+--   `WrapP` → `RecordOps.Point` at pass 4), while a client using `WrapP` in a
+--   signature emits `(GHCCore.tyConOpaque "WrapP")` and fails:
+--     error: NtUserUnderClient.lean:13:23: Unknown identifier `GHCCore.tyConOpaque`
+def eqWrapPInst : Instance :=
+  {className := "Eq", headTypes := [.tyCon "WrapP" []],
+   dfunName := "$fEqWrapP", dfunUnique := 0}
+#guard newtypeInstanceViolations [eqWrapPInst] [] [] == []
+-- OBSERVED refusal for the carried case (probe `NtOrphanProbe.hs`, `instance Eq Age`
+-- in a module importing `NewtypeBasic (Age, …)`, not committed — Task 7's
+-- regression loop keeps exactly one expected-fail fixture):
+--   error: newtype instance not representable: `instance Eq Age`
+--     `Age` is a newtype (erased → `Int`). …
+--   transpile.sh exit 1, no `Generated/NtOrphanProbe.lean` written.
+
+-- LOCAL NEWTYPE OVER AN IMPORTED NEWTYPE (`newtype Wrapped = Wrapped Age`, `Age`
+-- imported). The chain crosses the module boundary, and it works only because
+-- pass 2 folds the LOCAL substitutions BEFORE `extNts`: `newtypeSubsts` cannot
+-- resolve `Age` (no local decl), so it leaves the needle in the underlying
+-- string, and the ext entry consumes that needle on a LATER fold step.
+def wrappedNtDecl : DataDecl :=
+  {name := "Wrapped", kind := "newtype",
+   ctors := [ {name := "Wrapped", fields := [ {name := "_", ty := .tyCon "Age" []} ]} ]}
+#guard newtypeSubsts [wrappedNtDecl] == [("Wrapped", "(GHCCore.tyConOpaque \"Age\")")]
+#guard resolveNewtypes (newtypeSubsts [wrappedNtDecl] ++ [("Age", "Int")])
+         "(GHCCore.tyConOpaque \"Wrapped\")" == "Int"
+-- The ORDER is load-bearing, not incidental: reversed, the ext entry folds first
+-- over a source that does not mention `Age` yet, and the local step then splices
+-- a LIVE needle in behind it — pinned as the exact string, so this guard shows
+-- the failure rather than merely denying the success.
+#guard resolveNewtypes ([("Age", "Int")] ++ newtypeSubsts [wrappedNtDecl])
+         "(GHCCore.tyConOpaque \"Wrapped\")" == "(GHCCore.tyConOpaque \"Age\")"
+-- Same conclusion at the emitter, which is where the order actually lives: a
+-- signature mentioning `Wrapped` erases all the way through to `Int`, with no
+-- needle left for pass 4 to turn into a `NewtypeBasic.Age` that does not exist.
+def wrappedV : Var :=
+  {name := "useWrapped", unique := 4010,
+   ty := .tyFun (.tyCon "Wrapped" []) (.tyCon "Wrapped" []), role := .id}
+def wrappedX : Var := {name := "x", unique := 4011, ty := .tyCon "Wrapped" [], role := .id}
+def wrappedProg : Program :=
+  { binds := [.nonRec wrappedV (.lam wrappedX (.var wrappedX))],
+    typeDecls := [wrappedNtDecl], instances := [] }
+#guard ((emitFullProgram [] wrappedProg [("Age", "Int")]).splitOn
+         "(x_4011 : Int) : Int").length == 2
+#guard ((emitFullProgram [] wrappedProg [("Age", "Int")]).splitOn "tyConOpaque").length == 1
+-- Without the imported half the chain stops mid-way and the needle SURVIVES —
+-- loud at `lake build`, never a silently-wrong `Wrapped`-shaped type.
+#guard ((emitFullProgram [] wrappedProg []).splitOn
+         "(GHCCore.tyConOpaque \"Age\")").length == 3
+-- An imported newtype in the underlying is NOT re-exportable (the needle is still
+-- there pre-`resolveUserTypes`), so a third module cannot erase `Wrapped` — it
+-- gets the surviving needle, loud at `lake build`. Same skip rule as a local
+-- user-typed underlying.
+#guard newtypeExports [wrappedNtDecl] == []
+
+/-! ## M2 gate fix — local/imported type-name collisions
+
+The hole `parseExtManifest`'s ambiguity check cannot see: it compares manifest
+entries against each other, so the module DECLARING the second same-named type is
+invisible (its own newtype line is appended only after it emits). Proven
+silent-wrong end-to-end on the pre-fix binary — see Emit's "Local-vs-imported
+type-name collisions" section for the probe and the four resolution paths. -/
+
+-- The probe's exact shape: local `newtype Tag = Tag [Int]`, imported
+-- `Tag⇥newtype⇥Int`.
+def tagLocalNtDecl : DataDecl :=
+  {name := "Tag", kind := "newtype",
+   ctors := [ {name := "Tag",
+               fields := [ {name := "_", ty := .tyCon "[]" [.tyCon "Int" []]} ]} ]}
+#guard localImportCollisions [tagLocalNtDecl] ["Tag"] == ["Tag"]
+-- Local DATA over an imported name is refused identically: there pass 1 consumes
+-- the needle into the bare local name before pass 2's erasure can fire, so the
+-- imported reference silently becomes the local inductive. Different mechanism,
+-- same blindness — hence both kinds are in scope.
+def tagLocalDataDecl : DataDecl :=
+  {name := "Tag", kind := "data",
+   ctors := [ {name := "Tag", fields := [ {name := "t", ty := .tyCon "Int" []} ]} ]}
+#guard localImportCollisions [tagLocalDataDecl] ["Tag"] == ["Tag"]
+-- Which manifest CHANNEL the imported name came from is not a distinction the
+-- caller passes down, and a name in both channels is reported once.
+#guard localImportCollisions [tagLocalDataDecl] ["Tag", "Tag"] == ["Tag"]
+-- Report order follows the LOCAL decl order (the dump's), and unrelated local
+-- decls do not perturb it.
+#guard localImportCollisions [tagLocalNtDecl, pointDecl, ageNewtypeDecl]
+         ["Age", "Point", "Tag"] == ["Tag", "Point", "Age"]
+-- NO OVER-FIRE. A module whose local names are disjoint from the manifest is
+-- untouched, and so is every module in a graph with no imported types at all —
+-- the check is exactly the identity when either list is empty.
+#guard localImportCollisions [tagLocalNtDecl, pointDecl] ["Age", "Rect"] == []
+#guard localImportCollisions [] ["Tag", "Age"] == []
+#guard localImportCollisions [pointDecl, rectDecl, ageNewtypeDecl] [] == []
+-- The self-entry the DATA channel always carries for the module being transpiled
+-- (`Point⇥RecordOps` while transpiling `RecordOps`) is NOT a collision — filtered
+-- by defining module at the call site, since this function sees names only.
+-- Pinned here as the shape that would otherwise refuse every `data`-declaring
+-- module: with the filter, `RecordOps`' imported set is empty.
+#guard localImportCollisions [pointDecl, rectDecl]
+         (([("Point", "RecordOps"), ("Rect", "RecordOps")].filter (·.2 != "RecordOps")).map
+           (·.1)) == []
+-- …and the same manifest seen from a CLIENT (defining module ≠ this one) does
+-- collide, if the client declares its own `Point`.
+#guard localImportCollisions [pointDecl]
+         (([("Point", "RecordOps")].filter (·.2 != "RecordClient")).map (·.1)) == ["Point"]
+
+-- THE MESSAGE names the type, both origins, the root cause and the remedy. It
+-- deliberately states no kind for either side: the dump cannot tell the two
+-- references apart whatever they are, and naming one would suggest some pairing
+-- is safe.
+#guard ((localImportCollisionError "Tag").splitOn "`Tag`").length > 1
+#guard ((localImportCollisionError "Tag").splitOn
+         "declared locally and imported from the module").length == 2
+#guard ((localImportCollisionError "Tag").splitOn
+         "records type references unqualified").length == 2
+#guard ((localImportCollisionError "Tag").splitOn "rename one of the types").length == 2
+
+-- OBSERVED end-to-end (probe modules `NtSA.hs`/`NtSC.hs`, not committed — the
+-- regression loop keeps one expected-fail fixture only).
+--   BEFORE: `./transpile.sh examples/haskell/NtSC.hs` → exit 0, EMPTY stderr,
+--     `def foreignTag (t_2516 : (List Int)) : (List Int)` for a `NtSA.Tag ->
+--     NtSA.Tag` (i.e. `Int -> Int`) function, and `lake build` reported
+--     `GhcCoreToLean/Generated/NtSC.lean:16:50: ✅ Valid` for
+--     `theorem foreignTag_nil : foreignTag [] = [] := by blaster` — a verdict
+--     about the empty list for a function on integers.
+--   AFTER: exit 1 before any emission, with
+--     error: type name collision: `Tag` is declared locally and imported from
+--     the module graph. …
+--   The DATA-channel arm was probed the same way (`NtSD.hs`: `import qualified
+--   RecordOps` + a local `data Point`) — refused naming `Point`, no
+--   `Generated/NtSD.lean` written — while `RecordOps` itself still transpiles
+--   with `Point⇥RecordOps` and `Rect⇥RecordOps` in its own manifest, which is
+--   what the call site's defining-module filter buys.
 
 end GhcCoreToLean.Tests

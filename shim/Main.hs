@@ -197,7 +197,13 @@ convertExpr env modName = go
                                  , "alts"      .= map (convertAlt env modName) alts ]
       ETick _ x -> object [ "tag" .= ("Tick" :: T.Text), "expr" .= go x ]
       EType t -> object [ "tag" .= ("Type" :: T.Text), "type" .= convertType t ]
-      ECoercion -> object [ "tag" .= ("Cast" :: T.Text), "expr" .= object [] ]
+      -- A coercion in expression position. ghc-dump has no `ECast` node at all
+      -- (`Convert.hs`: `Cast x _ -> cvtExpr x` erases the cast), so this is the
+      -- only coercion the shim can ever see. It carries no payload: the Lean
+      -- side only needs a token it can erase in argument position. The former
+      -- `{"tag":"Cast","expr":{}}` encoding was unparseable (Parse.lean tried to
+      -- parse the empty `expr` and aborted).
+      ECoercion -> object [ "tag" .= ("Coercion" :: T.Text) ]
 
     letBinds [(b, rhs)] = object
       [ "tag"    .= ("NonRec" :: T.Text)
