@@ -199,6 +199,31 @@ ppClassOp (selId, dmInfo) = A.object
 -- (e.g. @m :: forall b. Eq b => a -> b -> Bool@) sheds those too — which loses
 -- information the Lean side cannot use yet; recovering per-method constraints is
 -- out of scope until a fixture needs it.
+--
+-- WHERE that loss shows is asymmetric, and the class side is the bad half.
+-- Shedding @forall b.@ leaves @b@ free in the emitted @m : a -> b -> Bool@ and
+-- Lean's @autoImplicit@ absorbs it in silence. OBSERVED at the settings that
+-- actually apply to generated files (the emitter writes no @set_option@ and
+-- @lakefile.toml@ sets no @leanOptions@, so the on-by-default value holds):
+--
+--     class Foo (a : Type) where
+--       m : a → b → Bool
+--     #check @Foo.m
+--     ⇒ @Foo.m : {a : Type} → [self : Foo a] → {b : Sort u_1} → a → b → Bool
+--
+-- The class therefore ELABORATES CLEANLY while meaning something the Haskell did
+-- not: @b@ became a per-method implicit, universe-polymorphic and entirely
+-- unconstrained, where the source said @forall b. Eq b =>@. The shed CONSTRAINT
+-- is the loud half — the instance's method body still needs the @Eq b@ the class
+-- no longer asks for, and fails there. (That half is PREDICTED, not observed: no
+-- fixture declares a method with its own quantifier, which is also why the
+-- recovery is deferred.) Net: the silent-wrong sits exactly where nothing checks.
+--
+-- Candidate hardening for whoever picks this up, VERIFIED effective: under
+-- @set_option autoImplicit false@ the very same class is rejected outright —
+-- @error: Unknown identifier `b`@ — which converts the silent class-side half
+-- into an elaboration error. Deliberately NOT done here: it would touch every
+-- generated file, and this task only adds a dump channel.
 methodBodyTy :: Type.Type -> Type.Type
 methodBodyTy ty =
   let ty' = Type.dropForAlls ty

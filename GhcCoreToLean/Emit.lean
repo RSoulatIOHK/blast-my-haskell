@@ -641,9 +641,41 @@ def reconstructClasses (binds : CoreProgram) (insts : List Instance)
     real method types (`ppMethodTy` renders type variables, which the data-field
     renderer cannot) in DECLARATION order, whereas the reconstruction's order is
     the dfun body's and its types come from head-abstracting an instance's
-    specialized `$c` bind — the documented "primary correctness risk". Where both
-    sources describe a single-parameter class they agree exactly, which is the
-    byte-identical-`UserClass.lean` regression this task gates on.
+    specialized `$c` bind — the documented "primary correctness risk". On every
+    fixture we have, both sources describe the same single-parameter class and
+    agree exactly, which is the byte-identical-`UserClass.lean` regression this
+    task gates on. Agreement is NOT guaranteed, though, and the one field where
+    disagreeing has a behavioral consequence is `methods`.
+
+    THE METHODS-DISAGREE PATH. After this merge `cd.methods` is the DECLARED
+    method set (GHC's own `classOpItems`), which can strictly EXCEED the set
+    `emitInstanceUser` can resolve to a `$c<method>` bind. Its all-or-nothing
+    test (`fields.length == cd.methods.length`) then drops the WHOLE instance —
+    silently as far as this program is concerned (`rc=0`, empty stderr); the
+    loudness is Lean's `failed to synthesize` at the use site, the same posture
+    as the other unsupported-class paths here, not a new guarantee.
+
+    It is REACHABLE, not hypothetical. `Main.lean`'s `shouldDrop` removes binds
+    before Emit ever sees them (`keepBinding` filters `prog.binds`), and two of
+    its rules are not class-aware: `$c/=` is dropped UNCONDITIONALLY, so a user
+    class that declares `/=` loses it and not merely `Eq`; and the `$cshow` test
+    is a PREFIX, so a user method named `showIt` (`$cshowIt`) is eaten too.
+    Neither has a fixture.
+
+    Net loudness is nonetheless BETTER than before this channel existed — argued
+    by construction, not measured. Pre-change `classDecls` was always empty, so
+    `mergeClassDecls [] xs = xs` and `cd.methods` was BY CONSTRUCTION the
+    resolvable set: `reconstructClasses` builds it by `findBind`-ing the very
+    binds `shouldDrop` already filtered, so a dropped method was absent from the
+    class AND from the instance. Output compiled, and the emitted class quietly
+    misdescribed the Haskell one. Now the class carries the true method list and
+    the instance vanishes instead, so any USE of it fails at Lean:
+    wrong-and-quiet became incomplete-and-checkable.
+
+    OWNERSHIP of the remaining sharp edges: M3 Task 2 makes the `$c/=` drop
+    class-aware; M3 Task 4 replaces `emitInstanceUser`'s silent whole-instance
+    skip with a per-method decision plus an `eprintln`, which is what removes the
+    "silent at the transpiler" half above.
 
     ORDER is deliberately taken from the reconstruction, with plugin-only classes
     (those with no local instance, which the reconstruction never sees) appended.

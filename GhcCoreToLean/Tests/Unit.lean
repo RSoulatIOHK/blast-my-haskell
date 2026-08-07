@@ -237,6 +237,17 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 #guard (reconRes.1.head!).methods.map (·.name) == ["size"]
 #guard reconRes.2 == [("size", "Sized")]
 #guard emitType (reconRes.1.head!).methods.head!.ty == emitType (.tyFun (.tyVar "a") (.tyCon "Int" []))
+-- M3 Task 1 ADAPTATION guard. `reconstructClasses` was rewritten for `ClassDecl`
+-- v2 but is unchanged in substance: it still produces exactly the three
+-- structural limits its docstring claims — the single invented `a`, now as a
+-- ONE-element `tyVars` list rather than a scalar; `supers` empty (a `$p`
+-- superclass selector is not a top-level bind, so nothing here can see one);
+-- `hasDefault` false (a `$dm` bind is indistinguishable from an ordinary one).
+-- Pinned on the REAL function's output, so the plugin channel's richer shapes
+-- can never be confused for something the fallback could have produced.
+#guard (reconRes.1.head!).tyVars == ["a"]
+#guard (reconRes.1.head!).supers == ([] : List Name)
+#guard (reconRes.1.head!).methods.head!.hasDefault == false
 
 -- Dict Task 3: emit a Lean `class` from a ClassDecl.
 #guard emitClassDecl sizedClass == "class Sized (a : Type) where\n  size : (a → Int)"
@@ -2250,15 +2261,40 @@ def m3parseClass (s : String) : Except String ClassDecl := do
     time. `empty : a` also shows a method whose type is a BARE type variable
     (no arrow), which matters for observation 4.
 
+    HANDOFF for Task 7 (multi-parameter classes): `supers` is a list of NAMES and
+    nothing else. `ppSuperPred` keeps the parent class's name and DISCARDS
+    `getClassPredTys_maybe`'s second component, the argument types — so
+    `class (Sized b) => C a b` dumps as `supers: ["Sized"]` with no record of
+    WHICH parameter carries the constraint. That is lossless only under the
+    single-parameter assumption this fixture satisfies: with one tyVar there is
+    exactly one thing `Sized` can be applied to, which is why the shim comment on
+    `ppSuperPred` calls the argument types "recoverable from `classTyVars`" and
+    declines to dump them. Multi-parameter classes break that recovery, and
+    `["Sized"]` would then be an ambiguity a consumer cannot detect. Task 7 must
+    either extend the dump with the argument types or record the limitation and
+    refuse — silently picking the first tyVar is the failure mode to avoid.
+    PREDICTED, not observed: no fixture declares a multi-parameter class with a
+    superclass, so the ambiguous arm is unexercised.
+
 ### Observation 3 — the Core spines (`/tmp/transpile-SuperClass.json`)
 
-    Every `$`-name in the whole dump, with counts:
+    Every UNQUALIFIED `$`-name in the whole dump, with counts — 16 distinct, 73
+    occurrences. Qualified externals are excluded (`GHC.Types.$tcInt`,
+    `GHC.Types.$tcConstraint`, `GHC.Types.$WKindRepVar`, `GHC.Num.$fNumInt`, one
+    each): those are other modules' plumbing, not this module's spines.
 
         39 "$krep"   7 "$trModule"   4 "$fContainerBag"   3 "$fSizedBag"
          2 "$tcSized"  2 "$tcContainer"  2 "$tcBag"
          2 "$dSized"   2 "$dContainer"
          2 "$csize"    2 "$cinsert"     2 "$cempty"
+         1 "$tc'C:Sized"   1 "$tc'C:Container"   1 "$tc'Bag"
          1 "$p1Container"
+
+    The three `$tc'…` promoted-datacon reps were missing from this list's first
+    pass. Nothing downstream changes — `shouldDrop`'s `$tc` prefix rule eats them
+    exactly as it eats `$tcSized` — but the enumeration has to be COMPLETE or the
+    negative claims it licenses ((a)'s "no `$cp1Container` anywhere", (c)'s "`$dm`
+    — ZERO occurrences") are worth nothing.
 
     (a) The Container INSTANCE's dfun stores the superclass DICT positionally as
     the dictionary constructor's first field. There is NO selector here, and no
