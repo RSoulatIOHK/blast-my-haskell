@@ -127,12 +127,74 @@ def emitLiteralPattern : Literal → String
 
 /-! ## Var emission -/
 
+/-- One `methodMap` entry: a class method's bare name, the class that declares
+    it, and the uniques of program BINDERS that shadow that name.
+
+    WHY THE SHADOW LIST. `emitVar` used to match a `Var` reference on the bare
+    NAME alone, which is wrong for a locally-bound occurrence of that name. A
+    parameter called `size` in a module declaring `class Sized a where size` is
+    legal Haskell (GHC only warns, under `-Wname-shadowing`), and the reference to
+    the PARAMETER emitted as `Sized.size` — type-correct and silently wrong.
+    OBSERVED on `examples/haskell/TwoClassesDistinctMethods.hs` before this
+    field existed:
+
+        def applySizer (size_8942 : (Box → Int)) : Int :=
+          (Sized.size) ((Box.Box) ((3 : Int)))
+
+    which Lean accepted with only an `unused variable size_8942` warning, and
+    whose property `∀ k, applySizer (fun _ => k) = k` blaster falsified with
+    `k: 4` (the body is constantly `3`).
+
+    UNIQUES ARE THE DISCRIMINATOR because they identify GHC `Id`s, and a class-op
+    selector is never a BINDER in the dump — a class-op Id is not a top-level
+    bind (see `reconstructClasses`) and cannot be a local binder. So a binder
+    named `size` is necessarily a different Id from the selector `size`, and
+    every reference sharing that binder's unique is a reference to the binder. On
+    that fixture the selector reference carries `unique 8931` (and, being routed
+    through the shim's external-name path, the placeholder type `_Unknown`) while
+    the shadowing parameter carries `unique 8942` at both its binder and its
+    reference.
+
+    CAVEAT, stated because the comparison is not on the full unique: the shim
+    records only the NUMBER part of ghc-dump's `Unique tag n`
+    (`binderUniqueAsNat`, shim/Main.hs), so two `Id`s whose numbers agree under
+    different tags compare equal here. Both would also have to be spelled with
+    the same method name for it to matter, and the failure direction is a
+    SUPPRESSED rewrite (a bare `size` that then resolves as a local id) rather
+    than a spurious one. Pinned as a risk; not observed. -/
+structure MethodRef where
+  method     : Name
+  cls        : Name
+  /-- Uniques of binders named `method` anywhere in the emitted program; see the
+      structure docstring. Filled by `attachMethodShadows`, which is why the
+      default keeps hand-written test literals short. -/
+  shadowedBy : List Unique := []
+deriving Repr, DecidableEq, Inhabited
+
 /-- Map a Var reference. A class-method selector (in `methodMap`) emits
     `Class.method`; otherwise value-map hits short-circuit; top-level refs use
-    bare names; locals get unique-suffixed. -/
-def emitVar (methodMap : List (Name × Name)) (topNames : List Name) (v : Var) : String :=
-  match methodMap.find? (·.1 == v.name) with
-  | some (_, cls) => s!"{sanitize cls}.{sanitize v.name}"
+    bare names; locals get unique-suffixed.
+
+    PRECEDENCE (`methodMap` before `valueMap`) is deliberate and load-bearing now
+    that M1 registered BARE operator keys (`++`, `==`, `+`, …) next to the
+    qualified ones, so the two key sets CAN overlap. This is the safe order:
+
+    * `methodMap` keys are always BARE method names — `reconstructClasses` takes
+      them from `$c<method>` binds (`cm.drop 2`) and the decl plugin from
+      `occNameString`. A QUALIFIED `valueMap` key (`GHC.Base.++`) therefore
+      cannot collide with one at all, which makes the order unobservable for
+      every qualified name.
+    * A BARE name in the dump belongs to the module being transpiled: the shim
+      strips the module prefix only for the current module and leaves
+      `GHC.Base.++` qualified (`convertExternalName`, shim/Main.hs). So when a
+      bare `++` arrives in a module that declares a class method `++`, the user's
+      method IS the referent and must win over the hedged bare `valueMap` key.
+
+    What makes a bare-name match mean "the selector" is `MethodRef.shadowedBy`,
+    which excludes locally-bound occurrences of the name; see that docstring. -/
+def emitVar (methodMap : List MethodRef) (topNames : List Name) (v : Var) : String :=
+  match methodMap.find? (fun m => m.method == v.name && !m.shadowedBy.contains v.unique) with
+  | some m    => s!"{sanitize m.cls}.{sanitize v.name}"
   | none      =>
   match valueMap v.name with
   | some lean => lean
@@ -249,7 +311,7 @@ private partial def peelLamsLocal : Expr → List Var × Expr
 /-! ## Expr emission -/
 
 mutual
-  partial def emitExpr (mm : List (Name × Name)) (top : List Name) : Expr → String
+  partial def emitExpr (mm : List MethodRef) (top : List Name) : Expr → String
     | .var v   => emitVar mm top v
     | .lit l   => emitLiteral l
     | .app f a =>
@@ -285,7 +347,7 @@ mutual
     -- the generated file must fail to elaborate rather than pick some value.
     | .coercion => "GHCCore.coercionResidue"
 
-  partial def emitAlt (mm : List (Name × Name)) (top : List Name) : Alt → String
+  partial def emitAlt (mm : List MethodRef) (top : List Name) : Alt → String
     | .mk con bndrs rhs =>
       s!"| {emitAltPattern con bndrs} => {emitExpr mm top rhs}"
 
@@ -293,14 +355,14 @@ mutual
       `let rec {id} {params} := {body}`. (Lean's `let rec` has no `decreasing_by`,
       so only structurally-decreasing recursion elaborates; non-structural local
       rec is a documented follow-up.) -/
-  partial def emitLetRecBinding (mm : List (Name × Name)) (top : List Name) (v : Var) (e : Expr) : String :=
+  partial def emitLetRecBinding (mm : List MethodRef) (top : List Name) (v : Var) (e : Expr) : String :=
     let (params, body) := peelLamsLocal e
     let paramStr := String.intercalate " " (params.map (fun p => s!"({localId p})"))
     let head := if paramStr.isEmpty then s!"let rec {localId v} :="
                 else s!"let rec {localId v} {paramStr} :="
     s!"{head} {emitExpr mm top body}"
 
-  partial def emitLet (mm : List (Name × Name)) (top : List Name) : Bind → String
+  partial def emitLet (mm : List MethodRef) (top : List Name) : Bind → String
     | .nonRec v e =>
       -- A `where`-style recursive helper can arrive tagged NonRec while its RHS
       -- references the binder. A plain Lean `let` can't self-reference, so route
@@ -373,7 +435,7 @@ private def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
 private def defNameId (v : Var) : String :=
   if isClassMethodName v.name then localId v else sanitize v.name
 
-private def emitDefHeader (mm : List (Name × Name)) (classNames : List Name) (top : List Name)
+private def emitDefHeader (mm : List MethodRef) (classNames : List Name) (top : List Name)
                           (v : Var) (args : List Var)
                           (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
   let name     := defNameId v
@@ -408,7 +470,7 @@ private def emitDefHeader (mm : List (Name × Name)) (classNames : List Name) (t
 
 /-! ## Top-level binds -/
 
-def emitBind (mm : List (Name × Name)) (classNames : List Name) (top : List Name) (b : Bind) : String :=
+def emitBind (mm : List MethodRef) (classNames : List Name) (top : List Name) (b : Bind) : String :=
   -- Result type is computed from the constraint-stripped signature so the
   -- erased dict arrow isn't mistaken for a value arg.
   let resTyOf (v : Var) (nargs : Nat) : GHCType :=
@@ -440,7 +502,7 @@ private def collectTopNames (p : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc
 
-def emitProgram (mm : List (Name × Name)) (classNames : List Name) (p : CoreProgram) : String :=
+def emitProgram (mm : List MethodRef) (classNames : List Name) (p : CoreProgram) : String :=
   let top      := collectTopNames p
   let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
@@ -449,7 +511,7 @@ def emitProgram (mm : List (Name × Name)) (classNames : List Name) (p : CorePro
     names that should NOT get a `_unique` suffix when emitted as Var refs.
     The intended use is to splice in user-declared data constructors so
     `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
-def emitProgramWith (mm : List (Name × Name)) (classNames : List Name) (p : CoreProgram) (extraTopNames : List Name) : String :=
+def emitProgramWith (mm : List MethodRef) (classNames : List Name) (p : CoreProgram) (extraTopNames : List Name) : String :=
   let top      := extraTopNames ++ collectTopNames p
   let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
@@ -540,6 +602,42 @@ private def ordMethodNames : List Name := ["$ccompare", "$c<", "$c<=", "$c>", "$
 private def methodHeadStr (v : Var) : Option String :=
   (firstValArgTy v.ty).map emitType
 
+/-- Instance-head strings of the program's `Eq` instances, in the SAME spelling
+    `emitInstance`/`emitDataDecl`/`methodHeadStr` use (pre-resolution, so a user
+    type is still its `(GHCCore.tyConOpaque "T")` form). Shared by `isEqNeqBind`
+    so the two sides of that comparison cannot drift apart. -/
+def eqInstanceHeads (insts : List Instance) : List String :=
+  insts.filterMap fun i =>
+    if i.className == "Eq" then some (i.headTypes.map emitType |> String.intercalate " ")
+    else none
+
+/-- Is `v` the `/=` method bind of an `Eq` instance — i.e. the one GHC derives as
+    `not ∘ (==)`, which `Main.lean` drops? Lean's `BEq`/`DecidableEq` supplies
+    `bne` itself, and the dropped body would not even elaborate: it references the
+    Eq DICT (observed in `/tmp/transpile-Ratio.json`, `$c/= = \eta eta -> case ==
+    @CustomRatioSOP $fEqCustomRatioSOP eta eta of …`), and `$c…` defs are emitted
+    BEFORE the instances they would need, which Lean does not see forward.
+
+    The point of this predicate is the SCOPE of that drop. `Main.lean` used to
+    drop every bind named `$c/=`, so a user class declaring `/=` (legal with
+    `import Prelude hiding ((/=))`) lost its method — and then
+    `emitInstanceUser`'s all-or-nothing test dropped the whole instance. Matching
+    the `Eq` instance heads keeps that class's `$c/=` and still drops Eq's.
+
+    RESIDUAL, un-fixtured: if a user class declaring `/=` has an instance at a
+    type that ALSO has an `Eq` instance, both `$c/=` binds carry that head type
+    (GHC gives them the same name and distinguishes them only by unique —
+    `/tmp/transpile-Ratio.json` has two `$c/=`, uniques 12069 and 12087), so both
+    are dropped and the user class's instance vanishes, loud at its use site. The
+    precise fix is per-instance attribution through the dfun body's method refs
+    (`collectCMethodRefs` carries the uniques); it is not done here because no
+    fixture reaches it. -/
+def isEqNeqBind (insts : List Instance) (v : Var) : Bool :=
+  v.name == "$c/=" &&
+    (match methodHeadStr v with
+     | some hs => (eqInstanceHeads insts).contains hs
+     | none    => false)
+
 /-- Scan binds for *derived* Eq methods (`$c==`/`$c/=` whose body uses the tag
     primops `dataToTag#`/`tagToEnum#`) and return their head-type strings. Such
     Eq instances can't be body-translated and are routed through Lean
@@ -572,6 +670,50 @@ private partial def collectCMethodRefs : Expr → List Name
   | .tick e      => collectCMethodRefs e
   | _            => []
 
+/-- Every BINDER inside an expression, as `(name, unique)`: lambda binders, both
+    `let` forms, the case binder, and pattern binders. The match is TOTAL (no
+    catch-all) so that adding an `Expr` constructor cannot silently drop a binder
+    kind: a missed kind would leave a shadowing occurrence looking like a class-op
+    selector, which is exactly the silent-wrong `MethodRef.shadowedBy` closes. -/
+private partial def exprBinders : Expr → List (Name × Unique)
+  | .var _       => []
+  | .lit _       => []
+  | .app f a     => exprBinders f ++ exprBinders a
+  | .lam v b     => (v.name, v.unique) :: exprBinders b
+  | .let_ bnd b  =>
+    (match bnd with
+     | .nonRec v e => (v.name, v.unique) :: exprBinders e
+     | .rec_ ps    => ps.flatMap (fun (v, e) => (v.name, v.unique) :: exprBinders e))
+      ++ exprBinders b
+  | .case_ s cb _ alts =>
+    exprBinders s ++ [(cb.name, cb.unique)]
+      ++ alts.flatMap (fun (.mk _ bs r) => bs.map (fun b => (b.name, b.unique)) ++ exprBinders r)
+  | .cast e      => exprBinders e
+  | .tick e      => exprBinders e
+  | .type_ _     => []
+  | .coercion    => []
+
+/-- Every binder of a program: the top-level binders and every binder in their
+    bodies. Top-level binders are included for completeness only — a top-level
+    name cannot collide with a class method's (both are module-level names, so
+    GHC rejects the module; see `examples/haskell/TwoClassesSameMethod.hs`). -/
+private def programBinders (binds : CoreProgram) : List (Name × Unique) :=
+  binds.flatMap fun b => match b with
+    | .nonRec v e => (v.name, v.unique) :: exprBinders e
+    | .rec_ pairs => pairs.flatMap (fun (v, e) => (v.name, v.unique) :: exprBinders e)
+
+/-- Fill in `MethodRef.shadowedBy` from the binders of the program that is about
+    to be emitted: for each method name, the uniques of every binder spelled the
+    same. `emitVar` then rewrites only the occurrences that are NOT one of those
+    binders' references. Pass the SAME binds that get emitted — a superset would
+    only add uniques that no emitted reference mentions, but a subset would leave
+    a shadowing occurrence unprotected. -/
+def attachMethodShadows (binds : CoreProgram) (mm : List MethodRef) : List MethodRef :=
+  let bs := programBinders binds
+  mm.map fun m =>
+    { m with shadowedBy :=
+        (bs.filterMap (fun (n, u) => if n == m.method then some u else none)).eraseDups }
+
 /-- Look up a top-level binding by name. -/
 private def findBind (binds : CoreProgram) (n : Name) : Option (Var × Expr) :=
   binds.findSome? fun b => match b with
@@ -595,17 +737,22 @@ private def builtinClasses : List Name :=
    "Floating", "Enum", "Bounded", "Functor", "Applicative", "Monad",
    "Foldable", "Traversable", "Semigroup", "Monoid"]
 
-/-- Reconstruct `ClassDecl`s + a `(method, class)` map from the program's
+/-- Reconstruct `ClassDecl`s + the `MethodRef` map from the program's
     instance dict-builders (which reference their `$c<method>` bindings) and the
     `$c<method>` binding types (generalized to the class parameter). No GHC-plugin
     support is needed: the dfun (`$f…`) body names the instance's methods.
 
     This is the FALLBACK shape source since M3 Task 1 — the decl-plugin's
     `classDecls` channel is ground truth (see `mergeClassDecls`). What it is still
-    the only source of is the `(method, class)` map, which is instance-driven by
+    the only source of is the method→class map, which is instance-driven by
     construction and drives the call-site `size` → `Sized.size` rewrite; and it is
     the whole story for a run with no decls sidecar (`ghc-core-shim` invoked
     without `--decls`), where `Program.classDecls` is empty.
+
+    The `MethodRef`s come out with an EMPTY `shadowedBy` — this function sees the
+    class shapes, not the bodies that will be emitted. `emitFullProgram` fills it
+    via `attachMethodShadows`; a caller that skips that step gets the old
+    name-only matching, which is the silent-wrong documented on `MethodRef`.
 
     Its structural limits are why the plugin channel exists: `tyVars` is always
     the single invented `"a"`, `supers` is always empty (a `$p` superclass
@@ -613,9 +760,9 @@ private def builtinClasses : List Name :=
     `hasDefault` is always `false` (a `$dm` bind is indistinguishable from an
     ordinary one). A class with no local instance produces nothing at all. -/
 def reconstructClasses (binds : CoreProgram) (insts : List Instance)
-    : List ClassDecl × List (Name × Name) :=
+    : List ClassDecl × List MethodRef :=
   let tv := "a"
-  let perInstance (i : Instance) : Option (ClassDecl × List (Name × Name)) := do
+  let perInstance (i : Instance) : Option (ClassDecl × List MethodRef) := do
     if builtinClasses.contains i.className then none else
     let (_, dfunRhs) ← findBind binds i.dfunName
     let headName ← match i.headTypes.head? with | some (.tyCon n _) => some n | _ => none
@@ -624,8 +771,8 @@ def reconstructClasses (binds : CoreProgram) (insts : List Instance)
       let (mv, _) ← findBind binds cm
       let mname := cm.drop 2   -- strip "$c"
       some ({ name := mname, ty := generalizeTy headName tv mv.ty } : ClassMethod)
-    let pairs := methods.map (fun m => (m.name, i.className))
-    some ({ name := i.className, tyVars := [tv], supers := [], methods }, pairs)
+    let refs := methods.map (fun m => ({ method := m.name, cls := i.className } : MethodRef))
+    some ({ name := i.className, tyVars := [tv], supers := [], methods }, refs)
   let results := insts.filterMap perInstance
   let classes := results.foldl (init := ([] : List ClassDecl)) fun acc (cd, _) =>
     if acc.any (·.name == cd.name) then acc else acc ++ [cd]
@@ -696,6 +843,126 @@ def mergeClassDecls (fromPlugin : List ClassDecl) (fromCore : List ClassDecl)
     | some p => p
     | none   => cd
   merged ++ plugin.filter (fun p => !fromCore.any (·.name == p.name))
+
+/-! ### Same-named methods across classes
+
+    `methodMap` is keyed by the BARE method name, so two classes declaring `size`
+    would produce two entries and `emitVar`'s `find?` would take whichever the
+    instance dump listed first — every call site in the module getting the same
+    qualifier, with no diagnostic. `sameMethodAmbiguities` refuses that program
+    instead (wired in `Main.lean`, before emission).
+
+    WHAT IS ACTUALLY REACHABLE HERE, measured rather than assumed. Two classes of
+    ONE module cannot share a method name at all: class methods are module-level
+    names, so the second declaration is a duplicate and GHC rejects the module —
+    `examples/haskell/TwoClassesSameMethod.hs` is that negative fixture, and it
+    fails at `cabal build`, never reaching this code. The collision needs the two
+    classes in DIFFERENT modules with this module instantiating both: then
+    `reconstructClasses` rebuilds the imported class from its local instance's
+    `$c` binds under its bare method name, next to the local class's entry.
+
+    That path has no fixture because cross-module user classes are not supported
+    end-to-end — an imported class's method reference arrives module-qualified
+    (`A.size`, since the shim only strips the CURRENT module's prefix), misses the
+    bare `methodMap` key entirely, and fails loud at `lake build`. So this guard
+    is an unexercised tripwire whose only exercise is the `#guard`s in
+    `GhcCoreToLean/Tests/Unit.lean`. It is not the removal of a live silent-wrong;
+    the live one in this lookup was local-binder shadowing (see `MethodRef`). -/
+
+/-- Method names declared by MORE THAN ONE class of the program's merged class
+    set, each with its declaring classes in first-seen order.
+
+    Computed on the MERGED set (plugin `classDecls` ∪ `reconstructClasses`), which
+    is deliberately WIDER than the `methodMap` the rewrite uses (reconstruction
+    only): the plugin channel also knows the methods of a class with no local
+    instance, so an ambiguity is refused even when only one of the two classes has
+    an entry in the map. Wider is the safe direction — the guard covers every
+    ambiguity the map could have, and a class that is neither declared nor
+    instantiated locally is not in either source, so no third module's classes can
+    make this fire. -/
+def sameMethodAmbiguities (p : Program) : List (Name × List Name) :=
+  let classes := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
+  let pairs := classes.flatMap fun c => c.methods.map fun m => (m.name, c.name)
+  ((pairs.map (·.1)).eraseDups).filterMap fun mname =>
+    let cs := (pairs.filterMap (fun (m, c) => if m == mname then some c else none)).eraseDups
+    if cs.length > 1 then some (mname, cs) else none
+
+/-- The refusal message for one `sameMethodAmbiguities` entry. Names every
+    declaring class, because which one the emitter would have picked is an
+    artifact of dump order and the reader must not be invited to guess it. -/
+def sameMethodAmbiguityError (mname : Name) (classes : List Name) : String :=
+  s!"ambiguous class method `{mname}`: declared by {String.intercalate ", " (classes.map (s!"`{·}`"))}.\n" ++
+  s!"  Call sites in Core reference a class method by its bare name, so the\n" ++
+  s!"  transpiler cannot tell which class's `{mname}` a reference means and would\n" ++
+  s!"  qualify EVERY one of them with whichever class the instance dump listed\n" ++
+  s!"  first. That typechecks and is silently wrong (calls dispatch to the other\n" ++
+  s!"  class's method), so transpilation is refused.\n" ++
+  s!"  Remedy: rename one of the methods."
+
+/-- Class methods that `emitVar` would resolve to a BUILTIN rather than to the
+    user's method, as `(class, method)`: the method's bare name has a `valueMap`
+    image — M1 registered bare operator keys (`/=`, `++`, `==`, …) beside the
+    qualified ones — and the method→class map has NO entry for it, so a call site
+    falls past `methodMap` into `valueMap`.
+
+    This is the other half of `emitVar`'s precedence story. The order there
+    (`methodMap` first) is correct whenever the map HAS the entry; what it cannot
+    fix is a declared method MISSING from the map, because then nothing marks the
+    name as the user's. Both sources of the merged class set know the method
+    exists, so the situation is detectable here even though `emitVar` cannot see
+    it.
+
+    OBSERVED, and the reason this is a refusal rather than a note: a class
+    declaring `(/=)` whose instance head also has an `Eq` instance loses its `$c/=`
+    bind (`isEqNeqBind` matches on the head type, and GHC gives both binds that
+    same head), so the map has no entry and
+
+        def differs (a_9642 : Box) (b_9643 : Box) : Bool :=
+          (((fun a b => !(a == b))) (a_9642)) (b_9643)
+
+    was emitted — the BUILTIN inequality in place of the user's method, which
+    typechecks because `deriving Eq` supplied `BEq Box`. Silently wrong for any
+    class whose operator means something other than the builtin.
+
+    USE-LEVEL, not declaration-level, and that conjunct is MEASURED. With no
+    reference to the name there is no call site to emit wrongly, and refusing
+    anyway would take away a module that used to transpile fine: a probe declaring
+    `class Neq a where (/=)` with no instance and no use built CLEAN before this
+    guard existed, whereas the same probe plus `allDiffer x y = x /= y` (still no
+    instance) transpiled and then failed `lake build` with `failed to synthesize`
+    — the builtin `!(a == b)` applied at a type variable with no `BEq` binder. So
+    the referenced case was already broken and is merely refused EARLIER now,
+    while the unreferenced case keeps working. This is the only guard here that
+    refuses a program GHC accepts, which is why its edge is drawn tightly.
+
+    The reference test is `occursInExpr`, i.e. any `Var` spelled with the method's
+    name. A locally-bound occurrence of that name counts too (`shadowedBy` cannot
+    help — there is no map entry to attach it to), so a module whose only `/=` is
+    some local binder is refused as well: conservative in the safe direction, and
+    unobserved. The names checked are only those with a `valueMap` image, so
+    ordinary method names (`size`, `empty`, `insert`) cannot trip it. -/
+def unmappedOperatorMethods (p : Program) : List (Name × Name) :=
+  let (coreClasses, mapped) := reconstructClasses p.binds p.instances
+  let classes := mergeClassDecls p.classDecls coreClasses
+  classes.flatMap fun c =>
+    c.methods.filterMap fun m =>
+      if (valueMap m.name).isSome && !mapped.any (fun r => r.method == m.name)
+         && p.binds.any (occursInBind m.name ·) then
+        some (c.name, m.name)
+      else none
+
+/-- The refusal message for one `unmappedOperatorMethods` entry. -/
+def unmappedOperatorMethodError (cls mname : Name) : String :=
+  s!"class `{cls}` declares the method `{mname}`, which the transpiler cannot\n" ++
+  s!"  distinguish from the builtin `{mname}`: no `$c{mname}` binding for it survives in\n" ++
+  s!"  this module (either the class has no local instance here, or the binding was\n" ++
+  s!"  filtered as an `Eq` method — see Main.lean's drop rules), so the method→class\n" ++
+  s!"  map has no entry and every call site would emit the BUILTIN `{mname}` instead.\n" ++
+  s!"  That typechecks whenever the builtin's own instances are in scope and is\n" ++
+  s!"  silently wrong (the user's method body is never called), so transpilation is\n" ++
+  s!"  refused.\n" ++
+  s!"  Remedy: rename the method to a name with no builtin meaning, or drop the\n" ++
+  s!"  conflicting `Eq`/`Ord` instance on the same type."
 
 /-- Find the `$c<method>` binding belonging to the instance whose head type
     matches `headTyStr`, returning its emitted (unique-suffixed) def name.
@@ -1549,7 +1816,13 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- plugin's shapes win over the instance-driven reconstruction (see
   -- `mergeClassDecls`); the map stays reconstruction-only, since it is keyed by
   -- the `$c` binds that only an instance provides.
-  let (coreClasses, methodMap) := reconstructClasses p.binds p.instances
+  --
+  -- `attachMethodShadows` over `keptBinds` — the binds actually emitted below —
+  -- is what stops a LOCAL BINDER named like a method from being rewritten into
+  -- the method (see `MethodRef`). The ambiguity that the bare key cannot resolve
+  -- at all is refused up in `Main.lean` (`sameMethodAmbiguities`), before here.
+  let (coreClasses, methodMapRaw) := reconstructClasses p.binds p.instances
+  let methodMap := attachMethodShadows keptBinds methodMapRaw
   let userClasses := mergeClassDecls p.classDecls coreClasses
   let classNames := userClasses.map (·.name)
   -- Dependency order: a decl with another local type as a field type must come

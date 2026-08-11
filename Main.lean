@@ -18,28 +18,30 @@ private def isGhcRuntimePlumbing (name : Name) : Bool :=
   name.startsWith "$cshow"  ||
   name.startsWith "$sshow"
 
-/-- Default-method bindings GHC auto-derives. `$c/=` is `not ∘ (==)` — we
-    don't need it (BEq supplies bne automatically) and emitting it creates a
-    circular dependency on the BEq instance we're about to define. -/
-private def isAutoDerivedDefault (name : Name) : Bool :=
-  name == "$c/="
-
 /-- NOTE: `$f<Class><Type>` instance dict-builders are NOT dropped here — they
     reach `emitFullProgram`, which reads their bodies to reconstruct user-class
     declarations and then suppresses them from emission (they have no Lean
-    image). `$fShow*` is still dropped above via `isGhcRuntimePlumbing`. -/
-private def shouldDrop (n : Name) : Bool :=
-  isGhcRuntimePlumbing n || isAutoDerivedDefault n
+    image). `$fShow*` is still dropped above via `isGhcRuntimePlumbing`.
+
+    The second rule is `Emit.isEqNeqBind`: GHC's auto-derived `/=` for an `Eq`
+    instance (Lean's `BEq`/`DecidableEq` supplies `bne`, and the body would not
+    elaborate anyway — see that docstring). It is deliberately keyed on the `Eq`
+    instance HEADS, not on the name `$c/=` alone: the name-only test also ate the
+    `/=` of a USER class declaring that operator, which then lost the whole
+    instance. Bind-level (a `Var`, not a `Name`) because the head type comes from
+    the bind's own type. -/
+private def shouldDrop (insts : List Instance) (v : Var) : Bool :=
+  isGhcRuntimePlumbing v.name || Emit.isEqNeqBind insts v
 
 /-- Filter bindings, including splitting `Rec` groups: if a Rec lumps
     together a dict literal and a method, drop the dict half and keep the
     rest. Returns `none` when the whole bind should be dropped. -/
-private def keepBinding (b : Bind) : Option Bind :=
+private def keepBinding (insts : List Instance) (b : Bind) : Option Bind :=
   match b with
   | .nonRec v _ =>
-    if shouldDrop v.name then none else some b
+    if shouldDrop insts v then none else some b
   | .rec_ pairs =>
-    let kept := pairs.filter (fun (v, _) => !shouldDrop v.name)
+    let kept := pairs.filter (fun (v, _) => !shouldDrop insts v)
     if kept.isEmpty then none else some (.rec_ kept)
 
 /-- Top-level binder names from the (filtered) program. -/
@@ -210,9 +212,34 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- guard: a refused module aborts the whole pipeline (`transpile.sh` runs under
     -- `set -e`), so no dependent can read the file this run either way.
     writeNewtypeExports prog.typeDecls
-    let userBinds := prog.binds.filterMap keepBinding
+    let userBinds := prog.binds.filterMap (keepBinding prog.instances)
     let lowered   := Lower.lowerProgram userBinds
     let userProg  : Program := { prog with binds := lowered }
+    -- Refuse a method name declared by two classes: Core references a class
+    -- method by its BARE name, so every call site would be qualified with
+    -- whichever class the instance dump listed first — typechecks, dispatches to
+    -- the wrong class. See Emit's "Same-named methods across classes" section for
+    -- what is reachable (not the single-module shape: GHC rejects that itself).
+    --
+    -- Computed on `userProg` — post-filter, post-`Lower` — so the class set
+    -- checked here is exactly the one `emitFullProgram` merges below. Still
+    -- before any emission: nothing is written until the very end.
+    let ambiguities := Emit.sameMethodAmbiguities userProg
+    if !ambiguities.isEmpty then
+      for (m, cs) in ambiguities do
+        IO.eprintln s!"error: {Emit.sameMethodAmbiguityError m cs}"
+      return 1
+    -- Refuse a declared class method that would fall through to `Maps.valueMap`'s
+    -- builtin of the same name (an operator method with no surviving `$c` bind).
+    -- `emitVar`'s precedence puts `methodMap` first, which settles the case where
+    -- the map HAS the entry; this settles the case where it does not. AFTER the
+    -- ambiguity check: under an ambiguity the map's entries are unreliable, so
+    -- reporting "no entry" first would name the wrong cause.
+    let unmapped := Emit.unmappedOperatorMethods userProg
+    if !unmapped.isEmpty then
+      for (c, m) in unmapped do
+        IO.eprintln s!"error: {Emit.unmappedOperatorMethodError c m}"
+      return 1
     let body      := Emit.emitFullProgram ext.datas userProg extNts
     let crib      := emitNamesCrib ext.datas extNts userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that

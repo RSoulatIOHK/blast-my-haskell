@@ -235,7 +235,13 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 #guard reconRes.1.length == 1
 #guard (reconRes.1.head!).name == "Sized"
 #guard (reconRes.1.head!).methods.map (·.name) == ["size"]
-#guard reconRes.2 == [("size", "Sized")]
+-- M3 Task 2 ADAPTATION: the map is `List MethodRef` (was `List (Name × Name)`),
+-- and the reconstruction leaves `shadowedBy` EMPTY — it sees class shapes, not
+-- the bodies that get emitted; `emitFullProgram` fills it via
+-- `attachMethodShadows`. Pinned so a future caller that forgets that step is a
+-- visibly different value, not a silent reversion to name-only matching.
+#guard reconRes.2 == [{ method := "size", cls := "Sized" }]
+#guard reconRes.2.map (·.shadowedBy) == [([] : List Unique)]
 #guard emitType (reconRes.1.head!).methods.head!.ty == emitType (.tyFun (.tyVar "a") (.tyCon "Int" []))
 -- M3 Task 1 ADAPTATION guard. `reconstructClasses` was rewritten for `ClassDecl`
 -- v2 but is unchanged in substance: it still produces exactly the three
@@ -253,8 +259,8 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 #guard emitClassDecl sizedClass == "class Sized (a : Type) where\n  size : (a → Int)"
 
 -- Dict Task 4: a bare class-method selector emits `Class.method`; others unaffected.
-#guard emitVar [("size","Sized")] [] {name := "size", unique := 7, ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .id} == "Sized.size"
-#guard emitVar [("size","Sized")] [] {name := "other", unique := 8, ty := .tyCon "Int" [], role := .id} == "other_8"
+#guard emitVar [{ method := "size", cls := "Sized" }] [] {name := "size", unique := 7, ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .id} == "Sized.size"
+#guard emitVar [{ method := "size", cls := "Sized" }] [] {name := "other", unique := 8, ty := .tyCon "Int" [], role := .id} == "other_8"
 
 -- Dict Task 5: a user-class instance emits `instance : C T where m := <ref>`.
 #guard (((emitInstanceUser [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
@@ -2564,5 +2570,241 @@ def m3PluginOnly : ClassDecl :=
       theorem `boxTotal boxes = total boxes + 1` is FALSE and blaster falsifies it
       (it did so in the pre-change baseline run too; the emitted file is
       byte-identical, so nothing about it changed); `SuperClass` — observation 4. -/
+
+/-! ## M3 Task 2 — same-named methods, `emitVar` precedence, `$c/=` scoping
+
+### The branch point, and how reality answered it
+
+    The plan asked: when two classes declare the same method name, do the
+    CALL-SITE `Var`s carry distinguishing info (a unique tied to the class-op Id)?
+    Fixture-first, and the answer arrived in two parts.
+
+    (1) THE PREMISED PROGRAM DOES NOT EXIST in one module. Class methods are
+    module-level names, so a second class declaring `size` is a duplicate
+    declaration. `examples/haskell/TwoClassesSameMethod.hs` is that fixture and it
+    dies at `cabal build` under the pipeline's GHC 9.2.7 (no error code — those
+    start at 9.6), never reaching the transpiler:
+
+        TwoClassesSameMethod.hs:41:9: error:
+            Multiple declarations of ‘size’
+            Declared at: TwoClassesSameMethod.hs:38:9
+                         TwoClassesSameMethod.hs:41:9
+
+    So the "silent first-match by instance-dump order" needs the two classes in
+    DIFFERENT modules with this module instantiating both — the path
+    `Emit.sameMethodAmbiguities` refuses, and which has no fixture because
+    cross-module user classes are not supported end-to-end.
+
+    (2) CALL SITES DO CARRY UNIQUES, but nothing can attribute them to a class.
+    From `/tmp/transpile-TwoClassesDistinctMethods.json`, the three `Var`s spelled
+    with a method name (name, unique, type, role):
+
+        boxSize      →  ("size",   8931, _Unknown, id)   -- the class-op selector
+        crateWeight  →  ("weight", 8929, _Unknown, id)   -- the class-op selector
+        applySizer   →  ("size",   8942, TyFun,    id)   -- the local PARAMETER
+                        binder: ("size", 8942, TyFun)
+
+    A selector reference is distinguishable, but only from the OTHER `Var`s in the
+    dump — mapping unique 8931 to `Sized` would need the class-op Id's unique from
+    the decl plugin, which `ppClassOp` does not dump. Adding it is possible: the
+    plugin's uniques are `getKey` (tag in the top byte) while the Core dump keeps
+    only ghc-dump's number part, and the two reconcile —
+    `dfunUnique 8214565720323794489 = 114 * 2^56 + 9785` and 9785 is exactly the
+    `$fSizedBox` binder's unique in `/tmp/transpile-UserClass.json`. It was NOT
+    done, because the plugin only dumps the module's OWN classes and GHC forbids
+    the collision among those: the whole attribution would buy nothing.
+
+    NET: this task's refusal is a TRIPWIRE for an unexercised path, not the removal
+    of a live silent-wrong. The live silent-wrong in this same lookup was LOCAL
+    BINDER SHADOWING (`MethodRef`), and that is what the uniques are used for.
+
+### Guards -/
+
+-- PRECEDENCE, both directions. `methodMap` is consulted before `valueMap`, which
+-- matters only for BARE names now that M1 registered bare operator keys: a
+-- qualified `valueMap` key cannot collide with a (always bare) method key.
+#guard valueMap "++" == some "List.append"          -- the collision is real…
+#guard emitVar [{ method := "++", cls := "Cat" }] []
+         {name := "++", unique := 11, ty := .tyCon "_Unknown" [], role := .id} == "Cat._plus__plus_"
+#guard emitVar [{ method := "++", cls := "Cat" }] []
+         {name := "GHC.Base.++", unique := 12, ty := .tyCon "_Unknown" [], role := .id}
+         == "List.append"
+-- …and with no user method declaring it, a bare `++` is still the builtin.
+#guard emitVar [] [] {name := "++", unique := 13, ty := .tyCon "_Unknown" [], role := .id}
+         == "List.append"
+
+-- SHADOWING. Same name, same map — the unique decides. Mirrors the observed
+-- `applySizer` shape above (selector 8931 vs parameter 8942).
+#guard emitVar [{ method := "size", cls := "Sized", shadowedBy := [8942] }] []
+         {name := "size", unique := 8931, ty := .tyCon "_Unknown" [], role := .id}
+         == "Sized.size"
+#guard emitVar [{ method := "size", cls := "Sized", shadowedBy := [8942] }] []
+         {name := "size", unique := 8942, ty := .tyFun (.tyCon "Box" []) (.tyCon "Int" []), role := .id}
+         == "size_8942"
+
+-- `attachMethodShadows` must see EVERY binder kind; a missed one leaves a
+-- shadowing occurrence looking like a selector. One synthetic bind carrying all
+-- five: top-level binder, lambda, `let` (non-rec), `let rec`, case binder, and
+-- alt pattern binder — each spelled `size` with its own unique.
+def m3t2ShadowBind : Bind :=
+  .nonRec {name := "size", unique := 1, ty := .tyCon "Int" [], role := .id}
+    (.lam {name := "size", unique := 2, ty := .tyCon "Int" [], role := .id}
+      (.let_ (.nonRec {name := "size", unique := 3, ty := .tyCon "Int" [], role := .id}
+                      (.lit (.litInt 0)))
+        (.let_ (.rec_ [({name := "size", unique := 4, ty := .tyCon "Int" [], role := .id},
+                        .lit (.litInt 0))])
+          (.case_ (.lit (.litInt 0))
+                  {name := "size", unique := 5, ty := .tyCon "Int" [], role := .id}
+                  (.tyCon "Int" [])
+                  [.mk (.dataCon "Box") [{name := "size", unique := 6, ty := .tyCon "Int" [], role := .id}]
+                       (.lit (.litInt 0))]))))
+#guard (attachMethodShadows [m3t2ShadowBind] [{ method := "size", cls := "Sized" }]).map
+         (·.shadowedBy) == [[1, 2, 3, 4, 5, 6]]
+-- A name no binder uses keeps an empty list (no blanket suppression).
+#guard (attachMethodShadows [m3t2ShadowBind] [{ method := "weight", cls := "Weighed" }]).map
+         (·.shadowedBy) == [([] : List Unique)]
+
+-- AMBIGUITY REFUSAL. Only exercisable here (see the branch note): two classes
+-- declaring `size` — reported once, naming both classes.
+def m3t2Sized : ClassDecl :=
+  { name := "Sized", tyVars := ["a"], supers := [],
+    methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+def m3t2Weighed : ClassDecl :=
+  { name := "Weighed", tyVars := ["a"], supers := [],
+    methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+def m3t2Container : ClassDecl :=
+  { name := "Container", tyVars := ["a"], supers := ["Sized"],
+    methods := [ { name := "empty", ty := .tyVar "a" },
+                 { name := "insert", ty := .tyFun (.tyCon "Int" []) (.tyVar "a") } ] }
+#guard sameMethodAmbiguities
+         { binds := [], typeDecls := [], instances := [], classDecls := [m3t2Sized, m3t2Weighed] }
+         == [("size", ["Sized", "Weighed"])]
+-- SuperClass.hs's real shape (distinct method names, one a superclass of the
+-- other) must NOT fire, nor must the same class arriving through both channels.
+#guard sameMethodAmbiguities
+         { binds := [], typeDecls := [], instances := [], classDecls := [m3t2Sized, m3t2Container] }
+         == []
+#guard sameMethodAmbiguities
+         { binds := [csizeBind, dfunBind], typeDecls := [], instances := [sizedInst],
+           classDecls := [m3t2Sized] } == []
+#guard ((sameMethodAmbiguityError "size" ["Sized", "Weighed"]).splitOn "`Weighed`").length == 2
+#guard ((sameMethodAmbiguityError "size" ["Sized", "Weighed"]).splitOn "`Sized`").length == 2
+
+-- `$c/=` SCOPING. Dropped for the head of an `Eq` instance (GHC's derived
+-- `not ∘ (==)`, which Lean supplies and whose body would not elaborate); KEPT for
+-- a user class's `/=` when no `Eq` instance covers that head.
+def m3t2NeqBind : Var :=
+  {name := "$c/=", unique := 20,
+   ty := .tyFun (.tyCon "Box" []) (.tyFun (.tyCon "Box" []) (.tyCon "Bool" [])), role := .id}
+def m3t2EqInstBox : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Box" []], dfunName := "$fEqBox", dfunUnique := 21}
+def m3t2EqInstCoin : Instance :=
+  {className := "Eq", headTypes := [.tyCon "Coin" []], dfunName := "$fEqCoin", dfunUnique := 22}
+#guard eqInstanceHeads [m3t2EqInstBox, sizedInst] == ["(GHCCore.tyConOpaque \"Box\")"]
+#guard isEqNeqBind [m3t2EqInstBox] m3t2NeqBind == true
+#guard isEqNeqBind [m3t2EqInstCoin] m3t2NeqBind == false   -- Eq elsewhere ⇒ keep
+#guard isEqNeqBind [] m3t2NeqBind == false                 -- no Eq at all ⇒ keep
+-- A user class's `Sized`-style method is never touched by this rule.
+#guard isEqNeqBind [m3t2EqInstBox]
+         {name := "$csize", unique := 23, ty := .tyFun (.tyCon "Box" []) (.tyCon "Int" []), role := .id}
+         == false
+
+-- BUILTIN FALL-THROUGH REFUSAL. A declared method whose name has a `valueMap`
+-- image and no map entry would emit the builtin AT A REFERENCE to it;
+-- `UserClassNeqWithEq.hs` is the e2e negative. Ordinary method names cannot trip
+-- it, and neither can a declaration nobody references.
+def m3t2NeqClass : ClassDecl :=
+  { name := "Neq", tyVars := ["a"], supers := [],
+    methods := [ { name := "/=", ty := .tyFun (.tyVar "a") (.tyFun (.tyVar "a") (.tyCon "Bool" [])) } ] }
+/-- A user bind that REFERENCES `/=` (what a call site looks like once the class
+    method has no map entry: a bare `Var` the emitter would send to `valueMap`). -/
+def m3t2NeqUse : Bind :=
+  .nonRec {name := "differs", unique := 30,
+           ty := .tyFun (.tyCon "Box" []) (.tyCon "Bool" []), role := .id}
+          (.app (.var {name := "/=", unique := 31, ty := .tyCon "_Unknown" [], role := .id})
+                (.var {name := "b", unique := 32, ty := .tyCon "Box" [], role := .id}))
+#guard unmappedOperatorMethods
+         { binds := [m3t2NeqUse], typeDecls := [], instances := [], classDecls := [m3t2NeqClass] }
+         == [("Neq", "/=")]
+-- USE-LEVEL, and this is the measured half: declared, never referenced ⇒ NOT
+-- refused. A probe of exactly this shape (`class Neq a where (/=)`, no instance,
+-- no use) transpiled AND `lake build`-ed clean before the guard existed, so
+-- refusing it would remove a working module for no soundness gain. Add a
+-- reference (`allDiffer x y = x /= y`, still no instance) and the pre-guard
+-- pipeline emitted the builtin at a type variable and failed
+-- `failed to synthesize` — that case is the one refused, earlier.
+#guard unmappedOperatorMethods
+         { binds := [], typeDecls := [], instances := [], classDecls := [m3t2NeqClass] }
+         == []
+#guard unmappedOperatorMethods
+         { binds := [m3t2NeqUse], typeDecls := [], instances := [],
+           classDecls := [m3t2Sized, m3t2Container] }
+         == []
+-- With the `$c/=` bind present (an instance whose dfun names it), the map has the
+-- entry and nothing is refused — the `UserClassNeq.hs` case.
+def m3t2NeqCBind : Bind :=
+  .nonRec m3t2NeqBind (.lam {name := "b", unique := 24, ty := .tyCon "Box" [], role := .id}
+                            (.var {name := "GHC.Types.True", unique := 25,
+                                   ty := .tyCon "_Unknown" [], role := .id}))
+def m3t2NeqDfun : Bind :=
+  .nonRec {name := "$fNeqBox", unique := 26, ty := .tyCon "Neq" [.tyCon "Box" []], role := .id}
+          (.var m3t2NeqBind)
+def m3t2NeqInst : Instance :=
+  {className := "Neq", headTypes := [.tyCon "Box" []], dfunName := "$fNeqBox", dfunUnique := 26}
+#guard (reconstructClasses [m3t2NeqCBind, m3t2NeqDfun] [m3t2NeqInst]).2
+         == [{ method := "/=", cls := "Neq" }]
+#guard unmappedOperatorMethods
+         { binds := [m3t2NeqCBind, m3t2NeqDfun], typeDecls := [], instances := [m3t2NeqInst],
+           classDecls := [m3t2NeqClass] } == []
+
+/-! ### e2e evidence (fixtures)
+
+    `TwoClassesDistinctMethods.hs` — two classes, distinct method names, instances
+    on different data types, both call sites plus the shadowing case. BEFORE the
+    fix the shadowed parameter was overwritten by the class method:
+
+        def applySizer (size_8942 : (Box → Int)) : Int :=
+          (Sized.size) ((Box.Box) ((3 : Int)))
+
+    Lean accepted it with only `unused variable size_8942`, and blaster FALSIFIED
+    `∀ k, applySizer (fun _ => k) = k` with `k: 4` (the body is constantly 3).
+    AFTER: `(size_8942) ((Box.Box) ((3 : Int)))`, and all three properties
+    (`boxSize_correct`, `crateWeight_correct`, `applySizer_uses_its_argument`) are
+    `✅ Valid`. The two class call sites still emit `Sized.size` / `Weighed.weight`,
+    each its own class's.
+
+    `UserClassNeq.hs` — a user class declaring `(/=)`. BEFORE, `Main.lean`'s
+    unconditional `$c/=` drop removed its only method, `emitInstanceUser` dropped
+    the whole instance, and `lake build` failed `failed to synthesize` at line 20
+    (plus a `translateType: unexpected sort type` from blaster on the orphaned
+    property). AFTER: the `$c/=` def, `instance : Neq Box where _slash__eq_ := …`,
+    a call site rewritten to `Neq._slash__eq_`, and `differs_is_inequality`
+    `✅ Valid`.
+
+    `UserClassNeqWithEq.hs` — the same class at a head that ALSO has `deriving Eq`.
+    Both `$c/=` binds share the head type, so both are dropped and the map has no
+    entry; BEFORE this task's second refusal the call site silently became the
+    builtin (`(fun a b => !(a == b))`, accepted because `deriving Eq` supplied
+    `BEq Box`). NOW refused, `rc=1`, no file written.
+
+### Regression evidence (post-change)
+
+    Byte-identical to a baseline built from the pre-change sources (`git stash` of
+    Emit/Main/Unit, rebuilt binary, transpiled, diffed): `UserClass`, `Ratio`,
+    `Arithmetic`, `OrdInstance`, `NewtypeBasic`, `RecordOps`, `SuperClass`.
+    `Ratio`/`Arithmetic`/`OrdInstance` are the ones that carry `$c/=` binds
+    (`Ratio` has TWO Eq instances — `$c/=` at uniques 12069 and 12087 — so it also
+    pins that the head-keyed rule drops both), which is what makes the `$c/=`
+    change verified rather than argued. `NewtypeInstances` still refused with a
+    byte-identical message.
+
+    `lake build GhcCoreToLean.Generated.<M>` green (0 errors) for NewtypeBasic,
+    RecordOps, Ratio, Arithmetic, OrdInstance, UserClassNeq,
+    TwoClassesDistinctMethods.
+
+    NOT re-verified this task: the remaining ~15 corpus fixtures declare no class
+    at all, so `reconstructClasses` returns `([], [])`, `attachMethodShadows`
+    returns `[]`, and both new guards return `[]` — the only reachable change for
+    them is the `$c/=` rule, byte-verified on the three fixtures that have one. -/
 
 end GhcCoreToLean.Tests
