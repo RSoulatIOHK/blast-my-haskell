@@ -191,10 +191,49 @@ deriving Repr, DecidableEq, Inhabited
       method IS the referent and must win over the hedged bare `valueMap` key.
 
     What makes a bare-name match mean "the selector" is `MethodRef.shadowedBy`,
-    which excludes locally-bound occurrences of the name; see that docstring. -/
+    which excludes locally-bound occurrences of the name; see that docstring.
+
+    SHADOWING GATES `valueMap`, and the two tests are therefore SEQUENCED rather
+    than conjoined. A name-match decides that the name belongs to the module (the
+    bullet above); `shadowedBy` then decides only WHICH of the module's `Id`s it
+    is — the selector or a local binder. Neither answer is ever the builtin, so a
+    suppressed match must route to `refId`, not fall through.
+
+    Folding the shadow test into the `find?` predicate — as this did until the
+    cross-cell fixture existed — made a suppressed match indistinguishable from
+    "no such method", so it fell into `valueMap`. For an ordinary method name that
+    is harmless (`valueMap "size"` is `none`, so the fall-through reached `refId`
+    anyway), which is why `TwoClassesDistinctMethods.hs` passed. For an OPERATOR
+    method name it is not. OBSERVED on `examples/haskell/OperatorShadow.hs`, whose
+    `applyEq`'s parameter is named `(==)` in a module declaring `class MyEq a where
+    (==)`:
+
+        def applyEq (_eq__eq__9645 : (Int → (Int → Bool))) (p_9646 : Int)
+            (q_9647 : Int) : Bool :=
+          (((· == ·)) (p_9646)) (q_9647)
+
+    — the builtin, with the parameter unused; Lean accepted it (`BEq Int` is in
+    scope) and blaster falsified `∀ p q, applyEq (fun _ _ => false) p q = false`
+    with `p: 0, q: 0`.
+
+    The sequencing also makes the `methodMap` lookup FIRST-MATCH-WINS on the name
+    where the conjoined form would have kept searching for an unshadowed entry
+    with the same name. That is unobservable: two entries sharing a `method`
+    require two classes declaring it, which `sameMethodAmbiguities` refuses
+    upstream (and GHC rejects outright within one module) — that refusal is the
+    proof, not the sweep: no green-regression fixture HAS a duplicated `method`,
+    so their byte-identical output measures the reorder's emission-neutrality
+    generally and is silent on this shape specifically.
+
+    `refId` (not `localId`) is the suppressed arm for safety, and degenerates to
+    `localId` for every reachable case: a method name is bare, so `refId`'s
+    qualified arm cannot fire, and its top-level arm cannot either — a top-level
+    binder spelled like a method the module declares is a duplicate declaration
+    that GHC rejects (see `TwoClassesSameMethod.hs`). -/
 def emitVar (methodMap : List MethodRef) (topNames : List Name) (v : Var) : String :=
-  match methodMap.find? (fun m => m.method == v.name && !m.shadowedBy.contains v.unique) with
-  | some m    => s!"{sanitize m.cls}.{sanitize v.name}"
+  match methodMap.find? (fun m => m.method == v.name) with
+  | some m    => if m.shadowedBy.contains v.unique then refId topNames v
+                 else s!"{sanitize m.cls}.{sanitize v.name}"
   | none      =>
   match valueMap v.name with
   | some lean => lean

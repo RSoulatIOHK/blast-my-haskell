@@ -2642,6 +2642,25 @@ def m3PluginOnly : ClassDecl :=
          {name := "size", unique := 8942, ty := .tyFun (.tyCon "Box" []) (.tyCon "Int" []), role := .id}
          == "size_8942"
 
+-- SHADOWING × BUILTIN NAME — the CROSS of the two tests above, and the cell
+-- `size` cannot reach. The three cells above pass under either control flow;
+-- this one discriminates. A suppressed match used to be indistinguishable from
+-- "no such method" and fall into `valueMap`: harmless for `size` (no image, so
+-- the fall-through reached `refId` anyway), the BUILTIN for an operator method.
+-- Mirrors the observed `applyEq` shape in `examples/haskell/OperatorShadow.hs`
+-- (parameter 9645 vs selector 9721).
+#guard valueMap "==" == some "(· == ·)"        -- the fall-through target is live…
+#guard emitVar [{ method := "==", cls := "MyEq", shadowedBy := [9645] }] []
+         {name := "==", unique := 9645,
+          ty := .tyFun (.tyCon "Int" []) (.tyFun (.tyCon "Int" []) (.tyCon "Bool" [])),
+          role := .id}
+         == "_eq__eq__9645"
+-- …and suppression stays scoped to the shadowing unique: the selector in that
+-- same module still qualifies.
+#guard emitVar [{ method := "==", cls := "MyEq", shadowedBy := [9645] }] []
+         {name := "==", unique := 9721, ty := .tyCon "_Unknown" [], role := .id}
+         == "MyEq._eq__eq_"
+
 -- `attachMethodShadows` must see EVERY binder kind; a missed one leaves a
 -- shadowing occurrence looking like a selector. One synthetic bind carrying all
 -- five: top-level binder, lambda, `let` (non-rec), `let rec`, case binder, and
