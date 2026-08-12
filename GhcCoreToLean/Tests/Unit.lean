@@ -2826,4 +2826,345 @@ def m3t2NeqInst : Instance :=
     returns `[]`, and both new guards return `[]` — the only reachable change for
     them is the `$c/=` rule, byte-verified on the three fixtures that have one. -/
 
+/-! ## M3 Task 3 — builtin class constraints in signatures (`Maps.classConMap`)
+
+### The two defects, as observed before the change
+
+    `examples/haskell/BuiltinConstraints.hs` transpiled with the pre-change binary
+    (`/tmp/BuiltinConstraints-before.lean`). `stripClassConstraints`' gate was
+    `classNames` = USER classes only, so a builtin constraint arrow was never
+    peeled and BOTH callers of that function went wrong at once:
+
+        def allSame {t_v3009 : Type} (x_3010 : ((GHCCore.tyConOpaque "Eq") (t_v3009)))
+                    (y_3011 : t_v3009) : (t_v3009 → Bool) :=
+          (((· == ·)) (x_3010)) (y_3011)
+
+    (a) the first VALUE binder is typed as the dictionary — `Lower` had already
+    erased the dict at the value level, so `x_3010` IS the Haskell `x`; (b) the
+    result type is `(t_v3009 → Bool)` instead of `Bool`, because `resTyOf` peeled
+    two arrows off a type that still had three. Loud in both cases (there is no
+    `GHCCore.tyConOpaque` in scope in a Generated module at all), never
+    silent-wrong — but nothing with a builtin constraint could compile.
+
+    The widening therefore lives INSIDE `stripClassConstraintsGo`, not in a gate
+    threaded to each caller, so `emitDefHeader` and `resTyOf` cannot drift apart
+    again.
+
+### Which binder set — probed, not assumed
+
+    Haskell's `Ord` methods do not map to `[Ord t]`. The transpiler's images are
+    `decide (a < b)` / `decide (a ≤ b)` (Lean's `<`/`≤` are `Prop`-valued),
+    `Min.min`/`Max.max`, and `compare`. Measured in a scratch file against
+    `fun (x y : t) => …` for each image:
+
+        [Ord t]                                    → FAILS: "failed to synthesize
+                                                     LT t" / "LE t" / "Min t"
+                                                     (`compare` alone is fine)
+        + [LT t] [LE t] [Min t] [Max t] [BEq t]    → FAILS: "failed to synthesize
+                                                     Decidable (a < b)" / "(a ≤ b)"
+        + [DecidableLT t] [DecidableLE t]          → ALL elaborate: `<`, `≤`, `>`,
+                                                     `≥`, `Min.min`, `Max.max`,
+                                                     `compare`, `==`,
+                                                     `(List.max? xs).getD default`,
+                                                     `(List.min? xs).getD default`,
+                                                     `xs.contains x`
+        drop [Ord t] from that set                 → FAILS: `compare` needs it
+
+    Lean core makes `ltOfOrd`/`leOfOrd`/`minOfLe`/`maxOfLe` plain DEFS, not
+    instances, which is why the caller has to supply them. Callers can: `Int`
+    satisfies the whole set, and so does a `deriving Ord` inductive carrying
+    `emitDataDecl`'s companion instances (`instance : LT T := ltOfOrd`, …) —
+    checked by elaborating a call at both.
+
+    `[BEq t]` belongs in the Ord set because Haskell's `Ord a` implies `Eq a`
+    (GHC projects it with `$p1Ord`), so an `Ord`-constrained body may use `==`.
+    `ordEq` in the fixture is exactly that body and would not elaborate without it.
+
+    REJECTED ALTERNATIVE (measured, not assumed): keep the header at `[Ord t]`
+    alone and derive LT/LE/Min/Max in the BODY, which would make the order
+    COHERENT by construction rather than trusting the caller to pass an `LT` that
+    agrees with its `Ord`. `have _i : LT t := ltOfOrd` does NOT work — the fvar is
+    opaque, so `Decidable (a < b)` is not found and core's
+    `DecidableRel (@LT.lt α ltOfOrd)` instance cannot match (`Decidable
+    (@LT.lt t ltOfOrd a b)` vs `Decidable (@LT.lt t _i a b)`). Zeta-transparent
+    `let _i : LT t := ltOfOrd` DOES work for `<`, but `Min`/`Max` then need their
+    own `let`-bound `DecidableRel LE.le` companion, and the whole scheme rewrites
+    every constrained def's BODY on an elaboration-transparency detail. Out of
+    scope here.
+    SCOPE OF THE GENERALITY CAVEAT this leaves: the emitted Lean def is MORE
+    general than its Haskell source, since nothing ties the `LT`/`LE`/`Min`/`Max`/
+    `BEq` arguments to the `Ord` one. Every instantiation the transpiler itself
+    can produce is coherent (`Int`'s core instances; `emitDataDecl`'s companions,
+    all derived from the same `Ord` via `leOfOrd`/`ltOfOrd`/`minOfLe`/`maxOfLe`),
+    so no emitted call site can observe the difference; a hand-written call
+    passing deliberately disagreeing instances would be outside the image of any
+    Haskell program.
+
+### Why `Num` is four binders and no `OfNat` — measured
+
+    `emitLiteral` emits numeric literals Int-ASCRIBED (`(1 : Int)`), so
+    `[OfNat t 0] [OfNat t 1]` would be dead weight. Probed on a throwaway
+    `incr :: Num a => a -> a; incr x = x + 1`, which emits
+    `(((· + ·)) (x_2273)) ((id) ((1 : Int)))` (Haskell's `fromInteger` maps to
+    `id`) and fails with
+
+        error: failed to synthesize  HAdd t_v2272 Int t_v2272
+
+    — an `OfNat` binder would not have helped; the ascription is the blocker. And
+    `absG x = abs x` emits `(fun a => if a < 0 then -a else a)`, failing
+    "failed to synthesize OfNat t_v2132 0" AND "LT t_v2132": `abs`/`signum` need
+    the Ord binder set a `Num a` constraint does not supply. All LOUD, no
+    silent-wrong, so `Num` is mapped for the `+`/`-`/`*`/`negate` fragment and the
+    literal / `abs` / `signum` fragment is a recorded deferral.
+
+### Unmapped builtin stays LOUD
+
+    Probed on a throwaway `halve :: Fractional a => a -> a`. The constraint head
+    arrives in the same shape as the mapped ones
+    (`{"args":[{"name":"_v2131","tag":"TyVar"}],"name":"Fractional","tag":"TyCon"}`),
+    `classConMap` returns `none`, the peel stops, and the emitted def carries the
+    pre-change defect shape on purpose — two hard errors, `Unknown identifier
+    'GHCCore.tyConOpaque'` and `Unknown identifier 'GHC.Real._slash_'`. -/
+
+#guard classConMap "Eq" == some ["[BEq {t}]"]
+-- ORDER IS LOAD-BEARING, so the whole SEQUENCE is pinned, not membership:
+-- `DecidableLT t` = `DecidableRel (LT.lt : t → t → Prop)` only elaborates with
+-- `LT t` already bound (same for `DecidableLE`/`LE`).
+#guard classConMap "Ord" ==
+  some ["[Ord {t}]", "[LT {t}]", "[LE {t}]", "[DecidableLT {t}]", "[DecidableLE {t}]",
+        "[Min {t}]", "[Max {t}]", "[BEq {t}]"]
+#guard classConMap "Num" == some ["[Add {t}]", "[Sub {t}]", "[Mul {t}]", "[Neg {t}]"]
+-- Qualified hedges (the shim delivers BARE heads; observed above).
+#guard classConMap "GHC.Classes.Eq" == classConMap "Eq"
+#guard classConMap "GHC.Classes.Ord" == classConMap "Ord"
+#guard classConMap "GHC.Num.Num" == classConMap "Num"
+-- Deliberately unmapped builtins — `none` here is what keeps them loud.
+#guard classConMap "Fractional" == none
+#guard classConMap "Integral"   == none
+#guard classConMap "Real"       == none
+#guard classConMap "Show"       == none
+#guard classConMap "Enum"       == none
+#guard classConMap "Sized"      == none   -- a USER class is not this map's business
+
+/-! ### `stripClassConstraints` — binders AND the stripped type
+
+    The types below are the shapes actually dumped for
+    `examples/haskell/BuiltinConstraints.hs` (`/tmp/transpile-BuiltinConstraints.json`):
+    `ForAll a. TyFun (TyCon "Eq" [TyVar "_v3009"]) …`, class head BARE. -/
+
+def m3t3TyA : GHCType := .tyVar "_v3009"
+
+-- allSame :: Eq a => a -> a -> Bool
+def m3t3AllSameVar : Var :=
+  { name := "allSame", unique := 2129, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Eq" [m3t3TyA])
+            (.tyFun m3t3TyA (.tyFun m3t3TyA (.tyCon "Bool" [])))) }
+#guard (stripClassConstraints [] m3t3AllSameVar.ty).1 == ["[BEq t_v3009]"]
+-- The stripped type is the VALUE signature — one arrow shorter than what
+-- `resTyOf` used to see, which is defect (b).
+#guard emitType (stripClassConstraints [] m3t3AllSameVar.ty).2
+         == "(t_v3009 → (t_v3009 → Bool))"
+
+-- maxG :: Ord a => [a] -> a
+def m3t3TyB : GHCType := .tyVar "_v3007"
+def m3t3MaxGVar : Var :=
+  { name := "maxG", unique := 2130, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Ord" [m3t3TyB])
+            (.tyFun (.tyCon "[]" [m3t3TyB]) m3t3TyB)) }
+#guard (stripClassConstraints [] m3t3MaxGVar.ty).1
+         == ["[Ord t_v3007]", "[LT t_v3007]", "[LE t_v3007]", "[DecidableLT t_v3007]",
+             "[DecidableLE t_v3007]", "[Min t_v3007]", "[Max t_v3007]", "[BEq t_v3007]"]
+#guard emitType (stripClassConstraints [] m3t3MaxGVar.ty).2 == "(List t_v3007 → t_v3007)"
+
+-- USER classes are matched FIRST and emit exactly as before: `[C t]`.
+def m3t3TyD : GHCType := .tyVar "_v9"
+def m3t3TotalVar : Var :=
+  { name := "total", unique := 9, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Sized" [m3t3TyD])
+            (.tyFun (.tyCon "[]" [m3t3TyD]) (.tyCon "Int" []))) }
+#guard (stripClassConstraints ["Sized"] m3t3TotalVar.ty).1 == ["[Sized t_v9]"]
+#guard emitType (stripClassConstraints ["Sized"] m3t3TotalVar.ty).2 == "(List t_v9 → Int)"
+
+-- An UNMAPPED builtin peels NOTHING and hands back the type UNCHANGED (the
+-- `tyConOpaque` head is what then fails loud in Lean).
+def m3t3TyC : GHCType := .tyVar "_v2131"
+def m3t3HalveVar : Var :=
+  { name := "halve", unique := 2131, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Fractional" [m3t3TyC]) (.tyFun m3t3TyC m3t3TyC)) }
+#guard (stripClassConstraints [] m3t3HalveVar.ty).1 == []
+#guard emitType (stripClassConstraints [] m3t3HalveVar.ty).2
+         == "(((GHCCore.tyConOpaque \"Fractional\") (t_v2131)) → (t_v2131 → t_v2131))"
+
+-- A non-tyvar constraint head (`Eq [a]`) does not match the peel pattern either —
+-- UNCHANGED from before this map existed, and stated so it reads as scoped rather
+-- than missed. Unreachable from the corpus (GHC passes no dictionary for a
+-- monomorphic signature).
+def m3t3ListEqVar : Var :=
+  { name := "listEq", unique := 11, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Eq" [.tyCon "[]" [m3t3TyA]])
+            (.tyFun (.tyCon "[]" [m3t3TyA]) (.tyCon "Bool" []))) }
+#guard (stripClassConstraints [] m3t3ListEqVar.ty).1 == []
+#guard emitType (stripClassConstraints [] m3t3ListEqVar.ty).2
+         == "(((GHCCore.tyConOpaque \"Eq\") (List t_v3009)) → (List t_v3009 → Bool))"
+
+-- `(Eq a, Ord a) =>` peels two constraints whose images OVERLAP (`[BEq t]` is in
+-- the Ord set). The wrapper dedups; first-occurrence order survives, so `LT`
+-- still precedes `DecidableLT`.
+def m3t3BothVar : Var :=
+  { name := "both", unique := 10, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Eq" [m3t3TyA])
+            (.tyFun (.tyCon "Ord" [m3t3TyA]) (.tyFun m3t3TyA (.tyCon "Bool" [])))) }
+#guard (stripClassConstraintsGo [] m3t3BothVar.ty).1.length == 9   -- pre-dedup
+#guard (stripClassConstraints [] m3t3BothVar.ty).1
+         == ["[BEq t_v3009]", "[Ord t_v3009]", "[LT t_v3009]", "[LE t_v3009]",
+             "[DecidableLT t_v3009]", "[DecidableLE t_v3009]", "[Min t_v3009]",
+             "[Max t_v3009]"]
+-- Different type variables are different binders and are never merged.
+def m3t3TwoVarVar : Var :=
+  { name := "twoVar", unique := 12, role := .id,
+    ty := .forAll "a" (.forAll "b" (.tyFun (.tyCon "Eq" [m3t3TyA])
+            (.tyFun (.tyCon "Eq" [.tyVar "_v3010"]) (.tyCon "Bool" [])))) }
+#guard (stripClassConstraints [] m3t3TwoVarVar.ty).1 == ["[BEq t_v3009]", "[BEq t_v3010]"]
+
+/-! ### `resTyOf` alignment — the whole header, character-exact
+
+    These pin defect (b) shut: the strings below are BYTE-IDENTICAL to the
+    corresponding defs in `GhcCoreToLean/Generated/BuiltinConstraints.lean`, so a
+    regression in either `emitDefHeader`'s binder list or `emitBind`'s `resTyOf`
+    breaks the build here rather than only at a fixture. -/
+
+def m3t3XV : Var := { name := "x", unique := 3010, ty := m3t3TyA, role := .id }
+def m3t3YV : Var := { name := "y", unique := 3011, ty := m3t3TyA, role := .id }
+def m3t3EqV : Var :=
+  { name := "GHC.Classes.==", unique := 0, ty := .tyCon "_Unknown" [], role := .id }
+-- The rhs has TWO lambdas, not four: `Lower` already erased the type binder and
+-- the `$dEq` dict binder (role `dict`) — that erasure is what makes the type-side
+-- peel necessary. Observed in /tmp/transpile-BuiltinConstraints.json.
+def m3t3AllSameBind : Bind :=
+  .nonRec m3t3AllSameVar
+    (.lam m3t3XV (.lam m3t3YV (.app (.app (.var m3t3EqV) (.var m3t3XV)) (.var m3t3YV))))
+#guard emitBind [] [] [] m3t3AllSameBind ==
+  "def allSame {t_v3009 : Type} [BEq t_v3009] (x_3010 : t_v3009) (y_3011 : t_v3009) : Bool :=\n" ++
+  "  (((· == ·)) (x_3010)) (y_3011)"
+
+-- `Ord a => [a] -> a` with a PARTIAL body: M1's `[Inhabited t]` (for the ⊥ →
+-- `default` image of `maximum`) and the Ord binder set have to coexist, implicits
+-- first. This is the header the plan predicted and the first e2e exercise of the
+-- polymorphic partial path.
+def m3t3XsV : Var := { name := "xs", unique := 3014, ty := .tyCon "[]" [m3t3TyB], role := .id }
+def m3t3MaxV : Var :=
+  { name := "Data.Foldable.maximum", unique := 0, ty := .tyCon "_Unknown" [], role := .id }
+def m3t3MaxGBind : Bind :=
+  .nonRec m3t3MaxGVar (.lam m3t3XsV (.app (.var m3t3MaxV) (.var m3t3XsV)))
+#guard emitBind [] [] [] m3t3MaxGBind ==
+  "def maxG {t_v3007 : Type} [Inhabited t_v3007] [Ord t_v3007] [LT t_v3007] [LE t_v3007] " ++
+  "[DecidableLT t_v3007] [DecidableLE t_v3007] [Min t_v3007] [Max t_v3007] [BEq t_v3007] " ++
+  "(xs_3014 : List t_v3007) : t_v3007 :=\n" ++
+  "  ((fun xs => (List.max? xs).getD default)) (xs_3014)"
+
+-- The LOUD shape, pinned so "unmapped builtin stays loud" is a test and not a
+-- hope: the dict-typed first binder AND the shifted result type are BOTH still
+-- there for `Fractional`. This is character-identical to the pre-change output
+-- for `Eq` with the class name swapped — i.e. it is defect (a)+(b) preserved
+-- deliberately, exactly where a mapping is missing.
+def m3t3HXV : Var := { name := "x", unique := 2435, ty := m3t3TyC, role := .id }
+def m3t3DivV : Var :=
+  { name := "GHC.Real./", unique := 0, ty := .tyCon "_Unknown" [], role := .id }
+def m3t3HalveBind : Bind :=
+  .nonRec m3t3HalveVar
+    (.lam m3t3HXV (.app (.app (.var m3t3DivV) (.var m3t3HXV)) (.var m3t3HXV)))
+#guard emitBind [] [] [] m3t3HalveBind ==
+  "def halve {t_v2131 : Type} (x_2435 : ((GHCCore.tyConOpaque \"Fractional\") (t_v2131))) : " ++
+  "(t_v2131 → t_v2131) :=\n" ++
+  "  ((GHC.Real._slash_) (x_2435)) (x_2435)"
+
+/-! ### The `[BEq t]` binder makes INSTANCE SELECTION load-bearing — pinned
+
+    New risk this task introduces: `[BEq t]` in the `Eq` and `Ord` sets means a
+    call site now RESOLVES a `BEq` instance where nothing resolved one before. A
+    type with a HAND-WRITTEN Eq (emitted as `instance : BEq T`) that ALSO has Ord
+    gets a SECOND candidate, because `emitDataDecl` derives `DecidableEq` whenever
+    `hasOrd` and core's `instBEqOfDecidableEq` lifts that to `BEq T`. If the
+    derived structural one won, an `Eq`-constrained function applied at that type
+    would return structural equality where Haskell returns the hand-written
+    result — silent-wrong.
+
+    It does not win. Measured below in the emitter's own section order (data +
+    `deriving` first, instances after — fact 7's ordering constraint): the
+    locally-declared `instance : BEq R` beats core's generic lift, `#synth BEq R`
+    answers `instBEqR`, and the cross-multiply semantics survives both a direct
+    `==` and a `[BEq t]`-constrained polymorphic call. Pinned as a `#guard` rather
+    than a comment precisely because the failing direction would be silent.
+
+    NOT EXERCISED e2e: no corpus type has both a hand-written Eq and an Ord —
+    `Ratio`'s `CustomRatio`/`CustomRatioSOP` have hand-written Eq and NO Ord (so
+    no `DecidableEq` is derived for them at all), and `OrdInstance`'s `Coin`
+    derives BOTH (one route only). So this is a scoped guard on the mechanism, not
+    fixture evidence. It becomes live in Task 6, which stops replacing
+    hand-written Ord with `deriving Ord`. -/
+
+inductive M3T3R where
+  | mk : Int → Int → M3T3R
+deriving Repr, Inhabited, DecidableEq, Ord
+
+instance : LE M3T3R := leOfOrd
+instance : LT M3T3R := ltOfOrd
+instance : Min M3T3R := minOfLe
+instance : Max M3T3R := maxOfLe
+-- The hand-written cross-multiply Eq, in the shape `emitInstance` produces.
+instance : BEq M3T3R where
+  beq a b := match a, b with | .mk p q, .mk r s => p * s == r * q
+
+-- `allSame`'s emitted shape, at the binder set this task assigns to `Eq a =>`.
+def m3t3AllSameAt {t : Type} [BEq t] (x y : t) : Bool := (((· == ·)) x) y
+
+-- Haskell semantics (hand-written): 1/2 == 2/4 is TRUE. Structural: FALSE.
+#guard m3t3AllSameAt (M3T3R.mk 1 2) (M3T3R.mk 2 4) == true
+#guard ((M3T3R.mk 1 2) == (M3T3R.mk 2 4)) == true
+-- …and the hand-written instance is still discriminating, not constantly true.
+#guard m3t3AllSameAt (M3T3R.mk 1 2) (M3T3R.mk 3 4) == false
+
+/-! ### e2e evidence (`examples/haskell/BuiltinConstraints.hs`)
+
+    `lake build GhcCoreToLean.Generated.BuiltinConstraints` — 0 errors, all nine
+    quantified properties `✅ Valid` under blaster at the `Int` instantiation of
+    the POLYMORPHIC defs (no monomorphic wrapper needed): `allSame_isBEq`,
+    `notSame_isNotBEq`, `allSameInt_agrees`, `ordered_isLt`, `ordEq_isLe`,
+    `maxG_pair`, `double_isAdd`, `sumSquares_expand`, `negateBoth_expand`; plus
+    four ground `decide` properties (`maxG_example`, `maxG_empty_isDefault`,
+    `clamp_middle`, `clamp_above`). `ordEq_isLe` and `maxG_pair` are the two that
+    exercise real order theory (`(x<y) ∨ (x==y) = (x≤y)`, and `List.max?` over a
+    two-element list) — both went through as-is, so no `decide` fallback was
+    needed anywhere.
+
+    The polymorphic defs COMPILING is itself the feature: before the change none
+    of them could, and the `maxG` header is the first one carrying an M1
+    `[Inhabited t]` binder alongside a builtin constraint set.
+
+### Regression evidence (post-change)
+
+    Corpus-wide `grep -n '::.*=>' examples/haskell/*.hs` shows the ONLY builtin
+    constraints anywhere are `BuiltinConstraints.hs`'s own; every other
+    constrained signature is a USER class (`UserClass.hs`'s `Sized a =>`,
+    `SuperClass.hs`'s `Container a =>`), which takes the unchanged
+    `classNames`-first branch — so byte-identity is expected everywhere else, and
+    it was MEASURED rather than argued: baselines were built by `git stash`ing
+    Maps/Emit/Unit, rebuilding the binary, transpiling, restoring, and diffing.
+
+    BYTE-IDENTICAL (12/12): `UserClass`, `Ratio`, `RecordOps`, `NewtypeBasic`,
+    `SuperClass` (still unchanged-degraded — the Task 5 `extends` gap, untouched
+    here), `OrdInstance`, `Arithmetic`, `ListLibrary`, `TupleBasics`,
+    `PreludeNames`, `NumOrd`, `PartialHead`. The last two are the ones that would
+    have moved had the peel over-fired: `NumOrd`/`PartialHead` use the very
+    `Ord`/`Num`/partial operators this task maps, but MONOMORPHICALLY (no
+    dictionary is passed, so there is no constraint arrow to peel).
+
+    Refusals intact: `NewtypeInstances` (message identical modulo the output path
+    passed on the command line, no file written) and `UserClassNeqWithEq`
+    (`rc=1`, Task 2's builtin-method-collision refusal).
+
+    `lake build GhcCoreToLean.Generated.<M>` green (0 errors): BuiltinConstraints,
+    Ratio, Arithmetic, OrdInstance, NewtypeBasic, RecordOps, ListLibrary,
+    TupleBasics. -/
+
 end GhcCoreToLean.Tests

@@ -421,20 +421,56 @@ private partial def peelLams : Expr → List Var × Expr
     (v :: vs, b)
   | other       => ([], other)
 
-/-- Peel leading class-constraint arrows (`C t → …` where `C ∈ classNames`) off a
-    def signature, returning the `[C t]` instance-implicit binder strings and the
-    remaining (constraint-stripped) type. `∀`-binders are skipped (their tyvars
-    are handled by `collectTyVars`). The term-level dict binder is already erased
-    by `Lower`, so stripping the dict arrow from the *type* realigns the value
-    args / result with the term binders. Stops at the first non-constraint arrow. -/
-private partial def stripClassConstraints (classNames : List Name) : GHCType → List String × GHCType
-  | .forAll _ b => stripClassConstraints classNames b
+private def dedup (xs : List Name) : List Name :=
+  xs.foldl (init := []) fun acc x => if acc.contains x then acc else acc ++ [x]
+
+/-- Peel leading class-constraint arrows off a def signature, returning the
+    instance-implicit binder strings and the remaining (constraint-stripped)
+    type. `∀`-binders are skipped (their tyvars are handled by `collectTyVars`).
+    The term-level dict binder is already erased by `Lower`, so stripping the
+    dict arrow from the *type* realigns the value args / result with the term
+    binders. Stops at the first non-constraint arrow.
+
+    A constraint is recognised in two ways, user classes FIRST:
+    * `C ∈ classNames` — a class the transpiler emits itself → `[C t]`.
+    * `Maps.classConMap C` — a BUILTIN class with a Lean image → that map's
+      binder templates, `{t}` filled in (`Eq a =>` ⇒ `[BEq t]`).
+    Anything else is not a constraint as far as this function is concerned and
+    stops the peel, which is what keeps an unmapped builtin (`Fractional a =>`)
+    LOUD: the arrow stays, the first value binder gets the dictionary's type, and
+    the generated file does not elaborate.
+
+    Only a constraint whose argument is a bare type VARIABLE is peeled. A head
+    like `Eq [a]` / `Eq Int` does not match the pattern and stays loud —
+    unchanged from before this map existed, and not reachable from the fixtures
+    (GHC passes no dictionary for a monomorphic signature).
+
+    Both defects of M3 fact 3 live in the two callers of this function
+    (`emitDefHeader`'s binder list and `emitBind`'s `resTyOf`), so the widening
+    goes HERE rather than in a gate threaded to each: the callers cannot drift
+    apart. Kept non-`private` so `Tests/Unit.lean` can guard it directly. -/
+partial def stripClassConstraintsGo (classNames : List Name) : GHCType → List String × GHCType
+  | .forAll _ b => stripClassConstraintsGo classNames b
   | .tyFun (.tyCon c [.tyVar t]) r =>
-    if classNames.contains c then
-      let (cs, rest) := stripClassConstraints classNames r
-      (s!"[{sanitize c} {tyVarId t}]" :: cs, rest)
-    else ([], .tyFun (.tyCon c [.tyVar t]) r)
+    let binders : Option (List String) :=
+      if classNames.contains c then some [s!"[{sanitize c} {tyVarId t}]"]
+      else (Maps.classConMap c).map (·.map (·.replace "{t}" (tyVarId t)))
+    match binders with
+    | some bs =>
+      let (cs, rest) := stripClassConstraintsGo classNames r
+      (bs ++ cs, rest)
+    | none => ([], .tyFun (.tyCon c [.tyVar t]) r)
   | t => ([], t)
+
+/-- `stripClassConstraintsGo` with the binder list deduplicated. An explicit
+    `(Eq a, Ord a) => …` peels two constraints whose Lean images overlap (`Ord`'s
+    set contains `[BEq t]`), and repeating an instance-implicit binder, while
+    legal, is noise. First-occurrence order is preserved, so `LT` still precedes
+    `DecidableLT`. Binders for DIFFERENT type variables are different strings and
+    are never merged. -/
+def stripClassConstraints (classNames : List Name) (t : GHCType) : List String × GHCType :=
+  let (cs, rest) := stripClassConstraintsGo classNames t
+  (dedup cs, rest)
 
 private partial def stripFunTys : Nat → GHCType → GHCType
   | 0,     t            => t
@@ -462,9 +498,6 @@ private partial def collectTyVars : GHCType → List Name
   | .forAll _ b   => collectTyVars b
   | .tyCon _ args => args.flatMap collectTyVars
   | .tyLit _      => []
-
-private def dedup (xs : List Name) : List Name :=
-  xs.foldl (init := []) fun acc x => if acc.contains x then acc else acc ++ [x]
 
 /-- GHC class-method bindings are named `$c<op>` (e.g. `$c==`). With more than
     one instance of a class these collide after sanitization, so we suffix them
