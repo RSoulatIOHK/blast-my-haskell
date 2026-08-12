@@ -2891,14 +2891,60 @@ def m3t2NeqInst : Instance :=
     own `let`-bound `DecidableRel LE.le` companion, and the whole scheme rewrites
     every constrained def's BODY on an elaboration-transparency detail. Out of
     scope here.
-    SCOPE OF THE GENERALITY CAVEAT this leaves: the emitted Lean def is MORE
-    general than its Haskell source, since nothing ties the `LT`/`LE`/`Min`/`Max`/
-    `BEq` arguments to the `Ord` one. Every instantiation the transpiler itself
-    can produce is coherent (`Int`'s core instances; `emitDataDecl`'s companions,
-    all derived from the same `Ord` via `leOfOrd`/`ltOfOrd`/`minOfLe`/`maxOfLe`),
-    so no emitted call site can observe the difference; a hand-written call
-    passing deliberately disagreeing instances would be outside the image of any
-    Haskell program.
+    SCOPE OF THE GENERALITY CAVEAT this leaves — the property is FAITHFULNESS,
+    NOT coherence. The emitted Lean def is MORE general than its Haskell source,
+    since nothing ties the `LT`/`LE`/`Min`/`Max`/`BEq` arguments to the `Ord` one.
+    The two halves of that set have DIFFERENT statuses and must not be lumped:
+
+    * `LT`/`LE`/`Min`/`Max` are coherent BY CONSTRUCTION at every type the
+      transpiler emits, because there is only ever one `Ord` for them to come
+      from: `emitDataDecl` emits the companions as `leOfOrd`/`ltOfOrd`/`minOfLe`/
+      `maxOfLe` off that type's single `Ord` (its `ordInsts` block), and `Int`'s
+      core instances agree the same way.
+    * `[BEq t]` is DELIBERATELY left untied, and it is NOT coherent by
+      construction — because in Haskell it is not either. `Eq a` and `Ord a` are
+      INDEPENDENT dictionaries; `Ord`'s superclass edge (`$p1Ord`) demands that an
+      `Eq` exist, not that it agree with `compare`. So
+      `data Rat = Rat Int Int deriving Ord` plus a hand-written cross-multiply
+      `instance Eq Rat` is legal Haskell that this transpiler emits WITHOUT
+      refusal, and at that type `==` (cross-multiply) and `<`/`compare`
+      (structural) genuinely diverge — in the emitted Lean exactly as in GHC.
+      Divergence there is the FAITHFUL answer, not a defect. It is therefore
+      FALSE that every instantiation the transpiler can produce is coherent; what
+      is true is that every binder is the image of a DISTINCT field of the Haskell
+      dictionary its constraint stands for, so each one is faithful to something.
+
+    Witnessed, not asserted: the `M3T3R` guards in the INSTANCE SELECTION
+    subsection at the end of this block ARE that `Rat` shape (derived `Ord` + the
+    four companions + a hand-written cross-multiply `BEq`) and pin `==` to
+    cross-multiply while the order stays structural.
+
+    HAZARD, named so that no future maintainer "simplifies" it away: the tempting
+    cleanup is to drop `[BEq t]` from the `Ord` set and obtain `==` from `Ord`
+    instead (`compare a b == .eq`, or a `BEq` synthesised from the `Ord`
+    argument). Doing that is SILENT-WRONG at exactly the `Rat` shape above —
+    every `Ord`-constrained function applied at `Rat` would begin reporting
+    STRUCTURAL equality where Haskell reports the hand-written cross-multiply
+    result, with no error raised anywhere. The `M3T3R` `#guard`s break if it is
+    ever done, which is why they are guards rather than prose. What remains
+    outside the image of any Haskell program is only the other direction: a
+    HAND-WRITTEN Lean call passing an `LT` that disagrees with its `Ord`.
+
+    TASK 6 MUST DECIDE AND PIN THE CONVERSE, which this task's scope does not
+    reach. Today `emitDataDecl` is the only source of the `LT`/`LE`/`Min`/`Max`
+    companions and derives all four FROM `compare`. Task 6 stops replacing a
+    hand-written Haskell `Ord` with `deriving Ord` and emits
+    `instance : Ord T where compare := <$ccompare ref>` — but per the plan's Task 6
+    bullet it reuses those same companions, so `<`/`≤`/`min`/`max` at `T` stay
+    FUNCTIONS OF `compare` and a hand-written `$c<` or `$cmin` body that disagrees
+    with the type's own `$ccompare` is silently discarded. That is divergence in
+    the OPPOSITE direction from the hazard above — Lean would be MORE lawful than
+    a law-violating Haskell instance, which is not automatically the wrong call,
+    but it IS a call, and Task 6 owns making it explicit and pinning it. (Plan:
+    `docs/superpowers/plans/2026-08-06-m3-typeclass-completeness.md`, Task 6.
+    Distinct from the forward-reference at the end of this block, which is about
+    instance SELECTION going live rather than companion derivation discarding
+    method bodies.)
 
 ### Why `Num` is four binders and no `OfNat` — measured
 
@@ -3019,6 +3065,25 @@ def m3t3BothVar : Var :=
          == ["[BEq t_v3009]", "[Ord t_v3009]", "[LT t_v3009]", "[LE t_v3009]",
              "[DecidableLT t_v3009]", "[DecidableLE t_v3009]", "[Min t_v3009]",
              "[Max t_v3009]"]
+-- The OTHER source order, pinned too: `(Ord a, Eq a) =>` yields the canonical
+-- EIGHT with `[BEq t]` kept exactly once, in its Ord-set position (8th) — because
+-- `dedup` keeps FIRST occurrences, so here it is the TRAILING `Eq`'s image that is
+-- dropped, not the leading one. Both orders are guarded because the SEQUENCE is
+-- load-bearing (`DecidableLT` only elaborates with `LT` already bound): pinning
+-- one source order would leave the other free to drift.
+def m3t3BothRevVar : Var :=
+  { name := "bothRev", unique := 13, role := .id,
+    ty := .forAll "a" (.tyFun (.tyCon "Ord" [m3t3TyA])
+            (.tyFun (.tyCon "Eq" [m3t3TyA]) (.tyFun m3t3TyA (.tyCon "Bool" [])))) }
+#guard (stripClassConstraintsGo [] m3t3BothRevVar.ty).1.length == 9   -- pre-dedup
+#guard (stripClassConstraints [] m3t3BothRevVar.ty).1
+         == ["[Ord t_v3009]", "[LT t_v3009]", "[LE t_v3009]", "[DecidableLT t_v3009]",
+             "[DecidableLE t_v3009]", "[Min t_v3009]", "[Max t_v3009]", "[BEq t_v3009]"]
+-- …i.e. `classConMap "Ord"`'s own sequence instantiated, with nothing added and
+-- nothing reordered by the extra `Eq`.
+#guard (stripClassConstraints [] m3t3BothRevVar.ty).1
+         == ((classConMap "Ord").getD []).map (·.replace "{t}" "t_v3009")
+
 -- Different type variables are different binders and are never merged.
 def m3t3TwoVarVar : Var :=
   { name := "twoVar", unique := 12, role := .id,

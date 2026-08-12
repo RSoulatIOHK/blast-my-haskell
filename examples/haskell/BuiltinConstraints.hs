@@ -42,8 +42,15 @@ module BuiltinConstraints where
     ordEq :: Ord a => a -> a -> Bool
     ordEq x y = (x < y) || (x == y)
 
-    -- Num. `+`/`*`/`-`/`negate` only; a numeric LITERAL other than 0/1 would
-    -- need `OfNat t n` for that n and is deliberately NOT covered (loud).
+    -- Num. `+`/`*`/`-`/`negate` only. EVERY numeric literal under a
+    -- `Num a`-polymorphic def is deliberately NOT covered and is LOUD — 0 and 1
+    -- included, not just "other than 0/1". The blocker is not a missing `OfNat`
+    -- binder: `emitLiteral` emits literals Int-ASCRIBED, so `x + 0` emits
+    -- `(((· + ·)) x) ((id) ((0 : Int)))` and fails `failed to synthesize
+    -- HAdd t Int t` identically at 0, at 1, and even WITH an `[OfNat t 0]` binder
+    -- added. `abs`/`signum` are loud here too (their images test `a < 0`, needing
+    -- the Ord set a `Num a` constraint does not supply). See `Maps.classConMap`
+    -- and the M3 Task 3 block in `GhcCoreToLean/Tests/Unit.lean`.
     double :: Num a => a -> a
     double x = x + x
 

@@ -445,6 +445,19 @@ private def dedup (xs : List Name) : List Name :=
     unchanged from before this map existed, and not reachable from the fixtures
     (GHC passes no dictionary for a monomorphic signature).
 
+    CONVERSE HAZARD — a tripwire, not a live bug. Recognition is by NAME in
+    leading-argument position, with no check that the head is a CLASS at all. So a
+    one-parameter user TYPE that happens to be named `Eq`/`Ord`/`Num` — e.g.
+    `data Eq a = …` used as `f :: Eq a -> Bool` — would be peeled as a constraint
+    and its real value argument deleted from the header. Unreachable today:
+    parameterized user data types are unsupported (`DataDecl` carries no `tyVars`
+    field, the decl plugin dumps no type parameters, and such a module already
+    fails loudly at `lake build` — see the README limitation), so no program in
+    which this could matter compiles in the first place. Named here so that
+    whenever parameterized data types land, the peel is given a real "is this head
+    a class?" test (plugin-sourced class names) instead of a name match — the
+    failure mode would be a silently dropped argument, not a loud one.
+
     Both defects of M3 fact 3 live in the two callers of this function
     (`emitDefHeader`'s binder list and `emitBind`'s `resTyOf`), so the widening
     goes HERE rather than in a gate threaded to each: the callers cannot drift
