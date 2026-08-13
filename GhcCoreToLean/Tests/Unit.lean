@@ -3382,6 +3382,17 @@ def m3t3AllSameAt {t : Type} [BEq t] (x y : t) : Bool := (((· == ·)) x) y
     order, so a Haskell class declaring a defaulted method before the method its
     default calls fails loud. No fixture has that shape.
 
+    (c2) A THIRD loud residual in the same body, found by review and then
+    measured: the bare-sibling rewrite fires only when `methodMap` has an entry
+    for that sibling, and the map is built from INSTANCES
+    (`reconstructClasses`). A class with a default whose sibling has no local
+    instance — the plugin channel supplies the `ClassDecl`, the reconstruction
+    supplies no entries — emits `name_8929` in the class body, an unbound
+    identifier. Loud, unfixtured, and pinned in the guards; the naive fix
+    (synthesizing map entries from `ClassDecl.methods`) would trade it for a
+    silent-wrong, because `emitVar` is first-match and such entries carry no
+    `shadowedBy`, so a local binder named like a method would become the field.
+
     (d) A FIELDLESS instance is legal (`instance : AllDef T where` with every
     method defaulted), which is why `emitInstanceUser` emits that form instead of
     refusing.
@@ -3510,6 +3521,16 @@ def m3t4Mm : List MethodRef :=
 -- ANOTHER class stays qualified, because that reference is not a sibling.
 #guard classDefaultBody [{ method := "name", cls := "Other" }] [] m3t4Binds m3t4Greet "greet"
          == some "(fun x_8937 => (((· + ·)) ((Other.name) (x_8937))) ((1 : Int)))"
+-- THE RESIDUAL, measured: the bare rewrite needs a map ENTRY for the sibling,
+-- and the map is instance-driven. With none (a class whose default's sibling has
+-- no local instance, or whose `$c` bind was filtered) the body emits
+-- `name_8929` — an unbound identifier inside the class body, so LOUD. Pinned as
+-- the degradation it is, not as intended output; see `MethodRef.bare` for why
+-- synthesizing entries from `ClassDecl.methods` would be worse than this.
+#guard classDefaultBody [] [] m3t4Binds m3t4Greet "greet"
+         == some "(fun x_8937 => (((· + ·)) ((name_8929) (x_8937))) ((1 : Int)))"
+#guard classDefaultBody [{ method := "greet", cls := "Greet" }] [] m3t4Binds m3t4Greet "greet"
+         == some "(fun x_8937 => (((· + ·)) ((name_8929) (x_8937))) ((1 : Int)))"
 -- Both directions of `MethodRef.bare` at the `emitVar` level.
 #guard emitVar [{ method := "name", cls := "Greet", bare := true }] [] m3t4NameSel == "name"
 #guard emitVar [{ method := "name", cls := "Greet" }] [] m3t4NameSel == "Greet.name"

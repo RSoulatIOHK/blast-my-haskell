@@ -186,7 +186,19 @@ structure MethodRef where
       instance that omits the field. Dropping the map entry instead of flagging it
       would be unsound for an OPERATOR method (`==`): `emitVar` would fall through
       to `Maps.valueMap` and emit the builtin, silently ignoring the user's
-      method. The flag keeps the match and only changes its spelling. -/
+      method. The flag keeps the match and only changes its spelling.
+
+      CONDITIONAL, and loudly so: the rewrite needs a map ENTRY for the sibling,
+      and the map is instance-driven (`reconstructClasses`). A sibling with no
+      entry — a class whose default's siblings have no local instance, or whose
+      `$c` bind `Main.lean` filtered — falls through to `refId` and emits
+      `name_8929`, an unbound identifier inside the class body. MEASURED, pinned in
+      `Tests/Unit.lean`. Synthesizing entries from `ClassDecl.methods` would fix
+      the spelling and break something worse: `emitVar` is first-match, so
+      synthesized entries with an empty `shadowedBy` would rewrite a LOCAL binder
+      named like a method into the field — the silent-wrong `shadowedBy` exists to
+      prevent. A correct version must attach shadows to them; deferred until a
+      fixture needs it. -/
   bare       : Bool := false
 deriving Repr, DecidableEq, Inhabited
 
@@ -1229,7 +1241,16 @@ def translatedDefaults (binds : CoreProgram) (classes : List ClassDecl) : List (
     emitted with `c`'s OWN methods spelled bare (`MethodRef.bare` — a qualified
     sibling reference does not elaborate inside a class body; see that field).
     `none` exactly when the `$dm` bind is absent, which `translatedDefaults` has
-    already excluded for every pair emission asks about. -/
+    already excluded for every pair emission asks about.
+
+    `mm` must carry an entry for every sibling the body calls, or that call emits
+    `<method>_<unique>` and the class body does not elaborate — loud, and the
+    residual documented on `MethodRef.bare`. Everything else in a default body is
+    ordinary: builtins go through `Maps.valueMap`, a call to another CLASS's method
+    stays qualified (and is a forward reference whenever that class is emitted
+    later, since class decls are unsorted until Task 5), and a call to a top-level
+    user function is a forward reference always — the class block precedes every
+    def. Only sibling methods, builtins and locals are safe there. -/
 def classDefaultBody (mm : List MethodRef) (top : List Name) (binds : CoreProgram)
     (c : ClassDecl) (method : Name) : Option String :=
   let selfBare := mm.map fun r => if r.cls == c.name then { r with bare := true } else r
