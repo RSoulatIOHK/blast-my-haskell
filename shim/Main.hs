@@ -264,7 +264,22 @@ convertExternalName modName (ExternalName mn nm (Unique _ u)) =
              else other <> "." <> nm
       -- Heuristic for dict instances exported from GHC libraries: names
       -- start with `$f` (instance methods) or `$d` (instance dicts).
-      role = if T.take 2 nm `elem` ["$d", "$f"] then "dict" else "id"
+      --
+      -- `$dm` is exempted here for the same reason as in `binderRole` (see the
+      -- argument there), and the exemption is needed in BOTH places because this
+      -- is an INDEPENDENT copy of the rule — and the one that classifies a
+      -- *reference*. GHC reaches a top-level name through `EVarGlobal` even
+      -- inside the defining module, so every `$dm<method>` USE lands in this
+      -- function while only its binder goes through `binderRole`. With the
+      -- exemption in one place only, a bind said `id` and its own reference said
+      -- `dict` (observed in the DefaultMethods dump: binder at `/binds/4`,
+      -- reference at `/binds/26/pairs/1/rhs/fun/fun`) — and a dict-role
+      -- reference in argument position is ERASED by the consumer's `Lower`.
+      --
+      -- Tested on `nm`, the BARE name, not on `name`: a cross-module reference
+      -- is prefixed (`GHC.Show.$dmshowList`), which a `take 3` would miss.
+      role = if T.take 3 nm == "$dm" then "id"
+             else if T.take 2 nm `elem` ["$d", "$f"] then "dict" else "id"
   in object [ "name"   .= name
             , "unique" .= u
             , "type"   .= unknownType

@@ -1256,28 +1256,70 @@ def classDefaultBody (mm : List MethodRef) (top : List Name) (binds : CoreProgra
   let selfBare := mm.map fun r => if r.cls == c.name then { r with bare := true } else r
   (findBind binds ("$dm" ++ method)).map (fun (_, e) => emitExpr selfBare top e)
 
-/-- Top-level `$dm<method>` binds whose binder ROLE says `dict`. Should be empty:
-    the shim classifies `$dm` as `id` (see `shim/Main.hs`'s `binderRole`). A
-    non-empty result means the dump's roles are the old heuristic's, under which
-    `Lower.isTypeOrDictArg` silently ERASES a `$dm` reference in argument
-    position; wired to a warning in `Main.lean`.
+/-- One `Var` is a mislabelled default-method occurrence. -/
+private def dmDictVar (v : Var) : List Name :=
+  if v.name.startsWith "$dm" && v.role == .dict then [v.name] else []
 
-    Only top-level binders are scanned, which is sufficient: the shim resolves a
-    `Var` reference through the binder it came from, so a reference's role is its
-    binder's role. -/
-def dmBindsMislabelledAsDicts (binds : CoreProgram) : List Name :=
-  let bad (v : Var) : Bool := v.name.startsWith "$dm" && v.role == .dict
-  binds.flatMap fun b => match b with
-    | .nonRec v _ => if bad v then [v.name] else []
-    | .rec_ pairs => pairs.filterMap (fun (v, _) => if bad v then some v.name else none)
+/-- Every `$dm`-named dict-role `Var` inside an expression, in ANY position:
+    references, lambda binders, both `let` forms, the case binder and pattern
+    binders. The match is TOTAL (no catch-all) so that adding an `Expr`
+    constructor cannot silently shrink the scan — `Lower` erases dict-role Vars
+    both at references (`isTypeOrDictArg`, argument position) and at binders
+    (`isTypeOrDictBinder`, lambda/`let`), so every position is failure surface. -/
+private partial def dmDictVarsInExpr : Expr → List Name
+  | .var v      => dmDictVar v
+  | .lit _      => []
+  | .app f a    => dmDictVarsInExpr f ++ dmDictVarsInExpr a
+  | .lam v b    => dmDictVar v ++ dmDictVarsInExpr b
+  | .let_ bnd b =>
+    (match bnd with
+     | .nonRec v e => dmDictVar v ++ dmDictVarsInExpr e
+     | .rec_ ps    => ps.flatMap (fun p => dmDictVar p.1 ++ dmDictVarsInExpr p.2))
+      ++ dmDictVarsInExpr b
+  | .case_ scr cb _ alts =>
+    dmDictVarsInExpr scr ++ dmDictVar cb
+      ++ alts.flatMap (fun (.mk _ bs r) => bs.flatMap dmDictVar ++ dmDictVarsInExpr r)
+  | .cast e     => dmDictVarsInExpr e
+  | .type_ _    => []
+  | .coercion   => []
+  | .tick e     => dmDictVarsInExpr e
 
-/-- The warning for one `dmBindsMislabelledAsDicts` entry. -/
+/-- Every `$dm<method>` `Var` in the program whose ROLE says `dict` — binders AND
+    references, at top level and inside every body. Should be empty: the shim
+    classifies `$dm` as `id`. A non-empty result means the dump's roles are the
+    old heuristic's, under which `Lower` silently ERASES that occurrence
+    (`isTypeOrDictArg` in argument position, `isTypeOrDictBinder` at a
+    lambda/`let` binder); wired to a warning in `Main.lean`.
+
+    References are scanned, not just binders, because the shim carries TWO
+    independent copies of the `$d`/`$f` prefix rule: `binderRole` for binders and
+    `convertExternalName` for references. GHC reaches a top-level name through
+    `EVarGlobal` even inside its own module, so a `$dm` USE is classified by the
+    second copy — a reference's role is NOT inherited from its binder. Both copies
+    now exempt `$dm`; while only `binderRole` did, `$dmgreet`'s binder said `id`
+    and its one reference said `dict` (DefaultMethods dump: `/binds/4` vs
+    `/binds/26/pairs/1/rhs/fun/fun`), the exact split a binders-only scan is blind
+    to. That reference was harmless only because it sits in HEAD position, which
+    `isTypeOrDictArg` never inspects; nothing kept it there.
+
+    Must be applied to the RAW dump, before `Lower`: lowering has already deleted
+    a dict-role occurrence in argument position, so the lowered program no longer
+    holds the evidence. `Main.lean` calls it on `prog.binds` for that reason. -/
+def dmVarsMislabelledAsDicts (binds : CoreProgram) : List Name :=
+  (binds.flatMap fun b => match b with
+    | .nonRec v e => dmDictVar v ++ dmDictVarsInExpr e
+    | .rec_ pairs => pairs.flatMap (fun (v, e) => dmDictVar v ++ dmDictVarsInExpr e)
+  ).eraseDups
+
+/-- The warning for one `dmVarsMislabelledAsDicts` entry. -/
 def dmDictRoleWarning (n : Name) : String :=
-  s!"default-method binding `{n}` arrived with binder role `dict`. It is a method\n" ++
-  s!"  BODY, not a dictionary — the shim's role heuristic (`$d`-prefixed ⇒ dict) must\n" ++
-  s!"  exempt `$dm`, and this dump's does not. Consequence: a reference to `{n}` in\n" ++
-  s!"  argument position is erased as a dictionary argument, silently dropping the\n" ++
-  s!"  default's body from wherever it was passed. Rebuild the shim."
+  s!"default-method `Var` `{n}` arrived with role `dict`. It is a method BODY, not\n" ++
+  s!"  a dictionary — the shim's role heuristic (`$d`-prefixed ⇒ dict) must exempt\n" ++
+  s!"  `$dm` in BOTH places that rule is written (`binderRole` for binders,\n" ++
+  s!"  `convertExternalName` for references), and this dump's does not. Consequence:\n" ++
+  s!"  an occurrence of `{n}` in argument position — or as a lambda/`let` binder —\n" ++
+  s!"  is erased as a dictionary, silently dropping the default's body from wherever\n" ++
+  s!"  it was used. Rebuild the shim."
 
 /-- How one class method of one instance is realized. -/
 inductive MethodFate where

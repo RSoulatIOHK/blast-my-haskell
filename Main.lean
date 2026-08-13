@@ -253,14 +253,22 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- emission uses (`Emit.classifyInstanceMethod`), so the two cannot disagree.
     for (cls, head, m) in Emit.unresolvedInstanceMethods userProg do
       IO.eprintln s!"warning: {Emit.unresolvedInstanceMethodWarning cls head m}"
-    -- Tripwire for the shim's binder-role heuristic. A `$dm<method>` bind is a
+    -- Tripwire for the shim's role heuristic. A `$dm<method>` Var is a
     -- default-method BODY; the shim used to classify it as a dictionary (any
     -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT
-    -- position — so a regression here would silently delete a default-method
-    -- reference rather than fail. `$dm` is unambiguous (a dict is `$d` + a CLASS
-    -- name, always upper-case), which is why the shim exempts it; this says so
-    -- out loud if a dump produced by some other/older shim arrives.
-    for n in Emit.dmBindsMislabelledAsDicts prog.binds do
+    -- position and at lambda/`let` binders — so a regression here would silently
+    -- delete a default-method occurrence rather than fail. `$dm` is unambiguous
+    -- (a dict is `$d` + a CLASS name, always upper-case), which is why the shim
+    -- exempts it in both places it writes that rule (`binderRole` and
+    -- `convertExternalName`); this says so out loud if a dump produced by some
+    -- other/older shim arrives. The scan covers references, not just binders:
+    -- the two shim copies can disagree, and one of them did.
+    --
+    -- Runs on `prog.binds` — the RAW dump, not `userProg` — and must: `Lower` has
+    -- already deleted a dict-role occurrence in argument position, so a scan of
+    -- the lowered program would find nothing to report about the very case that
+    -- matters.
+    for n in Emit.dmVarsMislabelledAsDicts prog.binds do
       IO.eprintln s!"warning: {Emit.dmDictRoleWarning n}"
     let body      := Emit.emitFullProgram ext.datas userProg extNts
     let crib      := emitNamesCrib ext.datas extNts userProg

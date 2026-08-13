@@ -3464,11 +3464,20 @@ def m3t4QuietWrapper : Var :=
 def m3t4QuietDfun : Var :=
   {name := "$fGreetQuiet", unique := 9136, ty := .tyCon "Greet" [.tyCon "Quiet" []],
    role := .dict}
+-- The wrapper's body as `Lower` leaves it. The dump has `($dmgreet @Quiet)
+-- $fGreetQuiet` (DefaultMethods `/binds/26/pairs/1/rhs`); the type argument and
+-- the dict argument both erase, leaving the bare `$dmgreet` reference.
+--
+-- `role := .id` is the OBSERVED role at that reference, not an assumption — but
+-- only since the `$dm` exemption was added to `convertExternalName` as well as
+-- `binderRole`. Before that the dump read `"dict"` HERE while the binder at
+-- `/binds/4` read `"id"`; the tripwire below now scans references for exactly
+-- that split.
+def m3t4DmRef : Expr :=
+  .var {name := "$dmgreet", unique := 9094, ty := .tyCon "_Unknown" [], role := .id}
 -- The dfun's body is the observed one, `C:Greet @Quiet $cname $cgreet` with its
 -- type argument erased by `Lower`: it must reference BOTH `$c` binds, since that
 -- is what `reconstructClasses` reads the method→class map out of.
-def m3t4DmRef : Expr :=
-  .var {name := "$dmgreet", unique := 9094, ty := .tyCon "_Unknown" [], role := .id}
 def m3t4QuietDfunRhs : Expr :=
   .app (.app (.var {name := "C:Greet", unique := 9097,
                     ty := .tyCon "_Unknown" [], role := .id})
@@ -3660,30 +3669,79 @@ def m3t4Out : String := emitFullProgram [] (m3t4Prog m3t4QuietRec)
 -- The `$f` dict-builder is still never emitted, in either order.
 #guard (m3t4Out.splitOn "_dollar_fGreetQuiet").length == 1
 
--- `$dm` ROLE TRIPWIRE (observation 2). The shim now says `id`; if a dump ever
--- says `dict` again, `Main.lean` warns — because `Lower` would erase the
--- reference. Both halves pinned: the detector, and the erasure that makes it
--- matter.
+-- `$dm` ROLE TRIPWIRE (observation 2). The shim writes the `$d`/`$f` prefix rule
+-- TWICE — `binderRole` for binders, `convertExternalName` for references — and
+-- GHC routes a top-level name through `EVarGlobal` even inside its own module, so
+-- the two classify different halves of the same name. Both now exempt `$dm`; the
+-- first fix touched `binderRole` only, and the DefaultMethods dump then said
+-- `role: "id"` at the binder (`/binds/4`) and `role: "dict"` at its one reference
+-- (`/binds/26/pairs/1/rhs/fun/fun`). Post-fix that reference reads `"id"`, which
+-- is what `m3t4DmRef` below encodes — observed, not assumed.
+--
+-- Three things pinned here: the detector on a BINDER, the detector on a
+-- REFERENCE inside a body (the half a binders-only scan missed), and the erasure
+-- that makes either matter.
 def m3t4DmDictBind : Bind :=
   .nonRec {name := "$dmgreet", unique := 9094,
            ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .dict} (.lit (.litInt 0))
-#guard dmBindsMislabelledAsDicts [m3t4DmDictBind] == ["$dmgreet"]
-#guard dmBindsMislabelledAsDicts m3t4Binds == ([] : List Name)
+#guard dmVarsMislabelledAsDicts [m3t4DmDictBind] == ["$dmgreet"]
+#guard dmVarsMislabelledAsDicts m3t4Binds == ([] : List Name)
 def m3t4DmDictRec : Bind :=
   .rec_ [ ({name := "$dmgreet", unique := 1, ty := .tyCon "Int" [], role := .dict},
            .lit (.litInt 0)) ]
-#guard dmBindsMislabelledAsDicts [m3t4DmDictRec] == ["$dmgreet"]
--- THE TRAP ITSELF: a dict-role `$dm` reference in ARGUMENT position is erased…
+#guard dmVarsMislabelledAsDicts [m3t4DmDictRec] == ["$dmgreet"]
+-- THE REFERENCE HALF, in the shape the dump actually had: an `id`-role `$cgreet`
+-- binder whose BODY applies the dict-role `$dmgreet` — unlowered, as `Main.lean`
+-- scans it (`prog.binds`, pre-`Lower`: lowering would already have deleted the
+-- occurrence). The binder is clean, so a binders-only scan reports nothing.
+def m3t4DmDictRefBody : Expr :=
+  .app (.app (.var {name := "$dmgreet", unique := 9094,
+                    ty := .tyCon "_Unknown" [], role := .dict})
+             (.type_ (.tyCon "Quiet" [])))
+       (.var m3t4QuietDfun)
+def m3t4DmDictRefBind : Bind := .nonRec m3t4QuietWrapper m3t4DmDictRefBody
+#guard dmVarsMislabelledAsDicts [m3t4DmDictRefBind] == ["$dmgreet"]
+-- Same body inside a Rec group, and inside a `let` — the nesting the walker has
+-- to reach, and the shape `$cgreet` is really in (`/binds/26` is a Rec).
+#guard dmVarsMislabelledAsDicts
+         [.rec_ [(m3t4QuietDfun, m3t4QuietDfunRhs), (m3t4QuietWrapper, m3t4DmDictRefBody)]]
+         == ["$dmgreet"]
+#guard dmVarsMislabelledAsDicts
+         [.nonRec m3t4QuietWrapper
+            (.let_ (.nonRec m3t4QuietWrapper m3t4DmDictRefBody) (.lit (.litInt 0)))]
+         == ["$dmgreet"]
+-- Duplicates collapse: `Main.lean` prints one warning per entry.
+#guard dmVarsMislabelledAsDicts [m3t4DmDictRefBind, m3t4DmDictBind] == ["$dmgreet"]
+-- And the post-fix reference role is NOT reported (this is the observed dump).
+#guard dmVarsMislabelledAsDicts [.nonRec m3t4QuietWrapper m3t4DmRef] == ([] : List Name)
+-- THE TRAP ITSELF: a dict-role `$dm` reference in ARGUMENT position is erased —
+-- the reason a mislabelled reference is a miscompile and not a cosmetic defect.
+-- (The observed reference sits in HEAD position, which `isTypeOrDictArg` never
+-- inspects, so today's dump would not have miscompiled; nothing pinned it there,
+-- which is why the tripwire now watches references at all.)
 #guard emitExpr [] [] (Lower.lowerExpr
          (.app (.var {name := "f", unique := 1, ty := .tyCon "_Unknown" [], role := .id})
                (.var {name := "$dmgreet", unique := 9094,
                       ty := .tyCon "_Unknown" [], role := .dict}))) == "f_1"
--- …and with the role the shim now emits, it survives (loud if unbound, never gone).
+-- …and with the role the shim now emits at references, it survives (loud if
+-- unbound, never gone).
 #guard emitExpr [] [] (Lower.lowerExpr
          (.app (.var {name := "f", unique := 1, ty := .tyCon "_Unknown" [], role := .id})
                (.var {name := "$dmgreet", unique := 9094,
                       ty := .tyCon "_Unknown" [], role := .id})))
          == "(f_1) (_dollar_dmgreet_9094)"
+-- Head position, both roles: the emission is the same either way — which is why
+-- fixing the shim's reference role changed no generated file.
+#guard emitExpr [] [] (Lower.lowerExpr
+         (.app (.app (.var {name := "$dmgreet", unique := 9094,
+                            ty := .tyCon "_Unknown" [], role := .dict})
+                     (.type_ (.tyCon "Quiet" [])))
+               (.var m3t4QuietDfun)))
+         == emitExpr [] [] (Lower.lowerExpr
+         (.app (.app (.var {name := "$dmgreet", unique := 9094,
+                            ty := .tyCon "_Unknown" [], role := .id})
+                     (.type_ (.tyCon "Quiet" [])))
+               (.var m3t4QuietDfun)))
 
 -- `$cshow` SCOPING, both directions (`Main.isGhcRuntimePlumbing` delegates here).
 -- `Show`'s three methods are dropped…
