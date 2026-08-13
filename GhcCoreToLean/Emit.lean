@@ -169,6 +169,25 @@ structure MethodRef where
       structure docstring. Filled by `attachMethodShadows`, which is why the
       default keeps hand-written test literals short. -/
   shadowedBy : List Unique := []
+  /-- Emit matching occurrences as the BARE method name instead of
+      `Class.method`. Set on exactly one derived map: the one used to translate a
+      class's own DEFAULT-METHOD bodies into its Lean class body (M3 Task 4,
+      `classDefaultBody`). Inside a `class C … where m : τ := <body>` the class
+      name is not a constant yet, so a qualified sibling reference does not
+      elaborate — PROBED, verbatim:
+
+          class Greet2 (a : Type) where
+            name2 : a → Int
+            greet2 : a → Int := fun x => Greet2.name2 x + 1
+          -- error: Invalid field `name2`: The environment does not contain
+          --   `Function.name2`
+
+      while the same body with a BARE `name2` elaborates and is picked up by an
+      instance that omits the field. Dropping the map entry instead of flagging it
+      would be unsound for an OPERATOR method (`==`): `emitVar` would fall through
+      to `Maps.valueMap` and emit the builtin, silently ignoring the user's
+      method. The flag keeps the match and only changes its spelling. -/
+  bare       : Bool := false
 deriving Repr, DecidableEq, Inhabited
 
 /-- Map a Var reference. A class-method selector (in `methodMap`) emits
@@ -233,6 +252,7 @@ deriving Repr, DecidableEq, Inhabited
 def emitVar (methodMap : List MethodRef) (topNames : List Name) (v : Var) : String :=
   match methodMap.find? (fun m => m.method == v.name) with
   | some m    => if m.shadowedBy.contains v.unique then refId topNames v
+                 else if m.bare then sanitize v.name
                  else s!"{sanitize m.cls}.{sanitize v.name}"
   | none      =>
   match valueMap v.name with
@@ -601,6 +621,32 @@ def emitProgramWith (mm : List MethodRef) (classNames : List Name) (p : CoreProg
   let bindStrs := p.map (emitBind mm classNames top)
   String.intercalate "\n\n" bindStrs
 
+/-- Keep the binds satisfying `keep`, PER PAIR: a `Rec` group is filtered
+    member-wise and survives with whatever is left (dropped only when nothing is).
+    Mirrors `Main.keepBinding`, which does the same for its own drop rules.
+
+    Every bind classification in `emitFullProgram` goes through this, because
+    reading a Rec group's HEAD binder and classifying the whole group by it is
+    wrong in both directions. GHC puts an instance's dict-builder and its method
+    binds in ONE Rec group whenever a method body needs the instance's own
+    dictionary — OBSERVED on `DefaultMethods.hs` as
+    `Rec group: ['$fGreetQuiet', '$cgreet']` (see the M3 Task 4 block in
+    `GhcCoreToLean/Tests/Unit.lean`) — and the group's member order is GHC's, not
+    ours:
+    * head `$f…` (observed): the whole group classified as junk, so the `$c`
+      method bind was DROPPED while the instance still referenced it —
+      `error: Unknown identifier `_dollar_cgreet_9231``.
+    * head `$c…` (not observed, and nothing forbids it): the whole group would
+      classify as a method def, EMITTING the `$f` dict-builder — a body applying
+      the dictionary constructor `C:Greet`, which has no Lean image.
+    Per-pair filtering makes the outcome independent of that order. -/
+def filterBinds (keep : Var → Expr → Bool) (binds : CoreProgram) : CoreProgram :=
+  binds.filterMap fun b => match b with
+    | .nonRec v e => if keep v e then some (.nonRec v e) else none
+    | .rec_ pairs =>
+      let kept := pairs.filter (fun (v, e) => keep v e)
+      if kept.isEmpty then none else some (.rec_ kept)
+
 /-! ## Data type declarations and instances -/
 
 /-- Emit a Haskell `data T = …` declaration as a Lean `inductive`. Bare
@@ -642,10 +688,33 @@ def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
     still rewritten to `Parent.method` at their call sites, so a function with
     only the child constraint in scope fails to synthesize the parent instance.
     Observed on `SuperClass.hs` — see the `M3 Task 1` block in
-    `GhcCoreToLean/Tests/Unit.lean`. -/
-def emitClassDecl (c : ClassDecl) : String :=
+    `GhcCoreToLean/Tests/Unit.lean`.
+
+    `defaults` maps a METHOD NAME to the Lean term for its class-body `:=`
+    default, translated from GHC's `$dm<method>` bind by `classDefaultBody` (M3
+    Task 4). A method absent from the list emits without a default, exactly as
+    before. Two ordering facts about Lean class bodies, both PROBED:
+
+    * A default may reference only methods declared EARLIER in the same class
+      body. `class Fwd (a : Type) where g : a → Int := fun x => f x + 1;
+      f : a → Int` gives `error: Unknown identifier `f``. Method order here is
+      GHC's `classOpItems` order, which is DECLARATION order (M3 Task 1's
+      observation 1), so a Haskell class that declares a defaulted method before
+      the method its default calls fails LOUD. The methods are deliberately NOT
+      reordered to dodge it: no fixture has that shape, so the reorder would be
+      unexercised code, and forward-reference-in-a-default is a shape whose only
+      other possible arrangement (mutually-referential defaults) cannot be
+      ordered at all.
+    * A default that calls a method of ANOTHER class emits that call QUALIFIED
+      (`Sized.size`), and class decls are emitted UNSORTED (see `mergeClassDecls`
+      — sorting is M3 Task 5's job), so it is a forward reference whenever the
+      other class comes later: loud, not silent. -/
+def emitClassDecl (defaults : List (Name × String)) (c : ClassDecl) : String :=
   let methodLines := c.methods.map fun m =>
-    s!"  {sanitize m.name} : {emitType m.ty}"
+    let decl := s!"  {sanitize m.name} : {emitType m.ty}"
+    match defaults.find? (·.1 == m.name) with
+    | some (_, body) => s!"{decl} := {body}"
+    | none           => decl
   let params := String.intercalate " " (c.tyVars.map fun tv => s!"({tyVarId tv} : Type)")
   s!"class {sanitize c.name} {params} where\n" ++
     String.intercalate "\n" methodLines
@@ -722,6 +791,30 @@ def isEqNeqBind (insts : List Instance) (v : Var) : Bool :=
     (match methodHeadStr v with
      | some hs => (eqInstanceHeads insts).contains hs
      | none    => false)
+
+/-- The `$c` method binds of a `Show` instance, which `Main.lean` drops: their
+    bodies are `showsPrec`/`showString`/`showParen` plumbing over GHC.Show
+    internals with no Lean image, and `Show` itself is deliberately not
+    translated (see `emitInstance`).
+
+    The point of this predicate, like `isEqNeqBind`'s, is the SCOPE of the drop.
+    `Main.lean` matched the PREFIX `$cshow`, which also ate the method of a user
+    class declaring anything spelled `show…` — `showIt` (`$cshowIt`), `showAll`,
+    `shows`. Those now survive; if such a method is genuinely untranslatable the
+    failure is loud downstream rather than a silently missing instance field.
+    `Show`'s own three class methods are exactly `showsPrec`, `show` and
+    `showList`, so the exact-name list is complete for the derived case.
+
+    RESIDUAL, un-fixtured (same shape as `isEqNeqBind`'s): a user class declaring
+    a method literally named `show`/`showsPrec`/`showList` (legal under
+    `import Prelude hiding (show)`) still loses that bind, because this test is
+    keyed on the name alone — unlike `isEqNeqBind`, which can compare against the
+    `Eq` instance HEADS, there is no `Show`-instance head list here (Show
+    instances are dropped before they reach the emitter). It is no longer silent
+    at the transpiler, though: the instance's method resolves to nothing, which is
+    now reported by `unresolvedInstanceMethods`. -/
+def isDerivedShowMethod (n : Name) : Bool :=
+  n == "$cshow" || n == "$cshowsPrec" || n == "$cshowList"
 
 /-- Scan binds for *derived* Eq methods (`$c==`/`$c/=` whose body uses the tag
     primops `dataToTag#`/`tagToEnum#`) and return their head-type strings. Such
@@ -1050,39 +1143,245 @@ def unmappedOperatorMethodError (cls mname : Name) : String :=
   s!"  conflicting `Eq`/`Ord` instance on the same type."
 
 /-- Find the `$c<method>` binding belonging to the instance whose head type
-    matches `headTyStr`, returning its emitted (unique-suffixed) def name.
-    Generalizes the former `findEqMethod`: multiple instances of a class each
-    produce a `$c<method>` binding that collides after sanitization, so we
+    matches `headTyStr`, returning the whole bind. Multiple instances of a class
+    each produce a `$c<method>` binding that collides after sanitization, so we
     disambiguate by matching the method's first value-argument type against the
-    instance head. -/
-private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
+    instance head. The RHS comes back too, because whether the bind is a
+    default-method wrapper is a property of its body (`isDefaultWrapperBody`). -/
+private def findClassMethodBind (binds : CoreProgram) (method : Name) (headTyStr : String)
+    : Option (Var × Expr) :=
   let matchesHead (v : Var) : Bool :=
     v.name == method &&
       (match firstValArgTy v.ty with
        | some t => emitType t == headTyStr
        | none   => false)
   binds.findSome? fun b => match b with
-    | .nonRec v _ => if matchesHead v then some (localId v) else none
-    | .rec_ pairs => (pairs.find? (fun (v, _) => matchesHead v)).map (fun (v, _) => localId v)
+    | .nonRec v e => if matchesHead v then some (v, e) else none
+    | .rec_ pairs => pairs.find? (fun (v, _) => matchesHead v)
 
-/-- Emit a user-class instance: for each class method, find the matching
-    `$c<method>` binding for this instance's head type and wire it as a field.
-    Returns `none` if any method can't be resolved (skip rather than emit broken). -/
-def emitInstanceUser (classes : List ClassDecl) (binds : CoreProgram) (i : Instance) : Option String := do
+/-- The emitted (unique-suffixed) def name of that binding. -/
+private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
+  (findClassMethodBind binds method headTyStr).map (fun (v, _) => localId v)
+
+/-! ### Default methods
+
+    A Haskell class default (`class Greet a where name :: a -> Int;
+    greet :: a -> Int; greet x = name x + 1`) reaches the transpiler as TWO
+    things, both OBSERVED on `examples/haskell/DefaultMethods.hs` (spines quoted
+    in the M3 Task 4 block of `GhcCoreToLean/Tests/Unit.lean`):
+
+    * the class-shape channel's `hasDefault: true` for the method, and a
+      top-level `$dm<method>` bind holding the default BODY, abstracted over the
+      class parameter and its dictionary;
+    * for each instance that RELIES on the default, a `$c<method>` bind that is
+      nothing but a wrapper applying `$dm<method>` to that instance's type and
+      dictionary — both of which `Lower` erases, leaving the bare reference.
+
+    The Lean image is a class-body `:=` default plus an instance that OMITS the
+    field. Emitting the `$dm` bind as an ordinary top-level def instead (what
+    happened before this task) cannot work: it carries a `[Greet t]` binder, so
+    the wrapper `$c<method>` that an instance's field would point at needs the
+    very instance being defined — `failed to synthesize`, or a definitional cycle.
+
+    ONE KEY drives all of it: `translatedDefaults`. A (class, method) pair in that
+    list gets a class-body default, its `$dm` bind is suppressed from the emitted
+    binds, and its wrapper `$c` binds are suppressed and their instance fields
+    omitted. A pair NOT in the list keeps every pre-existing behaviour, so the
+    no-plugin path (`classDecls` empty ⇒ `hasDefault` always false) degrades
+    exactly as it did before, loudly. -/
+
+/-- Is this `$c<method>` body just GHC's default-method wrapper? OBSERVED shape,
+    post-`Lower`, verbatim from `DefaultMethods.hs`'s relying instance:
+
+        ###   $cgreet#9231 [role=id]
+        ###     type: (Quiet -> Int)
+          App
+            App
+              Var $dmgreet#9094 [role=dict] : _Unknown
+              Type Quiet
+            Var $fGreetQuiet#9136 [role=dict] : _Unknown
+
+    The `Type` argument and the dictionary argument are both erased by `Lower`,
+    so what Emit sees is exactly `Var $dmgreet` — hence the single-`.var` test.
+    Deliberately TIGHT: a wider test ("the body mentions `$dm<method>`") would
+    tolerate an eta-expanded wrapper we have never seen, at the price of reading
+    any mention as "the default applies", which is the silent-wrong direction. Any
+    other shape falls through to being wired as an ordinary instance field, whose
+    reference to the suppressed `$dm` def is a loud unknown identifier. -/
+def isDefaultWrapperBody (method : Name) : Expr → Bool
+  | .var v => v.name == "$dm" ++ method
+  | _      => false
+
+/-- THE key (see the section header): the (class, method) pairs this program
+    turns into Lean class-body `:=` defaults. Both halves must hold — the class
+    shape says the method has a default, AND the `$dm<method>` bind carrying the
+    body is present in the program. Consumed by `classDefaultBody` (what to
+    emit), `classifyInstanceMethod` (which instance fields to omit) and
+    `emitFullProgram` (which binds to suppress), so those three cannot disagree
+    about which defaults exist. -/
+def translatedDefaults (binds : CoreProgram) (classes : List ClassDecl) : List (Name × Name) :=
+  classes.flatMap fun c =>
+    c.methods.filterMap fun m =>
+      if m.hasDefault && (findBind binds ("$dm" ++ m.name)).isSome
+      then some (c.name, m.name) else none
+
+/-- The Lean term for one class-body default: the `$dm<method>` bind's body,
+    emitted with `c`'s OWN methods spelled bare (`MethodRef.bare` — a qualified
+    sibling reference does not elaborate inside a class body; see that field).
+    `none` exactly when the `$dm` bind is absent, which `translatedDefaults` has
+    already excluded for every pair emission asks about. -/
+def classDefaultBody (mm : List MethodRef) (top : List Name) (binds : CoreProgram)
+    (c : ClassDecl) (method : Name) : Option String :=
+  let selfBare := mm.map fun r => if r.cls == c.name then { r with bare := true } else r
+  (findBind binds ("$dm" ++ method)).map (fun (_, e) => emitExpr selfBare top e)
+
+/-- Top-level `$dm<method>` binds whose binder ROLE says `dict`. Should be empty:
+    the shim classifies `$dm` as `id` (see `shim/Main.hs`'s `binderRole`). A
+    non-empty result means the dump's roles are the old heuristic's, under which
+    `Lower.isTypeOrDictArg` silently ERASES a `$dm` reference in argument
+    position; wired to a warning in `Main.lean`.
+
+    Only top-level binders are scanned, which is sufficient: the shim resolves a
+    `Var` reference through the binder it came from, so a reference's role is its
+    binder's role. -/
+def dmBindsMislabelledAsDicts (binds : CoreProgram) : List Name :=
+  let bad (v : Var) : Bool := v.name.startsWith "$dm" && v.role == .dict
+  binds.flatMap fun b => match b with
+    | .nonRec v _ => if bad v then [v.name] else []
+    | .rec_ pairs => pairs.filterMap (fun (v, _) => if bad v then some v.name else none)
+
+/-- The warning for one `dmBindsMislabelledAsDicts` entry. -/
+def dmDictRoleWarning (n : Name) : String :=
+  s!"default-method binding `{n}` arrived with binder role `dict`. It is a method\n" ++
+  s!"  BODY, not a dictionary — the shim's role heuristic (`$d`-prefixed ⇒ dict) must\n" ++
+  s!"  exempt `$dm`, and this dump's does not. Consequence: a reference to `{n}` in\n" ++
+  s!"  argument position is erased as a dictionary argument, silently dropping the\n" ++
+  s!"  default's body from wherever it was passed. Rebuild the shim."
+
+/-- How one class method of one instance is realized. -/
+inductive MethodFate where
+  /-- A `$c<method>` bind for this instance head → wire it as the field. -/
+  | field (ref : String)
+  /-- Omitted from the instance: the class body's `:=` default fills it. Either
+      there is no `$c<method>` bind at all, or the one there is is GHC's wrapper
+      around the same default. -/
+  | fromDefault
+  /-- No bind and no default. The instance is SKIPPED (an instance missing a
+      field does not elaborate) and `unresolvedInstanceMethods` reports it. -/
+  | unresolved
+deriving Repr, DecidableEq, Inhabited
+
+/-- The single decision procedure shared by `emitInstanceUser` (what to emit) and
+    `unresolvedInstanceMethods` (what to warn about). Keeping it in one place is
+    what stops the warning and the emission from drifting apart — a drift that
+    would be silent in both directions (warn about an instance that emitted fine,
+    or skip one with no diagnostic). -/
+def classifyInstanceMethod (defaults : List (Name × Name)) (binds : CoreProgram)
+    (cls : Name) (headTyStr : String) (m : ClassMethod) : MethodFate :=
+  let defaulted := defaults.contains (cls, m.name)
+  match findClassMethodBind binds ("$c" ++ m.name) headTyStr with
+  | some (v, e) =>
+    if defaulted && isDefaultWrapperBody m.name e then .fromDefault else .field (localId v)
+  | none => if defaulted then .fromDefault else .unresolved
+
+/-- Emit a user-class instance: for each class method, `classifyInstanceMethod`
+    decides between wiring the `$c<method>` bind as a field, omitting the field so
+    the class-body default fills it, and being unresolvable.
+
+    PER-METHOD since M3 Task 4. The all-or-nothing test it replaces (`every`
+    method must resolve to a `$c` bind) dropped the whole instance the moment one
+    method came from a default. It also dropped it SILENTLY, which is the half
+    this function cannot fix on its own — `unresolvedInstanceMethods` is the same
+    decision run for its diagnostic, wired to an `eprintln` in `Main.lean`.
+
+    A fieldless instance is legal Lean and is emitted as such (`instance : C T
+    where` with nothing after it) — that is the shape for a class every one of
+    whose methods is defaulted and unoverridden; PROBED. What is NOT emitted is an
+    instance of a class with no methods at all: `cd.methods.isEmpty` keeps the old
+    `none`, since such a class has no `$c` binds to have been dropped and nothing
+    to say. -/
+def emitInstanceUser (defaults : List (Name × Name)) (classes : List ClassDecl)
+    (binds : CoreProgram) (i : Instance) : Option String := do
   let cd ← classes.find? (·.name == i.className)
+  if cd.methods.isEmpty then none else
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
-  let fields := cd.methods.filterMap fun m =>
-    match findClassMethod binds ("$c" ++ m.name) tyStr with
-    | some ref => some s!"  {sanitize m.name} := {ref}"
-    | none     => none
-  if fields.length == cd.methods.length && !fields.isEmpty then
-    some (s!"instance : {sanitize i.className} {tyStr} where\n" ++ String.intercalate "\n" fields)
-  else none
+  let fates := cd.methods.map fun m =>
+    (m, classifyInstanceMethod defaults binds i.className tyStr m)
+  if fates.any (fun (_, f) => f == .unresolved) then none else
+  let fields := fates.filterMap fun (m, f) =>
+    match f with
+    | .field ref => some s!"  {sanitize m.name} := {ref}"
+    | _          => none
+  if fields.isEmpty then some s!"instance : {sanitize i.className} {tyStr} where"
+  else some (s!"instance : {sanitize i.className} {tyStr} where\n"
+               ++ String.intercalate "\n" fields)
+
+/-- An instance head spelled the way the SOURCE spells it (`Quiet`,
+    `(Int, Int)`-ish), for diagnostics only. `emitType`'s spelling is the emitter's
+    pre-resolution `(GHCCore.tyConOpaque "Quiet")` needle, which is the right key
+    for matching binds and the wrong thing to show a user. -/
+private def headTypeNames (i : Instance) : Name :=
+  let render : GHCType → Name
+    | .tyCon n args => if args.isEmpty then n else s!"({n} …)"
+    | .tyVar n      => n
+    | _             => "?"
+  String.intercalate " " (i.headTypes.map render)
+
+/-- Instance methods that resolve to NOTHING — no `$c<method>` bind for the
+    instance head and no translated class default — as
+    `(class, head type, method)`. Each one costs the WHOLE instance
+    (`emitInstanceUser` returns `none`; an instance missing a field does not
+    elaborate), so this is the diagnostic for a skip that used to be silent.
+
+    A WARNING, not a refusal: the consequence is a `failed to synthesize C T` at
+    every use site, i.e. already loud at `lake build`; refusing here would newly
+    reject modules that transpile today (an unused instance of a partially
+    droppable class). Reachable shapes: a method whose bind `Main.lean`'s drop
+    rules filtered (`$c/=` of an `Eq`-instance head, the three `$cshow…` names); a
+    class-shape channel listing a method the Core reconstruction has no bind for
+    (`mergeClassDecls`' methods-disagree path); and — the one this fires on today
+    — a method whose type does not START with the class parameter, since
+    `findClassMethodBind` attributes a `$c` bind to an instance by matching its
+    FIRST value argument against the instance head. OBSERVED on
+    `examples/haskell/SuperClass.hs`: `$cempty : Bag` (no argument at all) and
+    `$cinsert : (Int -> (Bag -> Bag))` (first argument `Int`) both fail that
+    match, which is exactly the instance Task 1 recorded as silently dropped.
+
+    Builtin classes cannot appear here: `Eq`/`Ord`/`Show` instances never reach
+    `emitInstanceUser`, and no `ClassDecl` is ever built for them
+    (`reconstructClasses` and `mergeClassDecls` both filter `builtinClasses`), so
+    the `find?` below fails and the instance contributes nothing. -/
+def unresolvedInstanceMethods (p : Program) : List (Name × String × Name) :=
+  let classes  := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
+  let defaults := translatedDefaults p.binds classes
+  p.instances.flatMap fun i =>
+    match classes.find? (·.name == i.className) with
+    | none    => []
+    | some cd =>
+      let tyStr := i.headTypes.map emitType |> String.intercalate " "
+      cd.methods.filterMap fun m =>
+        if classifyInstanceMethod defaults p.binds i.className tyStr m == .unresolved
+        then some (i.className, headTypeNames i, m.name) else none
+
+/-- The warning for one `unresolvedInstanceMethods` entry. -/
+def unresolvedInstanceMethodWarning (cls head mname : Name) : String :=
+  s!"instance `{cls} {head}` is DROPPED: its method `{mname}` resolves to nothing —\n" ++
+  s!"  no `$c{mname}` binding for that instance head survives in this module, and the\n" ++
+  s!"  class declares no default body for it (or the default's `$dm{mname}` binding is\n" ++
+  s!"  itself missing). A Lean instance cannot omit a field that has no default, so\n" ++
+  s!"  the whole instance is skipped; every use of `{cls}`'s methods at `{head}` will\n" ++
+  s!"  fail with `failed to synthesize {cls} {head}` at `lake build`.\n" ++
+  s!"  Likely causes: `{mname}`'s type does not start with the class parameter (a\n" ++
+  s!"  `$c` binding is matched to its instance by its FIRST value argument, so\n" ++
+  s!"  `{mname} :: Int -> a -> a` or `{mname} :: a` cannot be attributed); the binding\n" ++
+  s!"  was filtered as `Eq`/`Show` plumbing (see Main.lean's drop rules); or the\n" ++
+  s!"  class-shape dump declares a method this module has no binding for."
 
 /-- Emit a Lean `instance` block. `Eq` → Lean `BEq`, `Ord` → Lean `Ord` (the
     latter via `deriving` in the data block), and user classes via
     `emitInstanceUser`. Returns `none` for classes we don't model (Show, Read). -/
-def emitInstance (classes : List ClassDecl) (derivedEq : List String) (binds : CoreProgram) (i : Instance) : Option String :=
+def emitInstance (defaults : List (Name × Name)) (classes : List ClassDecl)
+    (derivedEq : List String) (binds : CoreProgram) (i : Instance) : Option String :=
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
   match i.className with
   | "Eq" =>
@@ -1105,7 +1404,7 @@ def emitInstance (classes : List ClassDecl) (derivedEq : List String) (binds : C
   -- already `derive Repr`, which Blaster uses to print counterexamples.
   -- Translating Show would risk a *wrong* printer; skipping is sound.
   | "Show" => none
-  | _ => emitInstanceUser classes binds i
+  | _ => emitInstanceUser defaults classes binds i
 
 /-- Build a user-data-constructor-name map from the typeDecls. This lets
     the Lean emitter rewrite `case x of CustomRatio …` patterns to use the
@@ -1892,11 +2191,7 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   let isSuppressedMethod (v : Var) : Bool :=
     (eqMethodNames.contains v.name  && headMatches v derivedEq)
     || (ordMethodNames.contains v.name && headMatches v ordTypes)
-  let keptBinds : CoreProgram := p.binds.filterMap fun b => match b with
-    | .nonRec v e => if isSuppressedMethod v then none else some (.nonRec v e)
-    | .rec_ pairs =>
-      let kept := pairs.filter (fun (v, _) => !isSuppressedMethod v)
-      if kept.isEmpty then none else some (.rec_ kept)
+  let keptBinds : CoreProgram := filterBinds (fun v _ => !isSuppressedMethod v) p.binds
   -- User classes → class decls + method→class map (selector rewrite). The decl
   -- plugin's shapes win over the instance-driven reconstruction (see
   -- `mergeClassDecls`); the map stays reconstruction-only, since it is keyed by
@@ -1919,22 +2214,50 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
       kept.any (·.name == d.name)).map fun d =>
     let hs := emitType (.tyCon d.name [])
     emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
-  let classDecls := userClasses.map emitClassDecl
+  -- Default methods: the class body carries the `:=` defaults translated from
+  -- GHC's `$dm<method>` binds, and `defaults` is THE key that also suppresses
+  -- those binds and their instance-side wrappers below (see the "Default
+  -- methods" section header). Computed from `p.binds`, the same list
+  -- `emitInstance`'s `findClassMethodBind` searches, so the two cannot disagree
+  -- about which binds exist.
+  --
+  -- The default BODY is emitted against the same top-name set as the user binds,
+  -- so a reference to a top-level function emits bare — and, since the class
+  -- block precedes every def, is then a loud forward reference. Only sibling
+  -- methods (bare, via `MethodRef.bare`), builtins and locals are safe there.
+  let defaults   := translatedDefaults p.binds userClasses
+  let defaultTop := ctorNames ++ collectTopNames keptBinds
+  let classDecls := userClasses.map fun c =>
+    let ds := (defaults.filter (·.1 == c.name)).filterMap fun (_, m) =>
+      (classDefaultBody methodMap defaultTop p.binds c m).map (fun body => (m, body))
+    emitClassDecl ds c
   -- Partition kept binds for forward-visibility-safe ordering. Drop instance
   -- dict-builders (`$f…`) and Typeable junk; `$c…` method defs precede the
   -- instances (which reference them) which precede user binds (which use the
   -- instances). Classes go in the data block (before everything).
-  let bindHeadName : Bind → Name
-    | .nonRec v _ => v.name
-    | .rec_ ps    => (ps.head?.map (·.1.name)).getD ""
+  --
+  -- PER PAIR (`filterBinds`), never by a Rec group's head binder: GHC groups an
+  -- instance's dict-builder with the method binds that need its dictionary, so
+  -- head-name classification dropped or emitted the wrong half of a group — see
+  -- `filterBinds` for both observed directions.
   let isJunkName (n : Name) : Bool :=
     n.startsWith "$f" || n.startsWith "$tc" || n.startsWith "$tr" || n.startsWith "$kr"
-  let methodDefs := keptBinds.filter (fun b => (bindHeadName b).startsWith "$c")
-  let userBinds  := keptBinds.filter (fun b =>
-    let n := bindHeadName b; !(n.startsWith "$c") && !(isJunkName n))
+  -- A `$dm` bind whose body is now the class-body default has no second Lean
+  -- image, and neither has a `$c` bind that is only GHC's wrapper around such a
+  -- default (the instance omits that field instead — `classifyInstanceMethod`).
+  let isTranslatedDm (n : Name) : Bool := defaults.any (fun (_, m) => "$dm" ++ m == n)
+  let isWrapperBind (v : Var) (e : Expr) : Bool :=
+    v.name.startsWith "$c" &&
+      (let m := v.name.drop 2
+       defaults.any (fun (_, dm) => dm == m) && isDefaultWrapperBody m e)
+  let methodDefs := filterBinds
+    (fun v e => v.name.startsWith "$c" && !isWrapperBind v e) keptBinds
+  let userBinds  := filterBinds
+    (fun v _ => !v.name.startsWith "$c" && !isJunkName v.name && !isTranslatedDm v.name)
+    keptBinds
   let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames
   let userStr   := emitProgramWith methodMap classNames userBinds ctorNames
-  let insts := p.instances.filterMap (emitInstance userClasses derivedEq p.binds)
+  let insts := p.instances.filterMap (emitInstance defaults userClasses derivedEq p.binds)
   let instStr := String.intercalate "\n\n" insts
   let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes kept bodyRaw

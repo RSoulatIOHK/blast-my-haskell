@@ -13,9 +13,14 @@ private def isGhcRuntimePlumbing (name : Name) : Bool :=
   -- call-stack primitives with no Lean image, so drop it. (Lower already
   -- erases the same dict when it stays a local let.)
   name.startsWith "$dIP"    ||
-  -- Auto-derived Show methods and instance dicts:
+  -- Auto-derived Show methods and instance dicts. The `$c` half is matched by
+  -- EXACT name (`Emit.isDerivedShowMethod` — `Show`'s three methods) rather than
+  -- by the prefix `$cshow`, which also ate a user class's `showIt`/`showAll`; see
+  -- that docstring for the residual. The other two stay prefixes and are not
+  -- method binds at all: `$fShow…` is a dict-builder (`$f` + the class name
+  -- `Show` + the type), `$sshow…` a specialization of `show` itself.
   name.startsWith "$fShow"  ||
-  name.startsWith "$cshow"  ||
+  Emit.isDerivedShowMethod name ||
   name.startsWith "$sshow"
 
 /-- NOTE: `$f<Class><Type>` instance dict-builders are NOT dropped here — they
@@ -240,6 +245,23 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for (c, m) in unmapped do
         IO.eprintln s!"error: {Emit.unmappedOperatorMethodError c m}"
       return 1
+    -- Name every instance `emitInstanceUser` is about to SKIP, and the method
+    -- that costs it. Not a refusal (the skip is already loud at `lake build`, as
+    -- `failed to synthesize`, and refusing would newly reject modules whose
+    -- unusable instance is unused) — but no longer silent at the transpiler,
+    -- which was the last silent half of that path. Same decision procedure the
+    -- emission uses (`Emit.classifyInstanceMethod`), so the two cannot disagree.
+    for (cls, head, m) in Emit.unresolvedInstanceMethods userProg do
+      IO.eprintln s!"warning: {Emit.unresolvedInstanceMethodWarning cls head m}"
+    -- Tripwire for the shim's binder-role heuristic. A `$dm<method>` bind is a
+    -- default-method BODY; the shim used to classify it as a dictionary (any
+    -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT
+    -- position — so a regression here would silently delete a default-method
+    -- reference rather than fail. `$dm` is unambiguous (a dict is `$d` + a CLASS
+    -- name, always upper-case), which is why the shim exempts it; this says so
+    -- out loud if a dump produced by some other/older shim arrives.
+    for n in Emit.dmBindsMislabelledAsDicts prog.binds do
+      IO.eprintln s!"warning: {Emit.dmDictRoleWarning n}"
     let body      := Emit.emitFullProgram ext.datas userProg extNts
     let crib      := emitNamesCrib ext.datas extNts userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that

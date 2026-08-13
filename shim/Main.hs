@@ -158,7 +158,15 @@ binderRole b@(Binder {}) =
     DFunId -> "dict"
     _      ->
       let n = T.unpack (binderName b)
-      in if take 2 n `elem` ["$d", "$f"] then "dict" else "id"
+      -- `$dm<method>` is a class DEFAULT-METHOD body, not a dictionary. The
+      -- consumer erases dict-role Vars in argument position (Lower.lean), so
+      -- classifying `$dmgreet` as a dict would silently delete the default's
+      -- body wherever it is passed as an argument. The exemption is exact, not a
+      -- guess: a dictionary's name is `$d` + a CLASS name, which is always
+      -- upper-case (`$dGreet`, `$dIP`), while `$dm` is followed by a METHOD
+      -- name, always lower-case or symbolic — the two prefixes cannot collide.
+      in if take 3 n == "$dm" then "id"
+         else if take 2 n `elem` ["$d", "$f"] then "dict" else "id"
 
 ------------------------------------------------------------------------
 -- Expr

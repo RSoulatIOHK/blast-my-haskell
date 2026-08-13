@@ -172,8 +172,8 @@ def eqInstProgram : CoreProgram :=
                   (.lit (.litInt 0))) ]
 def eqInst : Instance :=
   {className := "Eq", headTypes := [.tyCon "Foo" []], dfunName := "$fEqFoo", dfunUnique := 99}
-#guard (emitInstance [] [] eqInstProgram eqInst).isSome
-#guard (((emitInstance [] [] eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
+#guard (emitInstance [] [] [] eqInstProgram eqInst).isSome
+#guard (((emitInstance [] [] [] eqInstProgram eqInst).getD "").splitOn "instance : BEq (GHCCore.tyConOpaque \"Foo\")").length == 2
 
 -- Tier 3 Task 2/4: Ord is reconstructed via `deriving Ord` + LE/LT/Min/Max in
 -- the data block (instances precede binds; Lean instances aren't forward-
@@ -181,12 +181,12 @@ def eqInst : Instance :=
 -- emitDataDecl guards below.
 def ordInst : Instance :=
   {className := "Ord", headTypes := [.tyCon "Foo" []], dfunName := "$fOrdFoo", dfunUnique := 98}
-#guard emitInstance [] [] [] ordInst == none
+#guard emitInstance [] [] [] [] ordInst == none
 
 -- Tier 3 Task 3: Show instances are intentionally skipped (derived Repr handles printing).
 def showInst : Instance :=
   {className := "Show", headTypes := [.tyCon "Foo" []], dfunName := "$fShowFoo", dfunUnique := 97}
-#guard emitInstance [] [] [] showInst == none
+#guard emitInstance [] [] [] [] showInst == none
 
 -- Tier 3 Task 4: derived Eq (DecidableEq) and Ord (deriving Ord + LE/LT/Min/Max).
 def coinDecl : DataDecl :=
@@ -205,8 +205,8 @@ def coinDecl : DataDecl :=
 #guard ((emitDataDecl false false coinDecl).splitOn "leOfOrd").length == 1
 -- derived Eq instance is skipped (deriving handles it); hand-written (empty
 -- derived set) still emits its BEq from the translated body.
-#guard emitInstance [] ["(GHCCore.tyConOpaque \"Foo\")"] eqInstProgram eqInst == none
-#guard (emitInstance [] [] eqInstProgram eqInst).isSome
+#guard emitInstance [] [] ["(GHCCore.tyConOpaque \"Foo\")"] eqInstProgram eqInst == none
+#guard (emitInstance [] [] [] eqInstProgram eqInst).isSome
 
 -- Dict Task 1: ClassDecl / ClassMethod AST types exist and hold the shape.
 -- (Widened to `ClassDecl` v2 by M3 Task 1: `tyVar` → `tyVars`, plus `supers`.
@@ -256,19 +256,25 @@ def reconRes := reconstructClasses [csizeBind, dfunBind] [sizedInst]
 #guard (reconRes.1.head!).methods.head!.hasDefault == false
 
 -- Dict Task 3: emit a Lean `class` from a ClassDecl.
-#guard emitClassDecl sizedClass == "class Sized (a : Type) where\n  size : (a → Int)"
+-- M3 Task 4 ADAPTATION: `emitClassDecl` takes the method-name → default-body
+-- list first (`[]` here = no class-body `:=` defaults), so a class without
+-- defaults still emits exactly the v1 string.
+#guard emitClassDecl [] sizedClass == "class Sized (a : Type) where\n  size : (a → Int)"
 
 -- Dict Task 4: a bare class-method selector emits `Class.method`; others unaffected.
 #guard emitVar [{ method := "size", cls := "Sized" }] [] {name := "size", unique := 7, ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .id} == "Sized.size"
 #guard emitVar [{ method := "size", cls := "Sized" }] [] {name := "other", unique := 8, ty := .tyCon "Int" [], role := .id} == "other_8"
 
 -- Dict Task 5: a user-class instance emits `instance : C T where m := <ref>`.
-#guard (((emitInstanceUser [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
+-- M3 Task 4 ADAPTATION: `emitInstanceUser`/`emitInstance` take the translated
+-- (class, method) default set first (`[]` = none), which is what decides whether
+-- a missing method is an omitted default or an unresolvable one.
+#guard (((emitInstanceUser [] [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
          "instance : Sized (GHCCore.tyConOpaque \"Box\") where").length == 2
-#guard (((emitInstanceUser [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
+#guard (((emitInstanceUser [] [sizedClass] [csizeBind, dfunBind] sizedInst).getD "").splitOn
          "size := ").length == 2
 -- no matching class → none
-#guard emitInstanceUser [] [csizeBind, dfunBind] sizedInst == none
+#guard emitInstanceUser [] [] [csizeBind, dfunBind] sizedInst == none
 
 -- Dict Task 6: a `C a =>`-constrained def emits `[C a]` and no leaked dict arg.
 def totalBind : Bind :=
@@ -2238,8 +2244,10 @@ def m3parseClass (s : String) : Except String ClassDecl := do
 #guard ((m3parseClass m3SizedJson).toOption.map (·.methods.map (·.name))) == some ["size"]
 #guard ((m3parseClass m3SizedJson).toOption.map (·.methods.map (·.hasDefault))) == some [false]
 -- THE GATE, in one line: the plugin's own JSON re-emits the class block that
--- `Generated/UserClass.lean` has today, character for character.
-#guard ((m3parseClass m3SizedJson).toOption.map emitClassDecl)
+-- `Generated/UserClass.lean` has today, character for character. (M3 Task 4
+-- ADAPTATION: `emitClassDecl []` — no defaults for this class, so the gate string
+-- is unchanged; `UserClass.lean` was re-verified byte-identical.)
+#guard ((m3parseClass m3SizedJson).toOption.map (emitClassDecl []))
          == some "class Sized (a : Type) where\n  size : (a → Int)"
 
 /-! ### Observation 2 — `SuperClass.hs` (new fixture; observation only)
@@ -2512,7 +2520,7 @@ def m3PluginOnly : ClassDecl :=
 -- EMISSION is unchanged for the only shape supported end-to-end (single
 -- parameter, no superclass) — pinned character-exact at "Dict Task 3" above.
 -- `supers` is dropped, silently in the emitter (loudly at the Lean use site):
-#guard emitClassDecl
+#guard emitClassDecl []
   { name := "Container", tyVars := ["a"], supers := ["Sized"],
     methods := [ { name := "empty", ty := .tyVar "a" } ] }
     == "class Container (a : Type) where\n  empty : a"
@@ -2523,7 +2531,7 @@ def m3PluginOnly : ClassDecl :=
 -- call sites still fail to synthesize. This is loud either way; the point of
 -- pinning it is that Task 7 must change this string deliberately, not by
 -- accident.
-#guard emitClassDecl
+#guard emitClassDecl []
   { name := "Convert", tyVars := ["a", "b"], supers := [],
     methods := [ { name := "conv", ty := .tyFun (.tyVar "a") (.tyVar "b") } ] }
     == "class Convert (a : Type) (b : Type) where\n  conv : (a → b)"
@@ -3231,5 +3239,475 @@ def m3t3AllSameAt {t : Type} [BEq t] (x y : t) : Bool := (((· == ·)) x) y
     `lake build GhcCoreToLean.Generated.<M>` green (0 errors): BuiltinConstraints,
     Ratio, Arithmetic, OrdInstance, NewtypeBasic, RecordOps, ListLibrary,
     TupleBasics. -/
+
+/-! ## M3 Task 4 — default methods
+
+    A Haskell class default reaches the transpiler as TWO things: `hasDefault` in
+    the class-shape channel, and a top-level `$dm<method>` bind holding the body.
+    The Lean image is a class-body `:=` default plus instances that OMIT the
+    field. This block records the observed spines, the two Lean-side probes that
+    settled the emission shape, and the two pre-discovered defects fixed here.
+
+### Observation 1 — the fixture and its `classDecls`
+
+    `examples/haskell/DefaultMethods.hs`: `class Greet a where name :: a -> Int;
+    greet :: a -> Int; greet x = name x + 1`, `data Loud = Loud Int` /
+    `data Quiet = Quiet Int`, `instance Greet Loud` OVERRIDING `greet`,
+    `instance Greet Quiet` RELYING on the default, call sites for both methods at
+    both types. `.transpile-sandbox/.decls/DefaultMethods.decls.json`, `classDecls`
+    (pretty-printed; both methods share the type `a -> Int`):
+
+        [ { "name": "Greet", "tyVars": ["a"], "supers": [],
+            "methods": [ {"name": "name",  "hasDefault": false, "type": …},
+                         {"name": "greet", "hasDefault": true,  "type": …} ] } ]
+
+    `hasDefault` discriminates WITHIN one class and in DECLARATION order — the
+    first committed fixture to exercise the field (Task 1 could only verify it
+    with a throwaway probe).
+
+### Observation 2 — the `$dm` spine, and its ROLE (pre-discovered defect 2)
+
+    `/tmp/transpile-DefaultMethods.json`. Verbatim, BEFORE the shim fix below:
+
+        ### $dmgreet#9094 [role=dict]
+        ###   type: ForAll
+          Lam (a#8936 [role=tyVar] : Type)
+            Lam ($dGreet#9185 [role=dict] : (Greet _v_v8936))
+              Lam (x#8937 [role=id] : _v_v8936)
+                App
+                  App
+                    App
+                      App
+                        Var GHC.Num.+#1300 [role=id] : _Unknown
+                        Type Int
+                      Var GHC.Num.$fNumInt#9036 [role=dict] : _Unknown
+                    App
+                      App
+                        App
+                          Var name#8929 [role=id] : _Unknown
+                          Type _v_v8936
+                        Var $dGreet#9185 [role=dict] : (Greet _v_v8936)
+                      Var x#8937 [role=id] : _v_v8936
+                  App
+                    Var GHC.Types.I##19 [role=id] : _Unknown
+                    Lit {'tag': 'LitInt', 'value': 1}
+
+    `[role=dict]` on `$dmgreet` is the mislabel. It is a method BODY; the shim's
+    heuristic (`$d`/`$f` prefix ⇒ dict) has no exemption for `$dm`. The three
+    inner lambdas are exactly right, though: the `@a` tyvar and the `$dGreet`
+    dictionary binder are erased by `Lower`, as is the dict ARGUMENT of the inner
+    `name @a $dGreet x`, leaving `\x -> name x + 1`.
+
+    THE DECISION: fix the SHIM, not the consumer. `role` is a claim about the Id,
+    and the claim was false; the exemption is exact rather than a guess, because a
+    dictionary's name is `$d` + a CLASS name (always upper-case: `$dGreet`,
+    `$dIP`) while `$dm` is followed by a METHOD name (lower-case or symbolic), so
+    the two prefixes cannot collide. After `take 3 n == "$dm" -> "id"` in
+    `shim/Main.hs`, the same binder re-dumps as:
+
+        ### $dmgreet#9094 [role=id]
+
+    WHY IT MATTERS even though nothing observable changed: at pass-0000 `$dmgreet`
+    only ever appears in HEAD position (see observation 3), and `Lower` erases
+    dict-role Vars in ARGUMENT position — so the live dump was one inlining away
+    from silently deleting a default's body from wherever it was passed. The
+    erasure itself is pinned below, and `Main.lean` now warns if a `$dm` binder
+    ever arrives with role `dict` again. BLAST RADIUS of the shim change,
+    measured: `$dm` occurs in exactly ONE of the 26 saved dumps
+    (`grep -o '\$dm[a-zA-Z]*' /tmp/transpile-*.json` ⇒ `DefaultMethods: $dmgreet`),
+    so no other fixture's roles can move.
+
+### Observation 3 — the Rec groups (pre-discovered defect 1)
+
+    Both instances' method binds share a Rec group with their dfun, because a
+    `$c` body that needs the instance's own dictionary references it:
+
+        Rec group: ['$fGreetLoud', '$cgreet']       -- override calling `name`
+        Rec group: ['$fGreetQuiet', '$cgreet']      -- the default wrapper
+
+    The `$f` member is the group HEAD in both. `emitFullProgram` classified a
+    whole group by that head, so both groups were dropped as junk while the
+    emitted instances still referenced their `$c` defs. The pre-fix build,
+    verbatim:
+
+        error: …/DefaultMethods.lean:43:11: Unknown identifier `_dollar_cgreet_9231`
+        error: …/DefaultMethods.lean:47:11: Unknown identifier `_dollar_cgreet_9243`
+
+    The RELYING instance's wrapper, post-`Lower` (its `Type Quiet` and
+    `$fGreetQuiet` arguments both erased, leaving one Var):
+
+        ###   $cgreet#9231 [role=id]
+        ###     type: (Quiet -> Int)
+          App
+            App
+              Var $dmgreet#9094 [role=dict] : _Unknown
+              Type Quiet
+            Var $fGreetQuiet#9136 [role=dict] : _Unknown
+
+    Fixed by `Emit.filterBinds` (per-pair, like `Main.keepBinding`), which also
+    covers the direction GHC has NOT shown us: a `$c`-headed group would have
+    EMITTED the `$f` dict-builder. Both orders are guarded below.
+
+### Observation 4 — the Lean-side probes that fixed the emission shape
+
+    (a) A class-body default resolves a SIBLING method by BARE name, and an
+    instance omitting the field picks it up:
+
+        class Greet (a : Type) where
+          name : a → Int
+          greet : a → Int := fun x => name x + 1
+        instance : Greet Quiet where          -- no `greet`
+          name := cnameQuiet
+        example : Greet.greet (Quiet.Quiet 3) = 4 := by decide   -- passes
+
+    (b) The SAME body with the reference QUALIFIED does not elaborate, because the
+    class name is not a constant yet inside its own body:
+
+        greet2 : a → Int := fun x => Greet2.name2 x + 1
+        -- error: Invalid field `name2`: The environment does not contain
+        --   `Function.name2`
+
+    Hence `MethodRef.bare`, set only on the map used for default bodies. Dropping
+    the map entry instead would emit `Maps.valueMap`'s BUILTIN for an operator
+    method — the silent-wrong this flag exists to avoid.
+
+    (c) A default may only reference methods declared EARLIER in the class body:
+
+        class Fwd (a : Type) where
+          g : a → Int := fun x => f x + 1
+          f : a → Int
+        -- error: Unknown identifier `f`
+
+    Recorded as a LIMITATION, not fixed: `classOpItems` order is declaration
+    order, so a Haskell class declaring a defaulted method before the method its
+    default calls fails loud. No fixture has that shape.
+
+    (d) A FIELDLESS instance is legal (`instance : AllDef T where` with every
+    method defaulted), which is why `emitInstanceUser` emits that form instead of
+    refusing.
+
+    (e) The wall this task does NOT remove: an instance that OVERRIDES a method
+    with a body calling a SIBLING method. GHC's `$cgreet` then needs the
+    instance's own dictionary, and the emitted def precedes the instance (Lean
+    instances are not forward-visible). Observed after the fix, with the fixture's
+    override written as `greet x = name x * 10`:
+
+        def _dollar_cgreet_9243 (x_9077 : Loud) : Int :=
+          (((· * ·)) ((Greet.name) (x_9077))) ((10 : Int))
+        error: …/DefaultMethods.lean:42:15: failed to synthesize
+          Greet ?m.20
+
+    A `mutual` block does NOT rescue it — PROBED: `mutual instance instSibT : Sib T
+    where nm := cnmT; gr := cgrT / def cgrT := fun x => Sib.nm x * 10 end` gives
+    `error: failed to synthesize Sib T`. The real fix is self-dispatch rewriting
+    (a method call through the instance's OWN dfun resolving to the sibling `$c`
+    def), which needs the dict argument `Lower` has already erased — a pre-Emit
+    pass, out of scope here. The committed fixture therefore overrides by matching
+    the constructor (`greet (Loud n) = n * 10`), and the shape above is a HANDOFF:
+    Task 5's superclass method calls hit the same wall.
+
+### The emitted result, and what verifies it
+
+    `class Greet (a : Type) where`
+    `  name : (a → Int)`
+    `  greet : (a → Int) := (fun x_8937 => (((· + ·)) ((name) (x_8937))) ((1 : Int)))`
+    `instance : Greet Quiet where`
+    `  name := _dollar_cname_9227`            -- `greet` OMITTED
+    `instance : Greet Loud where`
+    `  name := _dollar_cname_9239`
+    `  greet := _dollar_cgreet_9243`          -- the override, wired
+
+    `lake build GhcCoreToLean.Generated.DefaultMethods` is GREEN: all four
+    quantified properties ✅ Valid (`loudName_correct`, `quietName_correct`,
+    `loudGreet_overrides_the_default` = `n * 10`, `quietGreet_uses_the_default` =
+    `n + 1`) plus the ground `override_and_default_differ` by `decide`. The last
+    three are what distinguish the two behaviours: no single shared body satisfies
+    `n * 10` and `n + 1` at once.
+
+### Guards -/
+
+def m3t4Greet : ClassDecl :=
+  { name := "Greet", tyVars := ["a"], supers := [],
+    methods := [ { name := "name",  ty := .tyFun (.tyVar "a") (.tyCon "Int" []) },
+                 { name := "greet", ty := .tyFun (.tyVar "a") (.tyCon "Int" []),
+                   hasDefault := true } ] }
+
+-- The `$dmgreet` bind as `Lower` leaves it: `\x -> name x + 1`, with `name` the
+-- class-op selector Var (unique 8929, as in the dump) — see observation 2.
+def m3t4NameSel : Var :=
+  {name := "name", unique := 8929, ty := .tyCon "_Unknown" [], role := .id}
+def m3t4DmBind : Bind :=
+  .nonRec {name := "$dmgreet", unique := 9094,
+           ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .id}
+    (.lam {name := "x", unique := 8937, ty := .tyVar "a", role := .id}
+      (.app (.app (.var {name := "GHC.Num.+", unique := 1300,
+                         ty := .tyCon "_Unknown" [], role := .id})
+                  (.app (.var m3t4NameSel)
+                        (.var {name := "x", unique := 8937, ty := .tyVar "a", role := .id})))
+            (.lit (.litInt 1))))
+-- The relying instance's wrapper `$cgreet` (observation 3) and its dfun, in the
+-- Rec group GHC put them in; plus the overriding instance's real `$cgreet`.
+def m3t4QuietWrapper : Var :=
+  {name := "$cgreet", unique := 9231,
+   ty := .tyFun (.tyCon "Quiet" []) (.tyCon "Int" []), role := .id}
+def m3t4QuietDfun : Var :=
+  {name := "$fGreetQuiet", unique := 9136, ty := .tyCon "Greet" [.tyCon "Quiet" []],
+   role := .dict}
+-- The dfun's body is the observed one, `C:Greet @Quiet $cname $cgreet` with its
+-- type argument erased by `Lower`: it must reference BOTH `$c` binds, since that
+-- is what `reconstructClasses` reads the method→class map out of.
+def m3t4DmRef : Expr :=
+  .var {name := "$dmgreet", unique := 9094, ty := .tyCon "_Unknown" [], role := .id}
+def m3t4QuietDfunRhs : Expr :=
+  .app (.app (.var {name := "C:Greet", unique := 9097,
+                    ty := .tyCon "_Unknown" [], role := .id})
+             (.var {name := "$cname", unique := 9227,
+                    ty := .tyFun (.tyCon "Quiet" []) (.tyCon "Int" []), role := .id}))
+       (.var m3t4QuietWrapper)
+def m3t4QuietRec : Bind :=
+  .rec_ [ (m3t4QuietDfun, m3t4QuietDfunRhs), (m3t4QuietWrapper, m3t4DmRef) ]
+def m3t4CnameQuiet : Bind :=
+  .nonRec {name := "$cname", unique := 9227,
+           ty := .tyFun (.tyCon "Quiet" []) (.tyCon "Int" []), role := .id}
+    (.lam {name := "ds", unique := 9286, ty := .tyCon "Quiet" [], role := .id}
+      (.lit (.litInt 0)))
+def m3t4CgreetLoud : Bind :=
+  .nonRec {name := "$cgreet", unique := 9243,
+           ty := .tyFun (.tyCon "Loud" []) (.tyCon "Int" []), role := .id}
+    (.lam {name := "ds", unique := 9363, ty := .tyCon "Loud" [], role := .id}
+      (.lit (.litInt 7)))
+def m3t4CnameLoud : Bind :=
+  .nonRec {name := "$cname", unique := 9239,
+           ty := .tyFun (.tyCon "Loud" []) (.tyCon "Int" []), role := .id}
+    (.lam {name := "ds", unique := 9362, ty := .tyCon "Loud" [], role := .id}
+      (.lit (.litInt 0)))
+def m3t4QuietInst : Instance :=
+  {className := "Greet", headTypes := [.tyCon "Quiet" []], dfunName := "$fGreetQuiet",
+   dfunUnique := 9136}
+def m3t4LoudInst : Instance :=
+  {className := "Greet", headTypes := [.tyCon "Loud" []], dfunName := "$fGreetLoud",
+   dfunUnique := 9122}
+def m3t4Binds : CoreProgram := [m3t4QuietRec, m3t4DmBind, m3t4CnameQuiet, m3t4CnameLoud, m3t4CgreetLoud]
+def m3t4Mm : List MethodRef :=
+  [{ method := "name", cls := "Greet" }, { method := "greet", cls := "Greet" }]
+
+-- THE KEY. Both halves are required, and each alone is not enough: `hasDefault`
+-- without the `$dm` bind (a filtered or absent body) and the `$dm` bind without
+-- `hasDefault` (the no-plugin path, where the class shape is reconstructed from
+-- instances and cannot know) BOTH yield no translated default — which is what
+-- keeps every pre-existing behaviour for those two shapes.
+#guard translatedDefaults m3t4Binds [m3t4Greet] == [("Greet", "greet")]
+#guard translatedDefaults [m3t4CnameQuiet] [m3t4Greet] == ([] : List (Name × Name))
+#guard translatedDefaults m3t4Binds
+         [{ m3t4Greet with methods := m3t4Greet.methods.map ({ · with hasDefault := false }) }]
+         == ([] : List (Name × Name))
+
+-- THE DEFAULT BODY, character-exact, with the sibling reference BARE — the shape
+-- probe (b) showed is the only one that elaborates inside a class body.
+#guard classDefaultBody m3t4Mm [] m3t4Binds m3t4Greet "greet"
+         == some "(fun x_8937 => (((· + ·)) ((name) (x_8937))) ((1 : Int)))"
+-- …and the flag is SCOPED to the class's own methods: a same-named method of
+-- ANOTHER class stays qualified, because that reference is not a sibling.
+#guard classDefaultBody [{ method := "name", cls := "Other" }] [] m3t4Binds m3t4Greet "greet"
+         == some "(fun x_8937 => (((· + ·)) ((Other.name) (x_8937))) ((1 : Int)))"
+-- Both directions of `MethodRef.bare` at the `emitVar` level.
+#guard emitVar [{ method := "name", cls := "Greet", bare := true }] [] m3t4NameSel == "name"
+#guard emitVar [{ method := "name", cls := "Greet" }] [] m3t4NameSel == "Greet.name"
+-- `bare` does not outrank `shadowedBy`: a LOCAL binder of that name is still a
+-- local, inside a default body as anywhere else.
+#guard emitVar [{ method := "name", cls := "Greet", bare := true, shadowedBy := [8929] }] []
+         m3t4NameSel == "name_8929"
+
+-- THE CLASS BLOCK. Defaulted method carries `:=`, the plain one does not.
+#guard emitClassDecl [("greet", "(fun x => name x + 1)")] m3t4Greet
+         == "class Greet (a : Type) where\n  name : (a → Int)\n" ++
+            "  greet : (a → Int) := (fun x => name x + 1)"
+#guard emitClassDecl [] m3t4Greet
+         == "class Greet (a : Type) where\n  name : (a → Int)\n  greet : (a → Int)"
+
+-- THE WRAPPER TEST, tight (observation 3): exactly a `$dm<method>` Var.
+#guard isDefaultWrapperBody "greet" (.var {name := "$dmgreet", unique := 9094,
+                                           ty := .tyCon "_Unknown" [], role := .id}) == true
+-- wrong method, an eta-expanded wrapper, and an ordinary body all say false —
+-- the last two then emit as ordinary fields and fail loud, never silently
+-- adopting the default.
+#guard isDefaultWrapperBody "name" (.var {name := "$dmgreet", unique := 9094,
+                                          ty := .tyCon "_Unknown" [], role := .id}) == false
+#guard isDefaultWrapperBody "greet"
+         (.lam {name := "x", unique := 1, ty := .tyCon "Quiet" [], role := .id}
+           (.app (.var {name := "$dmgreet", unique := 9094,
+                        ty := .tyCon "_Unknown" [], role := .id})
+                 (.var {name := "x", unique := 1, ty := .tyCon "Quiet" [], role := .id})))
+         == false
+
+-- THE THREE FATES, on the observed binds.
+def m3t4Defaults : List (Name × Name) := [("Greet", "greet")]
+def m3t4GreetM : ClassMethod := m3t4Greet.methods.getLast!
+def m3t4NameM  : ClassMethod := m3t4Greet.methods.head!
+#guard classifyInstanceMethod m3t4Defaults m3t4Binds "Greet"
+         (emitType (.tyCon "Quiet" [])) m3t4GreetM == .fromDefault
+#guard classifyInstanceMethod m3t4Defaults m3t4Binds "Greet"
+         (emitType (.tyCon "Loud" [])) m3t4GreetM == .field "_dollar_cgreet_9243"
+#guard classifyInstanceMethod m3t4Defaults m3t4Binds "Greet"
+         (emitType (.tyCon "Quiet" [])) m3t4NameM == .field "_dollar_cname_9227"
+-- No `$c` bind AND no translated default → unresolved (the instance is skipped).
+#guard classifyInstanceMethod [] m3t4Binds "Greet"
+         (emitType (.tyCon "Bag" [])) m3t4NameM == .unresolved
+-- No `$c` bind but a translated default → filled by the class body. This is the
+-- arm the plan predicted GHC would take; GHC actually emits a wrapper, so the
+-- arm is REACHED only through the `.fromDefault` case above. Pinned anyway: it is
+-- the behaviour a future GHC that omits the wrapper would need.
+#guard classifyInstanceMethod m3t4Defaults m3t4Binds "Greet"
+         (emitType (.tyCon "Bag" [])) m3t4GreetM == .fromDefault
+
+-- THE INSTANCE, both instances of the fixture. The relying one omits `greet`…
+#guard emitInstanceUser m3t4Defaults [m3t4Greet] m3t4Binds m3t4QuietInst
+         == some ("instance : Greet (GHCCore.tyConOpaque \"Quiet\") where\n" ++
+                 "  name := _dollar_cname_9227")
+-- …and the overriding one wires it.
+#guard emitInstanceUser m3t4Defaults [m3t4Greet] m3t4Binds m3t4LoudInst
+         == some ("instance : Greet (GHCCore.tyConOpaque \"Loud\") where\n" ++
+                 "  name := _dollar_cname_9239\n  greet := _dollar_cgreet_9243")
+-- WITHOUT the default translated, the same wrapper is wired as a field — the
+-- no-plugin path, whose reference to the (then still emitted) `$dmgreet` def is
+-- loud, not silent.
+#guard emitInstanceUser [] [m3t4Greet] m3t4Binds m3t4QuietInst
+         == some ("instance : Greet (GHCCore.tyConOpaque \"Quiet\") where\n" ++
+                 "  name := _dollar_cname_9227\n  greet := _dollar_cgreet_9231")
+-- A method with NO default and no bind kills the whole instance (unchanged), and
+-- is now REPORTED rather than silent.
+#guard emitInstanceUser m3t4Defaults [m3t4Greet] [m3t4QuietRec, m3t4DmBind] m3t4QuietInst == none
+#guard unresolvedInstanceMethods
+         { binds := [m3t4QuietRec, m3t4DmBind], typeDecls := [], instances := [m3t4QuietInst],
+           classDecls := [m3t4Greet] }
+         == [("Greet", "Quiet", "name")]
+#guard ((unresolvedInstanceMethodWarning "Greet" "Quiet" "name").splitOn
+          "instance `Greet Quiet` is DROPPED: its method `name` resolves to nothing").length == 2
+-- Every method defaulted and none overridden → a FIELDLESS instance (probe (d)).
+#guard emitInstanceUser [("Greet", "greet")] [{ m3t4Greet with methods := [m3t4GreetM] }]
+         m3t4Binds m3t4QuietInst
+         == some "instance : Greet (GHCCore.tyConOpaque \"Quiet\") where"
+-- A builtin-class instance contributes nothing here: no `ClassDecl` is built for
+-- `Eq`/`Ord`/`Show`, so the diagnostic cannot fire on the paths that legitimately
+-- drop their `$c` binds.
+#guard unresolvedInstanceMethods
+         { binds := m3t4Binds, typeDecls := [], instances := [eqInst, ordInst, showInst],
+           classDecls := [m3t4Greet] }
+         == ([] : List (Name × String × Name))
+
+-- REC-PAIR SURVIVAL, the fix for defect 1 — and its ORDER-INDEPENDENCE, which is
+-- the whole point: the `$c` member survives and the `$f` member does not,
+-- whichever GHC lists first.
+def m3t4bindNames : Bind → List Name
+  | .nonRec v _ => [v.name]
+  | .rec_ ps    => ps.map (·.1.name)
+def m3t4QuietRecFlipped : Bind :=
+  .rec_ [ (m3t4QuietWrapper, m3t4DmRef), (m3t4QuietDfun, m3t4QuietDfunRhs) ]
+#guard (filterBinds (fun v _ => v.name.startsWith "$c") [m3t4QuietRec]).flatMap m3t4bindNames
+         == ["$cgreet"]
+#guard (filterBinds (fun v _ => v.name.startsWith "$c") [m3t4QuietRecFlipped]).flatMap m3t4bindNames
+         == ["$cgreet"]
+#guard (filterBinds (fun v _ => !v.name.startsWith "$f") [m3t4QuietRec]).flatMap m3t4bindNames
+         == ["$cgreet"]
+#guard (filterBinds (fun v _ => !v.name.startsWith "$f") [m3t4QuietRecFlipped]).flatMap m3t4bindNames
+         == ["$cgreet"]
+-- A group nothing survives in disappears; a group everything survives in is
+-- unchanged (so a genuine multi-binding `mutual` still emits as one).
+#guard (filterBinds (fun v _ => v.name.startsWith "zzz") [m3t4QuietRec]).isEmpty
+#guard (filterBinds (fun _ _ => true) [m3t4QuietRec]).flatMap m3t4bindNames
+         == ["$fGreetQuiet", "$cgreet"]
+-- The predicate sees the BODY too, which is what the wrapper drop needs.
+#guard (filterBinds (fun v e => !(v.name == "$cgreet" && isDefaultWrapperBody "greet" e))
+         [m3t4QuietRec]).flatMap m3t4bindNames == ["$fGreetQuiet"]
+
+-- WHOLE-PIPELINE, the three suppressions at once — and again, order-independent.
+def m3t4Prog (rec_ : Bind) : Program :=
+  { binds := [rec_, m3t4DmBind, m3t4CnameQuiet], typeDecls := [],
+    instances := [m3t4QuietInst], classDecls := [m3t4Greet] }
+def m3t4Out : String := emitFullProgram [] (m3t4Prog m3t4QuietRec)
+#guard m3t4Out == emitFullProgram [] (m3t4Prog m3t4QuietRecFlipped)
+-- the class-body default, translated from the `$dm` body…
+#guard (m3t4Out.splitOn
+  "  greet : (a → Int) := (fun x_8937 => (((· + ·)) ((name) (x_8937))) ((1 : Int)))").length == 2
+-- …the instance without the defaulted field…
+#guard (m3t4Out.splitOn ("instance : Greet (GHCCore.tyConOpaque \"Quiet\") where\n" ++
+                         "  name := _dollar_cname_9227")).length == 2
+-- …and NEITHER the `$dm` def nor the wrapper `$c` def anywhere (they have no
+-- second Lean image; each would be a duplicate or an unbound reference).
+#guard (m3t4Out.splitOn "_dollar_dmgreet").length == 1
+#guard (m3t4Out.splitOn "_dollar_cgreet").length == 1
+-- The `$f` dict-builder is still never emitted, in either order.
+#guard (m3t4Out.splitOn "_dollar_fGreetQuiet").length == 1
+
+-- `$dm` ROLE TRIPWIRE (observation 2). The shim now says `id`; if a dump ever
+-- says `dict` again, `Main.lean` warns — because `Lower` would erase the
+-- reference. Both halves pinned: the detector, and the erasure that makes it
+-- matter.
+def m3t4DmDictBind : Bind :=
+  .nonRec {name := "$dmgreet", unique := 9094,
+           ty := .tyFun (.tyVar "a") (.tyCon "Int" []), role := .dict} (.lit (.litInt 0))
+#guard dmBindsMislabelledAsDicts [m3t4DmDictBind] == ["$dmgreet"]
+#guard dmBindsMislabelledAsDicts m3t4Binds == ([] : List Name)
+def m3t4DmDictRec : Bind :=
+  .rec_ [ ({name := "$dmgreet", unique := 1, ty := .tyCon "Int" [], role := .dict},
+           .lit (.litInt 0)) ]
+#guard dmBindsMislabelledAsDicts [m3t4DmDictRec] == ["$dmgreet"]
+-- THE TRAP ITSELF: a dict-role `$dm` reference in ARGUMENT position is erased…
+#guard emitExpr [] [] (Lower.lowerExpr
+         (.app (.var {name := "f", unique := 1, ty := .tyCon "_Unknown" [], role := .id})
+               (.var {name := "$dmgreet", unique := 9094,
+                      ty := .tyCon "_Unknown" [], role := .dict}))) == "f_1"
+-- …and with the role the shim now emits, it survives (loud if unbound, never gone).
+#guard emitExpr [] [] (Lower.lowerExpr
+         (.app (.var {name := "f", unique := 1, ty := .tyCon "_Unknown" [], role := .id})
+               (.var {name := "$dmgreet", unique := 9094,
+                      ty := .tyCon "_Unknown" [], role := .id})))
+         == "(f_1) (_dollar_dmgreet_9094)"
+
+-- `$cshow` SCOPING, both directions (`Main.isGhcRuntimePlumbing` delegates here).
+-- `Show`'s three methods are dropped…
+#guard isDerivedShowMethod "$cshow" == true
+#guard isDerivedShowMethod "$cshowsPrec" == true
+#guard isDerivedShowMethod "$cshowList" == true
+-- …and a user class's `show`-PREFIXED method is not: `$cshowIt` was eaten by the
+-- old prefix test, which cost the whole instance (the all-or-nothing skip).
+#guard isDerivedShowMethod "$cshowIt" == false
+#guard isDerivedShowMethod "$cshows" == false
+#guard isDerivedShowMethod "$cshowMe" == false
+-- Not a `$c` bind at all → not this rule's business (the `$fShow`/`$sshow`
+-- prefixes in `Main.lean` still handle those).
+#guard isDerivedShowMethod "$fShowBox" == false
+#guard isDerivedShowMethod "$sshow" == false
+
+/-! ### Regression — what this task could have moved, and what it did
+
+    The at-risk change is `filterBinds`: every multi-member Rec group in the
+    corpus mixes an `$f` dfun with `$c` method binds, so a group whose `$c` half
+    is NOT otherwise suppressed now EMITS that half where the head-name test
+    dropped it. Enumerated from the saved dumps rather than guessed —
+    `Arithmetic` and `Ratio` (`['$fShow…', '$cshowList', '$cshow']`,
+    `['$fEq…', '$c/=']`), `OrdInstance` and `ZZCoherence`
+    (`['$fOrd…', '$cmax', '$c>=', '$c>', '$cmin', '$c<=']`), `NewtypeInstances`,
+    `UserClassNeq*`. In every one of them the `$c` half is already filtered
+    earlier — by `Main.lean`'s Show/`$c/=` rules or by `isSuppressedMethod`'s
+    derived-Eq/Ord head match — so the group still contributes nothing.
+
+    MEASURED, not argued: the 26 saved shim dumps in `/tmp` were re-emitted with
+    the pre-change binary (`git stash` of Emit/Main/Unit/shim, rebuild) and the
+    post-change one, same env for both. `DefaultMethods.lean` is the ONLY emitted
+    file that differs; the other 25 are byte-identical, and the 5 refusal
+    fixtures still refuse with identical messages. Scope of that run: no
+    `LEAN_SPEC_DIR`, so it compares the EMITTED CODE and not the spec text — the
+    spec path (`resolveSpecText`) is untouched by this task. The full pipeline
+    (`./transpile.sh`, specs included) was then re-run on `UserClass`, `Ratio` and
+    `TwoClassesDistinctMethods`: byte-identical to their pre-change files.
+
+    ONE stderr line moved, deliberately: `SuperClass.hs` now emits the
+    `unresolvedInstanceMethods` warning for `Container Bag`'s `empty` and
+    `insert`. That is the drop Task 1's observation 4 recorded as silent, and its
+    cause is the third one the message lists — neither method's type STARTS with
+    the class parameter (`$cempty : Bag`, `$cinsert : (Int -> (Bag -> Bag))`), so
+    `findClassMethodBind` cannot attribute either bind to the instance. Nothing
+    about SuperClass's emitted output changed. -/
 
 end GhcCoreToLean.Tests
