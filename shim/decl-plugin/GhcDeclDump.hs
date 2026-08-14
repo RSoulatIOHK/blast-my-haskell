@@ -177,9 +177,16 @@ ppClass cls = A.object
 -- A superclass predicate that is not a class constraint at all (an equality
 -- constraint, say) has no name to give. It is NOT dropped — a silently-dropped
 -- superclass would be a silent-wrong downstream — but rendered as the reserved
--- name @_UnknownSuper@, which has no Lean image. That it therefore fails loud is
--- INTENT, not an observation: nothing consumes @supers@ yet (Task 5), and no
--- fixture produces a non-class superclass predicate, so the arm is unexercised.
+-- name @_UnknownSuper@, which has no Lean image.
+--
+-- WHAT "no Lean image" BUYS, as of M3 Task 5 (which now consumes @supers@): the
+-- name reaches neither @extends@ (it is not a locally-declared class) nor a
+-- builtin binder recipe (@Maps.classConMap@ has no entry), so the emitted Lean
+-- class omits the superclass and the transpiler prints
+-- @Emit.unmappedSuperWarning@ for it. The loudness is that warning plus a
+-- @failed to synthesize@ at any use site — NOT, as this comment previously
+-- claimed, an emitted unknown identifier. Still unexercised: no fixture produces
+-- a non-class superclass predicate.
 ppSuperPred :: Type.PredType -> A.Value
 ppSuperPred p = A.toJSON $ case getClassPredTys_maybe p of
   Just (c, _) -> occNameString (nameOccName (Cls.className c))

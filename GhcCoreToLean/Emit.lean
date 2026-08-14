@@ -464,7 +464,13 @@ private def dedup (xs : List Name) : List Name :=
     binders. Stops at the first non-constraint arrow.
 
     A constraint is recognised in two ways, user classes FIRST:
-    * `C ∈ classNames` — a class the transpiler emits itself → `[C t]`.
+    * `C ∈ classNames` — a class the transpiler emits itself → `[C t]`, PRECEDED
+      by `superBinders`' entry for `C` if it has one: the binder templates of
+      `C`'s transitive BUILTIN superclasses (`classSuperBinders`; M3 Task 5).
+      `class Ord a => Capped a` ⇒ `Capped a =>` peels to
+      `[Ord t] [LT t] … [BEq t] [Capped t]`, because the emitted Lean `class
+      Capped` does NOT carry the builtin parent (see `emitClassDecl`) and a body
+      constrained only by `Capped a` may still use the parent's operators.
     * `Maps.classConMap C` — a BUILTIN class with a Lean image → that map's
       binder templates, `{t}` filled in (`Eq a =>` ⇒ `[BEq t]`).
     Anything else is not a constraint as far as this function is concerned and
@@ -494,15 +500,22 @@ private def dedup (xs : List Name) : List Name :=
     (`emitDefHeader`'s binder list and `emitBind`'s `resTyOf`), so the widening
     goes HERE rather than in a gate threaded to each: the callers cannot drift
     apart. Kept non-`private` so `Tests/Unit.lean` can guard it directly. -/
-partial def stripClassConstraintsGo (classNames : List Name) : GHCType → List String × GHCType
-  | .forAll _ b => stripClassConstraintsGo classNames b
+partial def stripClassConstraintsGo (classNames : List Name)
+    (superBinders : List (Name × List String)) : GHCType → List String × GHCType
+  | .forAll _ b => stripClassConstraintsGo classNames superBinders b
   | .tyFun (.tyCon c [.tyVar t]) r =>
+    let fill (ts : List String) : List String := ts.map (·.replace "{t}" (tyVarId t))
     let binders : Option (List String) :=
-      if classNames.contains c then some [s!"[{sanitize c} {tyVarId t}]"]
-      else (Maps.classConMap c).map (·.map (·.replace "{t}" (tyVarId t)))
+      if classNames.contains c then
+        -- Builtin-superclass binders FIRST: they are what the class itself cannot
+        -- carry, and `[C t]` never depends on them (the emitted class takes no
+        -- instance-implicit parameters), so the order is for readability only.
+        some (fill ((superBinders.find? (·.1 == c)).map (·.2) |>.getD [])
+                ++ [s!"[{sanitize c} {tyVarId t}]"])
+      else (Maps.classConMap c).map fill
     match binders with
     | some bs =>
-      let (cs, rest) := stripClassConstraintsGo classNames r
+      let (cs, rest) := stripClassConstraintsGo classNames superBinders r
       (bs ++ cs, rest)
     | none => ([], .tyFun (.tyCon c [.tyVar t]) r)
   | t => ([], t)
@@ -512,9 +525,14 @@ partial def stripClassConstraintsGo (classNames : List Name) : GHCType → List 
     set contains `[BEq t]`), and repeating an instance-implicit binder, while
     legal, is noise. First-occurrence order is preserved, so `LT` still precedes
     `DecidableLT`. Binders for DIFFERENT type variables are different strings and
-    are never merged. -/
-def stripClassConstraints (classNames : List Name) (t : GHCType) : List String × GHCType :=
-  let (cs, rest) := stripClassConstraintsGo classNames t
+    are never merged.
+
+    `superBinders` is TRAILING and defaults to `[]` so that every pre-M3-Task-5
+    caller (and every `#guard`) keeps its meaning: no entry for a class ⇒ exactly
+    the old `[C t]`. -/
+def stripClassConstraints (classNames : List Name) (t : GHCType)
+    (superBinders : List (Name × List String) := []) : List String × GHCType :=
+  let (cs, rest) := stripClassConstraintsGo classNames superBinders t
   (dedup cs, rest)
 
 private partial def stripFunTys : Nat → GHCType → GHCType
@@ -554,12 +572,13 @@ private def defNameId (v : Var) : String :=
 
 private def emitDefHeader (mm : List MethodRef) (classNames : List Name) (top : List Name)
                           (v : Var) (args : List Var)
-                          (resTy : GHCType) (rhsBody : Expr) (rec? : Bool) : String :=
+                          (resTy : GHCType) (rhsBody : Expr) (rec? : Bool)
+                          (superBinders : List (Name × List String) := []) : String :=
   let name     := defNameId v
   -- Strip class-constraint arrows (`C a =>`) from the signature → `[C a]`
   -- instance-implicit binders; the remaining type aligns with the term binders
   -- (the dict term-binder is already erased by Lower).
-  let (constraints, strippedTy) := stripClassConstraints classNames v.ty
+  let (constraints, strippedTy) := stripClassConstraints classNames v.ty superBinders
   let argTys   := headerArgTys args strippedTy
   let argStrs  := (args.zip argTys).map (fun (a, t) => s!"({localId a} : {emitType t})")
   let argStr   := String.intercalate " " argStrs
@@ -587,9 +606,12 @@ private def emitDefHeader (mm : List MethodRef) (classNames : List Name) (top : 
 
 /-! ## Top-level binds -/
 
-def emitBind (mm : List MethodRef) (classNames : List Name) (top : List Name) (b : Bind) : String :=
+def emitBind (mm : List MethodRef) (classNames : List Name) (top : List Name) (b : Bind)
+    (superBinders : List (Name × List String) := []) : String :=
   -- Result type is computed from the constraint-stripped signature so the
-  -- erased dict arrow isn't mistaken for a value arg.
+  -- erased dict arrow isn't mistaken for a value arg. `superBinders` is NOT
+  -- threaded here: it only ever adds BINDERS, never changes the stripped type
+  -- (`.2`), so the header and the result type cannot drift apart over it.
   let resTyOf (v : Var) (nargs : Nat) : GHCType :=
     stripFunTys nargs (stripClassConstraints classNames v.ty).2
   match b with
@@ -597,19 +619,19 @@ def emitBind (mm : List MethodRef) (classNames : List Name) (top : List Name) (b
     let (args, body) := peelLams e
     let resTy        := resTyOf v args.length
     let rec?         := occursInExpr v.name e
-    emitDefHeader mm classNames top v args resTy body rec?
+    emitDefHeader mm classNames top v args resTy body rec? superBinders
   | .rec_ pairs =>
     match pairs with
     | [(v, e)] =>
       let (args, body) := peelLams e
       let resTy        := resTyOf v args.length
       let rec?         := occursInExpr v.name e
-      emitDefHeader mm classNames top v args resTy body rec?
+      emitDefHeader mm classNames top v args resTy body rec? superBinders
     | _        =>
       let defs := pairs.map fun (v, e) =>
         let (args, body) := peelLams e
         let resTy        := resTyOf v args.length
-        emitDefHeader mm classNames top v args resTy body true
+        emitDefHeader mm classNames top v args resTy body true superBinders
       let body := String.intercalate "\n" defs
       s!"mutual\n{body}\nend"
 
@@ -619,18 +641,20 @@ private def collectTopNames (p : CoreProgram) : List Name :=
     | .nonRec v _ => v.name :: acc
     | .rec_ pairs => pairs.foldl (init := acc) fun acc (v, _) => v.name :: acc
 
-def emitProgram (mm : List MethodRef) (classNames : List Name) (p : CoreProgram) : String :=
+def emitProgram (mm : List MethodRef) (classNames : List Name) (p : CoreProgram)
+    (superBinders : List (Name × List String) := []) : String :=
   let top      := collectTopNames p
-  let bindStrs := p.map (emitBind mm classNames top)
+  let bindStrs := p.map (fun b => emitBind mm classNames top b superBinders)
   String.intercalate "\n\n" bindStrs
 
 /-- Like `emitProgram`, but extends the "top-level names" set with extra
     names that should NOT get a `_unique` suffix when emitted as Var refs.
     The intended use is to splice in user-declared data constructors so
     `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
-def emitProgramWith (mm : List MethodRef) (classNames : List Name) (p : CoreProgram) (extraTopNames : List Name) : String :=
+def emitProgramWith (mm : List MethodRef) (classNames : List Name) (p : CoreProgram)
+    (extraTopNames : List Name) (superBinders : List (Name × List String) := []) : String :=
   let top      := extraTopNames ++ collectTopNames p
-  let bindStrs := p.map (emitBind mm classNames top)
+  let bindStrs := p.map (fun b => emitBind mm classNames top b superBinders)
   String.intercalate "\n\n" bindStrs
 
 /-- Keep the binds satisfying `keep`, PER PAIR: a `Rec` group is filtered
@@ -694,13 +718,32 @@ def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
     parameter. Single-parameter classes — the only ones supported end-to-end —
     are unchanged from v1 (`class Sized (a : Type) where …`).
 
-    `c.supers` is deliberately NOT emitted yet: superclass emission (`extends`
-    for a user parent, an instance-implicit field for a builtin one) is M3
-    Task 5. Dropping it here is loud, not silent: the parent class's methods are
-    still rewritten to `Parent.method` at their call sites, so a function with
-    only the child constraint in scope fails to synthesize the parent instance.
-    Observed on `SuperClass.hs` — see the `M3 Task 1` block in
-    `GhcCoreToLean/Tests/Unit.lean`.
+    SUPERCLASSES (M3 Task 5). `c.supers` splits by what the parent IS, and only
+    the first half reaches the class header:
+
+    * a USER class (`classNames.contains`) → `extends P {t}`, the Lean image of
+      `class Sized a => Container a`. Lean then makes `Sized` reachable from a
+      `[Container t]` binder, which is what `sizeViaContainer`'s `Sized.size`
+      call site needs, and an instance of the child may OMIT the parent field
+      entirely — Lean fills it from the parent instance in scope. Both PROBED,
+      transcripts in the `M3 Task 5` block of `GhcCoreToLean/Tests/Unit.lean`.
+    * a BUILTIN class (`Maps.classConMap`) → NOTHING here. Its binder recipe is
+      injected at every CONSTRAINT SITE instead (`stripClassConstraints`'
+      `superBinders`), because `Ord`'s recipe contains `DecidableLT`/`DecidableLE`
+      — `def`s, not structures — which `extends` rejects outright (`error:
+      expected structure`) and which do not compose as instance-implicit class
+      FIELDS either (both probed). CONSEQUENCE, pinned: the emitted class does
+      not record the builtin parent, so a class-body DEFAULT under such a class
+      gets no `Ord` in scope (loud), and the emitted instance no longer re-checks
+      the parent obligation Haskell imposed — weaker than Haskell, not wrong,
+      since GHC already accepted the program.
+    * anything else (an unmapped builtin like `Show`, an imported user class,
+      the plugin's `_UnknownSuper`) → nothing, and `unmappedSupers` reports it.
+
+    MULTI-PARAMETER classes get NO `extends` at all: `supers` carries names only
+    (the plugin discards which parameter each constraint applies to — M3 Task 1's
+    handoff), so with two type variables there is nothing to apply the parent to
+    but a guess. Omitting is loud at the use site; guessing would be silent-wrong.
 
     `defaults` maps a METHOD NAME to the Lean term for its class-body `:=`
     default, translated from GHC's `$dm<method>` bind by `classDefaultBody` (M3
@@ -718,18 +761,95 @@ def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
       other possible arrangement (mutually-referential defaults) cannot be
       ordered at all.
     * A default that calls a method of ANOTHER class emits that call QUALIFIED
-      (`Sized.size`), and class decls are emitted UNSORTED (see `mergeClassDecls`
-      — sorting is M3 Task 5's job), so it is a forward reference whenever the
-      other class comes later: loud, not silent. -/
-def emitClassDecl (defaults : List (Name × String)) (c : ClassDecl) : String :=
+      (`Sized.size`), and class decls are emitted in SUPERCLASS-DEPENDENCY order
+      (`sortClassDecls`) — which orders a parent before its children but says
+      nothing about two unrelated classes, so a default calling an unrelated
+      class's method is still a forward reference whenever that class comes
+      later: loud, not silent.
+
+    `classNames` is TRAILING and defaults to `[]`, which reproduces the
+    pre-Task-5 output exactly (no super is a "user class" ⇒ no `extends`). -/
+def emitClassDecl (defaults : List (Name × String)) (c : ClassDecl)
+    (classNames : List Name := []) : String :=
   let methodLines := c.methods.map fun m =>
     let decl := s!"  {sanitize m.name} : {emitType m.ty}"
     match defaults.find? (·.1 == m.name) with
     | some (_, body) => s!"{decl} := {body}"
     | none           => decl
   let params := String.intercalate " " (c.tyVars.map fun tv => s!"({tyVarId tv} : Type)")
-  s!"class {sanitize c.name} {params} where\n" ++
+  let extends? :=
+    match c.tyVars with
+    | [tv] =>
+      let userSupers := c.supers.filter classNames.contains
+      if userSupers.isEmpty then ""
+      else " extends " ++ String.intercalate ", "
+             (userSupers.map fun p => s!"{sanitize p} {tyVarId tv}")
+    | _ => ""
+  s!"class {sanitize c.name} {params}{extends?} where\n" ++
     String.intercalate "\n" methodLines
+
+/-- Superclass NAMES of `c` that emission drops on the floor: neither a user
+    class in `classNames` (→ `extends`) nor a builtin with a `Maps.classConMap`
+    recipe (→ constraint-site binders). Reachable as: an unmapped builtin
+    (`Show`, `Fractional`, `Enum`), an imported user class (cross-module user
+    classes are not supported end-to-end — see `mergeClassDecls`), and the
+    plugin's `_UnknownSuper` placeholder for a superclass predicate that is not a
+    class constraint at all (`GhcDeclDump.ppSuperPred`).
+
+    A WARNING, not a refusal (`Main.lean`), for the same reason as
+    `unresolvedInstanceMethods`: the consequence is `failed to synthesize` at a
+    use site, i.e. already loud at `lake build`, and refusing would newly reject
+    modules that transpile today (a `Show`-superclassed class whose parent methods
+    are never called still works). -/
+def unmappedSupers (classNames : List Name) (c : ClassDecl) : List Name :=
+  c.supers.filter fun s =>
+    !classNames.contains s && (Maps.classConMap s).isNone
+
+/-- The warning for one `unmappedSupers` entry. -/
+def unmappedSuperWarning (cls super : Name) : String :=
+  s!"class `{cls}` has the superclass `{super}`, which is DROPPED from the emitted\n" ++
+  s!"  Lean class: `{super}` is neither a class this module declares (which would\n" ++
+  s!"  become `extends {super}`) nor a builtin with a binder recipe in\n" ++
+  s!"  `Maps.classConMap` (which would be injected at each constraint site). A body\n" ++
+  s!"  that uses `{super}`'s methods through a `{cls} a` constraint therefore fails\n" ++
+  s!"  with `failed to synthesize {super} …` at `lake build`; `{cls}`'s own methods\n" ++
+  s!"  are unaffected.\n" ++
+  s!"  Likely causes: `{super}` is an unmapped builtin (`Show`, `Fractional`, …) —\n" ++
+  s!"  add a `classConMap` entry; `{super}` is declared in another module (imported\n" ++
+  s!"  user classes are not supported end-to-end); or the superclass is not a class\n" ++
+  s!"  constraint at all (the plugin renders those as `_UnknownSuper`)."
+
+/-- Builtin-superclass binder templates per user class, TRANSITIVELY, as
+    `stripClassConstraints`' `superBinders`. `class Ord a => Capped a` ⇒
+    `("Capped", ["[Ord {t}]", …, "[BEq {t}]"])`; a user parent contributes its own
+    builtin-super binders, so `class Ord a => P a` + `class P a => C a` gives `C`
+    the `Ord` recipe as well — the Lean `extends P a` chain reaches `P`, but `P`'s
+    builtin parent lives only in constraint sites, so it has to be re-injected
+    here or a `C a`-constrained body could not use `<`.
+
+    Templates keep their `{t}` placeholder (substituted per constraint site) and
+    are deduplicated in first-occurrence order, since `Ord`'s recipe already
+    contains `[BEq {t}]` and two parents may overlap. The fuel is the class count:
+    a superclass CYCLE is impossible in Haskell, so exhausting it means the class
+    graph is malformed and the binders are simply truncated (loud at the use
+    site), never looped. -/
+def classSuperBinders (classes : List ClassDecl) : List (Name × List String) :=
+  let rec go (fuel : Nat) (c : ClassDecl) : List String :=
+    match fuel with
+    | 0      => []
+    | fuel+1 =>
+      c.supers.flatMap fun s =>
+        match Maps.classConMap s with
+        | some recipe => recipe
+        | none        =>
+          match classes.find? (·.name == s) with
+          | some parent => go fuel parent
+          | none        => []
+  let perClass := classes.map fun c =>
+    let bs := go classes.length c
+    (c.name, bs.foldl (init := ([] : List String))
+               fun acc t => if acc.contains t then acc else acc ++ [t])
+  perClass.filter fun (_, bs) => !bs.isEmpty
 
 private partial def firstValArgTy : GHCType → Option GHCType
   | .forAll _ b => firstValArgTy b
@@ -1159,7 +1279,14 @@ def unmappedOperatorMethodError (cls mname : Name) : String :=
     each produce a `$c<method>` binding that collides after sanitization, so we
     disambiguate by matching the method's first value-argument type against the
     instance head. The RHS comes back too, because whether the bind is a
-    default-method wrapper is a property of its body (`isDefaultWrapperBody`). -/
+    default-method wrapper is a property of its body (`isDefaultWrapperBody`).
+
+    THE FALLBACK, since M3 Task 5. This matcher can only see methods whose type
+    STARTS with the class parameter, so `empty :: a` and `insert :: Int -> a -> a`
+    are invisible to it and their instance was dropped whole. `dfunMethodBinds`
+    reads the attribution out of the instance's own dictionary instead and is
+    tried first; this stays for the shapes that one declines (a dfun whose body is
+    not a recognizable dictionary, a class the plugin channel has no shape for). -/
 private def findClassMethodBind (binds : CoreProgram) (method : Name) (headTyStr : String)
     : Option (Var × Expr) :=
   let matchesHead (v : Var) : Bool :=
@@ -1170,6 +1297,76 @@ private def findClassMethodBind (binds : CoreProgram) (method : Name) (headTyStr
   binds.findSome? fun b => match b with
     | .nonRec v e => if matchesHead v then some (v, e) else none
     | .rec_ pairs => pairs.find? (fun (v, _) => matchesHead v)
+
+/-- Unwind an application spine into its head and its arguments, left to right.
+    `f @T d x` ⇒ `(f, [Type T, Var d, Var x])`. -/
+private partial def spineOf : Expr → Expr × List Expr
+  | .app f a => let (h, as) := spineOf f; (h, as ++ [a])
+  | e        => (e, [])
+
+/-- The `$c<method>` bind for each of `cd`'s methods, read POSITIONALLY out of the
+    instance's own dictionary — the attribution that fixes `SuperClass.hs`'s
+    dropped `Container Bag`.
+
+    A dfun body is one of exactly two observed shapes (`/tmp/transpile-SuperClass.
+    json`, quoted in the `M3 Task 5` block of `GhcCoreToLean/Tests/Unit.lean`):
+
+    * MULTI-field dictionary — `$fContainerBag = C:Container @Bag $fSizedBag
+      $cempty $cinsert`. Head is the dictionary constructor `C:<Class>`; then type
+      arguments, then one argument per SUPERCLASS dictionary (`role = dict`), then
+      the methods in class order. Dropping `.type_` args and `dict`-role args
+      leaves exactly the method list, and GHC's field order is `classOpItems`
+      order — the same order the plugin's `methods` list is in.
+    * SINGLE-method dictionary — `$fSizedBag = $csize`. A one-method, superclass-
+      free class dictionary is a newtype over the method, so the dfun body IS the
+      method reference, with no constructor and (at pass-0000) no cast.
+
+    THE GUARD, and why it is name-based even though the pairing is positional:
+    every paired arg must be named `$c` ++ the method's name. Order agreement
+    between GHC's dict fields and `classOpItems` is an assumption about GHC's
+    internals, and if it ever breaks, positional pairing alone would attribute
+    `empty`'s body to `insert` — a SILENT wrong instance. With the guard, any
+    disagreement (or an arg count mismatch) rejects the whole attribution, falls
+    through to `findClassMethodBind`, and at worst drops the instance LOUDLY. It
+    also costs nothing on the shapes we have: GHC does not suffix these names per
+    instance (two instances of one class both bind `$c<method>`, disambiguated by
+    unique — see `findClassMethodBind`), which is also why the bind lookup below
+    matches on name AND unique: the name alone is ambiguous in exactly that case,
+    and the spine hands us the right unique.
+
+    Returns `[]` — decline, no attribution — rather than a partial list, so a
+    caller can never mix the two attribution mechanisms within one instance. Kept
+    non-`private` so `Tests/Unit.lean` can guard the decline arms directly. -/
+def dfunMethodBinds (binds : CoreProgram) (cd : ClassDecl) (i : Instance)
+    : List (Name × Var × Expr) :=
+  let byNameUnique (v : Var) : Option (Var × Expr) :=
+    binds.findSome? fun b =>
+      let hit (w : Var) : Bool := w.name == v.name && w.unique == v.unique
+      match b with
+      | .nonRec w e => if hit w then some (w, e) else none
+      | .rec_ pairs => pairs.find? (fun (w, _) => hit w)
+  match findBind binds i.dfunName with
+  | none          => []
+  | some (_, rhs) =>
+    let (head, args) := spineOf rhs
+    let methodVars : List Var :=
+      match head with
+      | .var hv =>
+        if args.isEmpty then
+          -- Newtype dictionary: the body IS the sole method.
+          if hv.name.startsWith "$c" then [hv] else []
+        else if hv.name.startsWith "C:" then
+          args.filterMap fun a => match a with
+            | .var av => if av.role == .dict then none else some av
+            | _       => none
+        else []
+      | _ => []
+    if methodVars.length != cd.methods.length then []
+    else
+      let paired := cd.methods.zip methodVars
+      if paired.all (fun (m, v) => v.name == "$c" ++ m.name) then
+        paired.filterMap fun (m, v) => (byNameUnique v).map (fun (w, e) => (m.name, w, e))
+      else []
 
 /-- The emitted (unique-suffixed) def name of that binding. -/
 private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
@@ -1338,11 +1535,19 @@ deriving Repr, DecidableEq, Inhabited
     `unresolvedInstanceMethods` (what to warn about). Keeping it in one place is
     what stops the warning and the emission from drifting apart — a drift that
     would be silent in both directions (warn about an instance that emitted fine,
-    or skip one with no diagnostic). -/
+    or skip one with no diagnostic).
+
+    `spine` is the instance's `dfunMethodBinds` attribution and is consulted
+    FIRST, because it is the more informative of the two: it knows the methods
+    whose type does not start with the class parameter. It is TRAILING with a `[]`
+    default so a caller (or `#guard`) that has no dictionary to read falls back to
+    exactly the pre-M3-Task-5 behavior. -/
 def classifyInstanceMethod (defaults : List (Name × Name)) (binds : CoreProgram)
-    (cls : Name) (headTyStr : String) (m : ClassMethod) : MethodFate :=
+    (cls : Name) (headTyStr : String) (m : ClassMethod)
+    (spine : List (Name × Var × Expr) := []) : MethodFate :=
   let defaulted := defaults.contains (cls, m.name)
-  match findClassMethodBind binds ("$c" ++ m.name) headTyStr with
+  let fromSpine := (spine.find? (·.1 == m.name)).map (fun (_, v, e) => (v, e))
+  match fromSpine.orElse (fun _ => findClassMethodBind binds ("$c" ++ m.name) headTyStr) with
   | some (v, e) =>
     if defaulted && isDefaultWrapperBody m.name e then .fromDefault else .field (localId v)
   | none => if defaulted then .fromDefault else .unresolved
@@ -1368,8 +1573,9 @@ def emitInstanceUser (defaults : List (Name × Name)) (classes : List ClassDecl)
   let cd ← classes.find? (·.name == i.className)
   if cd.methods.isEmpty then none else
   let tyStr := i.headTypes.map emitType |> String.intercalate " "
+  let spine := dfunMethodBinds binds cd i
   let fates := cd.methods.map fun m =>
-    (m, classifyInstanceMethod defaults binds i.className tyStr m)
+    (m, classifyInstanceMethod defaults binds i.className tyStr m spine)
   if fates.any (fun (_, f) => f == .unresolved) then none else
   let fields := fates.filterMap fun (m, f) =>
     match f with
@@ -1402,13 +1608,18 @@ private def headTypeNames (i : Instance) : Name :=
     droppable class). Reachable shapes: a method whose bind `Main.lean`'s drop
     rules filtered (`$c/=` of an `Eq`-instance head, the three `$cshow…` names); a
     class-shape channel listing a method the Core reconstruction has no bind for
-    (`mergeClassDecls`' methods-disagree path); and — the one this fires on today
-    — a method whose type does not START with the class parameter, since
-    `findClassMethodBind` attributes a `$c` bind to an instance by matching its
-    FIRST value argument against the instance head. OBSERVED on
-    `examples/haskell/SuperClass.hs`: `$cempty : Bag` (no argument at all) and
-    `$cinsert : (Int -> (Bag -> Bag))` (first argument `Int`) both fail that
-    match, which is exactly the instance Task 1 recorded as silently dropped.
+    (`mergeClassDecls`' methods-disagree path); and a method whose type does not
+    START with the class parameter WHEN the dictionary attribution also declines
+    (`dfunMethodBinds` — no dfun bind, an unrecognized dfun body, or its name
+    guard rejecting the pairing).
+
+    That last shape is what M3 Task 5 mostly REMOVED. It used to fire on
+    `examples/haskell/SuperClass.hs` — `$cempty : Bag` (no value argument at all)
+    and `$cinsert : (Int -> (Bag -> Bag))` (first argument `Int`) are both
+    invisible to `findClassMethodBind`'s first-value-argument match, and the
+    `Container Bag` instance was dropped for it. The dictionary now attributes both
+    positionally, so the fixture emits, and what remains here is the residue: the
+    same shape in a module where no dictionary can be read.
 
     Builtin classes cannot appear here: `Eq`/`Ord`/`Show` instances never reach
     `emitInstanceUser`, and no `ClassDecl` is ever built for them
@@ -1422,9 +1633,21 @@ def unresolvedInstanceMethods (p : Program) : List (Name × String × Name) :=
     | none    => []
     | some cd =>
       let tyStr := i.headTypes.map emitType |> String.intercalate " "
+      -- Same attribution `emitInstanceUser` uses, from the same `p.binds`, or the
+      -- warning and the emission would disagree about which methods resolve.
+      let spine := dfunMethodBinds p.binds cd i
       cd.methods.filterMap fun m =>
-        if classifyInstanceMethod defaults p.binds i.className tyStr m == .unresolved
+        if classifyInstanceMethod defaults p.binds i.className tyStr m spine == .unresolved
         then some (i.className, headTypeNames i, m.name) else none
+
+/-- Every `(class, superclass)` pair the class emission drops, program-wide — the
+    Program-level view of `unmappedSupers`, wired to an `eprintln` in `Main.lean`.
+    Computed on the MERGED class set, exactly like the other diagnostics here, so a
+    class with no local instance (plugin-only) is covered too. -/
+def droppedSupers (p : Program) : List (Name × Name) :=
+  let classes := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
+  let classNames := classes.map (·.name)
+  classes.flatMap fun c => (unmappedSupers classNames c).map fun s => (c.name, s)
 
 /-- The warning for one `unresolvedInstanceMethods` entry. -/
 def unresolvedInstanceMethodWarning (cls head mname : Name) : String :=
@@ -1434,11 +1657,12 @@ def unresolvedInstanceMethodWarning (cls head mname : Name) : String :=
   s!"  itself missing). A Lean instance cannot omit a field that has no default, so\n" ++
   s!"  the whole instance is skipped; every use of `{cls}`'s methods at `{head}` will\n" ++
   s!"  fail with `failed to synthesize {cls} {head}` at `lake build`.\n" ++
-  s!"  Likely causes: `{mname}`'s type does not start with the class parameter (a\n" ++
-  s!"  `$c` binding is matched to its instance by its FIRST value argument, so\n" ++
-  s!"  `{mname} :: Int -> a -> a` or `{mname} :: a` cannot be attributed); the binding\n" ++
-  s!"  was filtered as `Eq`/`Show` plumbing (see Main.lean's drop rules); or the\n" ++
-  s!"  class-shape dump declares a method this module has no binding for."
+  s!"  Likely causes: the instance's dictionary could not be read (no dfun binding,\n" ++
+  s!"  or a shape whose method arguments are not named `$c<method>`) AND `{mname}`'s\n" ++
+  s!"  type does not start with the class parameter, which is the fallback\n" ++
+  s!"  attribution's only key; the binding was filtered as `Eq`/`Show` plumbing (see\n" ++
+  s!"  Main.lean's drop rules); or the class-shape dump declares a method this module\n" ++
+  s!"  has no binding for."
 
 /-- Emit a Lean `instance` block. `Eq` → Lean `BEq`, `Ord` → Lean `Ord` (the
     latter via `deriving` in the data block), and user classes via
@@ -2190,6 +2414,88 @@ def sortDataDecls (ds : List DataDecl) : List DataDecl :=
   -- Totality fallback: any length change ⇒ hand back the input untouched.
   if result.length != ds.length then ds else result
 
+/-- Order class decls so that a class comes AFTER every LOCAL class it extends.
+    `sortDataDecls`' idiom, with `supers ∩ local class names` as the dependency
+    edge — `extends Sized a` is a reference to a name Lean must already know, and
+    class order became load-bearing the moment M3 Task 5 started emitting it.
+
+    NECESSARY, not defensive: the decl plugin dumps `tcg_tcs` in REVERSE
+    declaration order (`Container` before `Sized` — M3 Task 1's observation 2), so
+    any class the reconstruction never sees (no local instance) arrives from
+    `mergeClassDecls` child-first.
+
+    STABLE on input with no local supers: `find?` takes the first pending decl
+    whose deps are placed, and with no deps that is always the head, so every
+    fixture without a superclass keeps its previous byte-for-byte order. Same
+    totality fallback and same dead `| 0` arm as `sortDataDecls`; a `supers` CYCLE
+    cannot come out of GHC (it rejects them), and if one ever did the remainder is
+    appended in dump order and Lean fails loud on the forward `extends`. -/
+def sortClassDecls (cs : List ClassDecl) : List ClassDecl :=
+  let names := cs.map (·.name)
+  let deps (c : ClassDecl) : List Name :=
+    c.supers.filter (fun s => s != c.name && names.contains s)
+  let rec go (fuel : Nat) (pending : List ClassDecl) (placed : List Name)
+      (acc : List ClassDecl) : List ClassDecl :=
+    match fuel, pending with
+    | _, []             => acc.reverse
+    | 0, pending        => acc.reverse ++ pending
+    | fuel + 1, pending =>
+      match pending.find? (fun c => (deps c).all (fun n => placed.contains n)) with
+      | some c => go fuel (pending.filter (·.name != c.name)) (c.name :: placed) (c :: acc)
+      | none   => acc.reverse ++ pending
+  let result := go cs.length cs [] []
+  if result.length != cs.length then cs else result
+
+/-- Order instances so that an instance of a class comes AFTER the instance of
+    every LOCAL class it extends, at the SAME head type. `instance : Container Bag`
+    omits the `Sized` parent field and Lean fills it from the `Sized Bag` instance
+    in scope, so the parent's `instance` block has to be emitted first.
+
+    NECESSARY, and MEASURED rather than argued: the instance channel is in source
+    declaration order, so writing `instance Container Bag` above `instance Sized
+    Bag` — legal Haskell, and how `examples/haskell/SuperClass.hs` is deliberately
+    written since M3 Task 5 — emitted the child first and Lean answered `error:
+    Fields missing: `size`` (the flattened-parent form it falls back to when the
+    parent instance is not in scope). Loud, but a legal module that failed to
+    transpile.
+
+    The dependency edge is only a LOCAL user superclass: a builtin parent
+    contributes no `extends` and hence no ordering requirement (its binder recipes
+    are constraint-site — see `emitClassDecl`), and a parent from another module is
+    not emitted here at all. Heads are compared by their emitted spelling, the same
+    key `emitInstanceUser` matches binds with.
+
+    STABLE with no local supers (`find?` takes the pending head when nothing is
+    blocked), so every fixture without a class hierarchy keeps its byte-for-byte
+    instance order. Same totality fallback and dead `| 0` arm as `sortDataDecls`;
+    an instance whose parent instance is MISSING is not blocked by this sort (its
+    dependency is unsatisfiable, so `find?` never picks it while others remain and
+    the `none` arm appends it) — that stays Lean's `Fields missing` error, which is
+    the correct diagnosis. -/
+def sortInstances (classes : List ClassDecl) (is : List Instance) : List Instance :=
+  let classNames := classes.map (·.name)
+  let headStr (i : Instance) : String :=
+    i.headTypes.map emitType |> String.intercalate " "
+  let key (i : Instance) : Name × String := (i.className, headStr i)
+  let deps (i : Instance) : List (Name × String) :=
+    match classes.find? (·.name == i.className) with
+    | none    => []
+    | some cd =>
+      (cd.supers.filter classNames.contains).filterMap fun s =>
+        if is.any (fun j => j.className == s && headStr j == headStr i)
+        then some (s, headStr i) else none
+  let rec go (fuel : Nat) (pending : List Instance) (placed : List (Name × String))
+      (acc : List Instance) : List Instance :=
+    match fuel, pending with
+    | _, []             => acc.reverse
+    | 0, pending        => acc.reverse ++ pending
+    | fuel + 1, pending =>
+      match pending.find? (fun i => (deps i).all (fun k => placed.contains k)) with
+      | some i => go fuel (pending.filter (fun j => key j != key i)) (key i :: placed) (i :: acc)
+      | none   => acc.reverse ++ pending
+  let result := go is.length is [] []
+  if result.length != is.length then is else result
+
 /-- Apply the same name-resolution post-passes used on emitted bodies to a
     single user spec string: local types → bare, newtypes → underlying, imported
     types → `M.T`, user ctors → `T.C`.
@@ -2266,8 +2572,17 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- at all is refused up in `Main.lean` (`sameMethodAmbiguities`), before here.
   let (coreClasses, methodMapRaw) := reconstructClasses p.binds p.instances
   let methodMap := attachMethodShadows keptBinds methodMapRaw
-  let userClasses := mergeClassDecls p.classDecls coreClasses
+  -- Superclass-dependency order (M3 Task 5): `extends Sized a` is a forward
+  -- reference unless the parent's `class` block precedes the child's, and the
+  -- merged order is the plugin's REVERSE declaration order for any class the
+  -- reconstruction never saw. Sorted once, here, so every consumer below (class
+  -- emission, `classNames`, the super-binder recipes) sees the same list.
+  let userClasses := sortClassDecls (mergeClassDecls p.classDecls coreClasses)
   let classNames := userClasses.map (·.name)
+  -- Builtin superclasses cannot ride on `extends` (probes in the M3 Task 5 block
+  -- of `Tests/Unit.lean`), so their binder recipes are injected at every
+  -- constraint site instead — `Capped a =>` ⇒ `[Ord t] … [Capped t]`.
+  let superBinders := classSuperBinders userClasses
   -- Dependency order: a decl with another local type as a field type must come
   -- after it (Lean has no forward references; the dump order is not topological).
   -- Newtypes stay in the SORT's input — chains thread through them transitively
@@ -2293,7 +2608,7 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   let classDecls := userClasses.map fun c =>
     let ds := (defaults.filter (·.1 == c.name)).filterMap fun (_, m) =>
       (classDefaultBody methodMap defaultTop p.binds c m).map (fun body => (m, body))
-    emitClassDecl ds c
+    emitClassDecl ds c classNames
   -- Partition kept binds for forward-visibility-safe ordering. Drop instance
   -- dict-builders (`$f…`) and Typeable junk; `$c…` method defs precede the
   -- instances (which reference them) which precede user binds (which use the
@@ -2318,9 +2633,17 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   let userBinds  := filterBinds
     (fun v _ => !v.name.startsWith "$c" && !isJunkName v.name && !isTranslatedDm v.name)
     keptBinds
-  let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames
-  let userStr   := emitProgramWith methodMap classNames userBinds ctorNames
-  let insts := p.instances.filterMap (emitInstance defaults userClasses derivedEq p.binds)
+  -- `superBinders` reaches BOTH sections. The `$c` method defs are monomorphic
+  -- (their signatures carry no class constraint, so the recipes cannot fire there)
+  -- and are passed the same list anyway: two emitters with one binder policy
+  -- cannot drift, and a method with its own class constraint would be covered.
+  let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames superBinders
+  let userStr   := emitProgramWith methodMap classNames userBinds ctorNames superBinders
+  -- Superclass-dependency order again, now for the instances: a child instance
+  -- omits its parent field and Lean synthesizes it from the parent instance in
+  -- scope, which must therefore already be emitted (`sortInstances`).
+  let insts := (sortInstances userClasses p.instances).filterMap
+    (emitInstance defaults userClasses derivedEq p.binds)
   let instStr := String.intercalate "\n\n" insts
   let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes kept bodyRaw

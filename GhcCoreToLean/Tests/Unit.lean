@@ -3068,7 +3068,7 @@ def m3t3BothVar : Var :=
   { name := "both", unique := 10, role := .id,
     ty := .forAll "a" (.tyFun (.tyCon "Eq" [m3t3TyA])
             (.tyFun (.tyCon "Ord" [m3t3TyA]) (.tyFun m3t3TyA (.tyCon "Bool" [])))) }
-#guard (stripClassConstraintsGo [] m3t3BothVar.ty).1.length == 9   -- pre-dedup
+#guard (stripClassConstraintsGo [] [] m3t3BothVar.ty).1.length == 9   -- pre-dedup
 #guard (stripClassConstraints [] m3t3BothVar.ty).1
          == ["[BEq t_v3009]", "[Ord t_v3009]", "[LT t_v3009]", "[LE t_v3009]",
              "[DecidableLT t_v3009]", "[DecidableLE t_v3009]", "[Min t_v3009]",
@@ -3083,7 +3083,7 @@ def m3t3BothRevVar : Var :=
   { name := "bothRev", unique := 13, role := .id,
     ty := .forAll "a" (.tyFun (.tyCon "Ord" [m3t3TyA])
             (.tyFun (.tyCon "Eq" [m3t3TyA]) (.tyFun m3t3TyA (.tyCon "Bool" [])))) }
-#guard (stripClassConstraintsGo [] m3t3BothRevVar.ty).1.length == 9   -- pre-dedup
+#guard (stripClassConstraintsGo [] [] m3t3BothRevVar.ty).1.length == 9   -- pre-dedup
 #guard (stripClassConstraints [] m3t3BothRevVar.ty).1
          == ["[Ord t_v3009]", "[LT t_v3009]", "[LE t_v3009]", "[DecidableLT t_v3009]",
              "[DecidableLE t_v3009]", "[Min t_v3009]", "[Max t_v3009]", "[BEq t_v3009]"]
@@ -3788,5 +3788,508 @@ def m3t4DmDictRefBind : Bind := .nonRec m3t4QuietWrapper m3t4DmDictRefBody
     the class parameter (`$cempty : Bag`, `$cinsert : (Int -> (Bag -> Bag))`), so
     `findClassMethodBind` cannot attribute either bind to the instance. Nothing
     about SuperClass's emitted output changed. -/
+
+/-! ## M3 Task 5 — superclasses
+
+    Two mechanisms, because Lean forced two. `class Sized a => Container a` emits
+    as `extends`; `class Ord a => Capped a` CANNOT, and its binder recipe is
+    injected at every constraint site instead. Everything below that reads like a
+    design decision was made by a probe first.
+
+### Lean-side probes
+
+    Each is a scratch file run with `lake env lean` (Lean 4 v4.24.0, this
+    repo's toolchain). Replies verbatim; the Blaster "local changes" warning is
+    elided throughout.
+
+    (a) `extends` + an instance that OMITS the parent field. The emitter's
+    `emitInstanceUser` writes only the class's OWN methods, so the question was
+    whether Lean accepts that or demands `toSized := …`:
+
+        class Sized (a : Type) where
+          size : a → Int
+        class Container (a : Type) extends Sized a where
+          empty : a
+          insert : Int → a → a
+        inductive Bag where | Bag (n : Int)
+        instance : Sized Bag where
+          size := fun b => match b with | .Bag n => n
+        instance : Container Bag where
+          empty := Bag.Bag 0
+          insert := fun k b => match b with | .Bag n => Bag.Bag (n + k)
+
+    → EXIT 0. Lean fills the parent field from the `Sized Bag` instance in scope,
+    so the emitted instance shape needs no change at all. NEGATIVE control, same
+    file with the `Sized Bag` instance deleted:
+
+        error: Fields missing: `size`
+
+    i.e. a missing parent instance is LOUD, and it is loud in the FLATTENED
+    spelling — Lean asks for the parent's fields, not for `toSized`. That message
+    is the one `sortInstances` exists to prevent (see the ordering section below).
+
+    (b) the parent's method under only the CHILD's constraint, spelled the way
+    `methodMap` spells it:
+
+        def sizeViaContainer {t : Type} [Container t] : (t → Int) :=
+          fun x => (Sized.size) (x)
+        def bagSize : (Bag → Int) := sizeViaContainer
+        def bagInsert : (Int → (Bag → Bag)) := Container.insert
+
+    → EXIT 0. `extends` is what makes `Sized` reachable from `[Container t]`, and
+    this is character-for-character the header and body the transpiler already
+    emitted before this task (`Generated/SuperClass.lean`, which failed with
+    `failed to synthesize Sized t_v9077`): the CLASS was the only thing missing.
+
+    (c) the builtin parent. `Maps.classConMap "Ord"` is EIGHT binder templates,
+    and all three ways of putting them inside a `class` were tried.
+
+    (c1) `extends` over the whole recipe:
+
+        class Capped (a : Type) extends Ord a, LT a, LE a, DecidableLT a, DecidableLE a,
+                                        Min a, Max a, BEq a where
+          cap : a → a → a
+
+        error: expected structure
+
+    at the column of `DecidableLT a`. `DecidableLT α` is a `def` (it unfolds to
+    `DecidableRel (· < ·)`, a Pi type), and `extends` takes structures only. This
+    is a HARD elimination of the shape, not a preference.
+
+    (c2) the plan's other candidate — instance-implicit FIELDS:
+
+        class Capped (a : Type) where
+          [ordInst : Ord a]
+          [ltInst : LT a]
+          … [beqInst : BEq a]
+          cap : a → a → a
+
+    The class DECLARATION elaborates (the `[f : T]` field binder is legal), and
+    `Capped.cap` works, but the fields are not registered as instances:
+
+        error: failed to synthesize LT t      -- def clampLt … [Capped t] … decide (x < y)
+        error: failed to synthesize Min t     -- def useMin  … [Capped t] … Min.min x y
+        error: failed to synthesize BEq t     -- def useBEq  … [Capped t] … x == y
+
+    So instance-implicit fields do NOT compose out of a child constraint. (c3) the
+    same eight as instance-implicit class PARAMETERS elaborates as a declaration
+    too, but then `Capped t` itself needs the eight in scope to even be written —
+    it moves the problem to every constraint site without removing it.
+
+    (c4) `extends` over only the six recipe entries that ARE structures (`Ord`,
+    `LT`, `LE`, `Min`, `Max`, `BEq`) — the near miss, and the one that pins the
+    residue exactly:
+
+        class Capped (a : Type) extends Ord a, LT a, LE a, Min a, Max a, BEq a where
+          cap : a → a → a
+        def useLt {t : Type} [Capped t] : t → t → Bool := fun x y => decide (x < y)
+
+        error: failed to synthesize Decidable (x < y)
+
+    ONE error, and only about `Decidable`: `x < y`, `Min.min`, `==`, `compare`,
+    `Capped.cap` and the `instance : Capped Meters` all elaborated. So `extends`
+    composes fine — it simply cannot carry the two `Decidable*` entries, which are
+    exactly what the emitter's `decide (a < b)` image of Haskell `<` needs.
+
+    (c5) THE MECHANISM CHOSEN — the recipe at the constraint site, with the class
+    carrying no parent at all:
+
+        class Capped (a : Type) where
+          cap : a → a → a
+        def useAll {t : Type} [Ord t] [LT t] [LE t] [DecidableLT t] [DecidableLE t]
+                   [Min t] [Max t] [BEq t] [Capped t] : t → t → Bool :=
+          fun x y => decide (x < y) || (x == y) || (Capped.cap x y == Min.min x y)
+        inductive Meters where | Meters : Int → Meters
+        deriving Repr, Inhabited, DecidableEq, Ord
+        instance : LE Meters := leOfOrd
+        instance : LT Meters := ltOfOrd
+        instance : Min Meters := minOfLe
+        instance : Max Meters := maxOfLe
+        instance : Capped Meters where cap := fun x y => Min.min x y
+        def metersAll : Meters → Meters → Bool := useAll
+        example : metersAll (Meters.Meters 3) (Meters.Meters 5) = true := by decide
+
+    → EXIT 0, no output. Two things at once: the eight binders compose with
+    `[Capped t]`, AND the whole set synthesizes at a USER data type from nothing
+    but what `emitDataDecl` already emits for a derived `Ord` — including
+    `DecidableLT Meters`/`DecidableLE Meters`, which come from `LT := ltOfOrd`
+    being Bool-backed and hence decidable. Uniform over `Eq`, `Ord` and `Num`
+    (no structure-ness test anywhere), which is why it beat the hybrid.
+
+    (d) THE GATE — `blaster` through the `extends` projection, which is what the
+    fixture's properties actually need and which (b) did not test. The full
+    expected post-fix output was hand-assembled and run before the emitter was
+    touched; through TWO projections (`sizeViaContainer` → `Container.toSized` →
+    `instSizedBag` → `_dollar_csize`):
+
+        theorem bagSize_correct : ∀ (n : Int), bagSize (Bag.Bag n) = n := by blaster
+        theorem bagInsert_adds : ∀ (k n : Int),
+          bagInsert k (Bag.Bag n) = Bag.Bag (n + k) := by blaster
+        theorem metersCap_min : ∀ (a b : Int), … := by blaster
+        theorem metersLt_lt : ∀ (a b : Int), … := by blaster
+
+    → four `✅ Valid`. The one FAILURE in that probe was mine, not the design's:
+    `(Container.empty : Bag) = Bag.Bag 0 := by decide` gives `failed to synthesize
+    Decidable (…)` because `Bag` derives no `Eq` in the fixture, so the property is
+    written `by rfl` (which passes). Recorded because it is why one fixture
+    property uses `rfl` where the others use `decide`.
+
+### The dfun spines, and why attribution is positional
+
+    `dfunMethodBinds` reads a method's bind out of the instance's DICTIONARY. Both
+    shapes it handles are from `/tmp/transpile-SuperClass.json` (the extended
+    fixture; uniques from that run):
+
+        $fSizedBag    = Var $csize                                  -- newtype dict
+        $fContainerBag = C:Container @Bag $fSizedBag $cempty $cinsert
+        $fCappedLevel  = C:Capped    @Level $fOrdLevel  $ccap
+
+    The second and third are the general shape: dictionary constructor, type
+    args, one arg per SUPERCLASS dict (`role = dict` — `$fSizedBag` for a user
+    parent, `$fOrdLevel` for a BUILTIN one, stored identically), then the methods.
+    The first is what a one-method superclass-free class compiles to: the
+    dictionary is a newtype over the method, so the dfun body IS the method Var,
+    with no constructor and no cast at pass-0000. `dfunMethodBinds` deliberately
+    does NOT strip casts, and that is not an omission to "fix" speculatively: if a
+    later pass ever wraps the body, the shape is unrecognized, the attribution
+    DECLINES, and the old first-value-argument matcher runs — degrading to today's
+    behaviour (and at worst to the loud instance drop), never to a mis-pairing.
+
+    `$cempty : Bag` and `$cinsert : (Int -> (Bag -> Bag))` are precisely the two
+    binds `findClassMethodBind`'s first-value-argument match cannot attribute, and
+    the whole `Container Bag` instance was dropped for it (M3 Task 1's observation
+    4). The dictionary knows the answer positionally.
+
+    The NAME GUARD (`arg.name == "$c" ++ method.name`, all-or-nothing per
+    instance) is the reason a positional read is safe to ship: field order equals
+    `classOpItems` order is a claim about GHC's internals, and if it ever broke,
+    unguarded position would attribute `empty`'s body to `insert` — silently wrong.
+    Guarded, any disagreement falls back to the old matcher and at worst drops the
+    instance with the existing warning. It costs nothing on real dumps: GHC does
+    not suffix these names per instance (two instances of one class both bind
+    `$c<method>`), which is also why the bind lookup matches name AND unique. -/
+
+-- The observed class shapes, from the `classDecls` channel of the same run
+-- (`supers` for a builtin parent is the bare occurrence name, `"Ord"`, which is
+-- the spelling `Maps.classConMap` already keys on):
+--
+--   [{"name":"Capped","supers":["Ord"],"tyVars":["a"]}
+--   ,{"name":"Container","supers":["Sized"],"tyVars":["a"]}
+--   ,{"name":"Sized","supers":[],"tyVars":["a"]}]
+def m3t5Sized : ClassDecl :=
+  { name := "Sized", tyVars := ["a"], supers := [],
+    methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+def m3t5Container : ClassDecl :=
+  { name := "Container", tyVars := ["a"], supers := ["Sized"],
+    methods := [ { name := "empty",  ty := .tyVar "a" },
+                 { name := "insert", ty := .tyFun (.tyCon "Int" [])
+                                            (.tyFun (.tyVar "a") (.tyVar "a")) } ] }
+def m3t5Capped : ClassDecl :=
+  { name := "Capped", tyVars := ["a"], supers := ["Ord"],
+    methods := [ { name := "cap", ty := .tyFun (.tyVar "a") (.tyFun (.tyVar "a") (.tyVar "a")) } ] }
+-- Plugin order, verbatim: REVERSE declaration order, child before parent.
+def m3t5Plugin : List ClassDecl := [m3t5Capped, m3t5Container, m3t5Sized]
+
+/-! ### `emitClassDecl` — the `extends` clause -/
+
+-- A user parent, with the class list that says `Sized` is one of ours.
+#guard emitClassDecl [] m3t5Container ["Sized", "Container", "Capped"]
+         == "class Container (a : Type) extends Sized a where\n" ++
+            "  empty : a\n  insert : (Int → (a → a))"
+-- The same class WITHOUT that knowledge (the no-plugin path, and every call site
+-- that predates this task) emits exactly the pre-Task-5 string.
+#guard emitClassDecl [] m3t5Container
+         == "class Container (a : Type) where\n  empty : a\n  insert : (Int → (a → a))"
+-- A BUILTIN parent contributes NOTHING to the header: `Ord` is not a user class,
+-- and `extends Ord a` cannot carry the recipe (probe (c1)).
+#guard emitClassDecl [] m3t5Capped ["Capped"]
+         == "class Capped (a : Type) where\n  cap : (a → (a → a))"
+-- Two user parents → one `extends`, comma-separated, in `supers` order.
+#guard emitClassDecl [] { m3t5Container with supers := ["Sized", "Named"] } ["Sized", "Named"]
+         == "class Container (a : Type) extends Sized a, Named a where\n" ++
+            "  empty : a\n  insert : (Int → (a → a))"
+-- MULTI-PARAMETER: no `extends` at all, because `supers` does not say WHICH
+-- parameter the parent constrains. Loud at the use site; a guess would be silent.
+#guard emitClassDecl [] { m3t5Container with tyVars := ["a", "b"] } ["Sized", "Container"]
+         == "class Container (a : Type) (b : Type) where\n" ++
+            "  empty : a\n  insert : (Int → (a → a))"
+-- Defaults and `extends` are independent and compose on one class.
+#guard emitClassDecl [("empty", "(Bag.Bag 0)")] m3t5Container ["Sized"]
+         == "class Container (a : Type) extends Sized a where\n" ++
+            "  empty : a := (Bag.Bag 0)\n  insert : (Int → (a → a))"
+
+/-! ### `sortClassDecls` — parent before child -/
+
+-- THE CASE THAT MATTERS: the plugin's reverse order, sorted. `Capped` keeps its
+-- place (its only parent is builtin, so it has no local dependency at all).
+#guard (sortClassDecls m3t5Plugin).map (·.name) == ["Capped", "Sized", "Container"]
+-- Already-correct input is UNCHANGED — the stability that keeps every
+-- superclass-free fixture byte-identical.
+#guard (sortClassDecls [m3t5Sized, m3t5Container]).map (·.name) == ["Sized", "Container"]
+#guard (sortClassDecls [m3t5Capped]).map (·.name) == ["Capped"]
+#guard (sortClassDecls ([] : List ClassDecl)).length == 0
+-- A three-level chain, worst-case order in: C extends P extends Q.
+#guard (sortClassDecls
+          [ { m3t5Sized with name := "C", supers := ["P"] },
+            { m3t5Sized with name := "P", supers := ["Q"] },
+            { m3t5Sized with name := "Q", supers := [] } ]).map (·.name)
+         == ["Q", "P", "C"]
+-- A superclass GHC would have rejected (a cycle) is not sorted into a lie: the
+-- blocked remainder is appended in dump order and Lean fails loud on the forward
+-- `extends`. Length is preserved, which is what the totality fallback checks.
+#guard (sortClassDecls
+          [ { m3t5Sized with name := "C", supers := ["P"] },
+            { m3t5Sized with name := "P", supers := ["C"] } ]).length == 2
+-- A super naming a class that is NOT local (imported, or builtin) is not a
+-- dependency and cannot block: `Capped`'s `Ord` never appears in the class list.
+#guard (sortClassDecls [m3t5Capped, m3t5Sized]).map (·.name) == ["Capped", "Sized"]
+
+/-! ### `classSuperBinders` — the builtin recipes, transitively -/
+
+-- `Ord`'s eight, in `Maps.classConMap` order (which is load-bearing: `DecidableLT`
+-- after `LT`), with `{t}` still unsubstituted.
+#guard classSuperBinders [m3t5Capped]
+         == [("Capped", ["[Ord {t}]", "[LT {t}]", "[LE {t}]", "[DecidableLT {t}]",
+                         "[DecidableLE {t}]", "[Min {t}]", "[Max {t}]", "[BEq {t}]"])]
+-- A USER parent contributes nothing of its own, so a class whose only parent is a
+-- user class is ABSENT from the list (not present-with-`[]`): `extends` already
+-- carries it.
+#guard classSuperBinders [m3t5Sized, m3t5Container] == ([] : List (Name × List String))
+-- The whole fixture's class set: only `Capped` has an entry.
+#guard (classSuperBinders m3t5Plugin).map (·.1) == ["Capped"]
+-- TRANSITIVE through a user parent — the arm no fixture reaches, since it needs a
+-- two-level hierarchy whose TOP has a builtin parent. `class Ord a => P a` and
+-- `class P a => C a`: `extends P a` gets `C` to `P`, but `P`'s `Ord` lives only in
+-- constraint sites, so `C` must re-inject it.
+#guard (classSuperBinders
+          [ { m3t5Sized with name := "C", supers := ["P"] },
+            { m3t5Sized with name := "P", supers := ["Ord"] } ]).map (·.1)
+         == ["C", "P"]
+#guard ((classSuperBinders
+          [ { m3t5Sized with name := "C", supers := ["P"] },
+            { m3t5Sized with name := "P", supers := ["Ord"] } ]).find? (·.1 == "C")).map (·.2)
+         == some ["[Ord {t}]", "[LT {t}]", "[LE {t}]", "[DecidableLT {t}]",
+                  "[DecidableLE {t}]", "[Min {t}]", "[Max {t}]", "[BEq {t}]"]
+-- DEDUP, first-occurrence order: `class (Eq a, Ord a) => C a` must not emit
+-- `[BEq {t}]` twice (it is in `Ord`'s recipe as well).
+#guard ((classSuperBinders [{ m3t5Sized with name := "C", supers := ["Eq", "Ord"] }]).head!).2
+         == ["[BEq {t}]", "[Ord {t}]", "[LT {t}]", "[LE {t}]", "[DecidableLT {t}]",
+             "[DecidableLE {t}]", "[Min {t}]", "[Max {t}]"]
+-- An UNMAPPED builtin parent yields no binders and no entry (see `unmappedSupers`).
+#guard classSuperBinders [{ m3t5Sized with name := "C", supers := ["Show"] }]
+         == ([] : List (Name × List String))
+
+/-! ### `stripClassConstraints` — the recipe at the constraint site
+
+    `capOrdered :: Capped a => a -> a -> Bool`, as the shim delivers it. -/
+def m3t5CapOrderedTy : GHCType :=
+  .forAll "a" (.tyFun (.tyCon "Capped" [.tyVar "a"])
+    (.tyFun (.tyVar "a") (.tyFun (.tyVar "a") (.tyCon "Bool" []))))
+
+-- WITHOUT the recipes: `[Capped t]` alone — which is what the file looked like
+-- before this task and cannot elaborate `decide (x < y)` (probe (c4)).
+#guard (stripClassConstraints ["Capped"] m3t5CapOrderedTy).1 == ["[Capped a]"]
+-- WITH them: the parent's binders FIRST, then the child's. This is the emitted
+-- header of `capOrdered` in `Generated/SuperClass.lean`.
+#guard (stripClassConstraints ["Capped"] m3t5CapOrderedTy (classSuperBinders [m3t5Capped])).1
+         == ["[Ord a]", "[LT a]", "[LE a]", "[DecidableLT a]", "[DecidableLE a]",
+             "[Min a]", "[Max a]", "[BEq a]", "[Capped a]"]
+-- The STRIPPED TYPE is identical either way — the reason `emitBind`'s `resTyOf`
+-- does not need the recipes and the header cannot drift from the result type.
+#guard emitType (stripClassConstraints ["Capped"] m3t5CapOrderedTy).2
+         == emitType (stripClassConstraints ["Capped"] m3t5CapOrderedTy
+                        (classSuperBinders [m3t5Capped])).2
+-- A recipe entry for a class NOT in this signature never fires, and a user class
+-- with no entry is exactly as before.
+#guard (stripClassConstraints ["Container"]
+          (.forAll "a" (.tyFun (.tyCon "Container" [.tyVar "a"])
+             (.tyFun (.tyVar "a") (.tyCon "Int" [])))) (classSuperBinders m3t5Plugin)).1
+         == ["[Container a]"]
+
+/-! ### Dropped superclasses are WARNED, never silent -/
+
+#guard unmappedSupers ["Sized", "Container", "Capped"] m3t5Container == ([] : List Name)
+-- A builtin WITH a recipe is not dropped (it reaches the constraint sites).
+#guard unmappedSupers ["Capped"] m3t5Capped == ([] : List Name)
+-- An unmapped builtin, an imported user class, and the plugin's placeholder for a
+-- superclass predicate that is not a class constraint at all — all reported.
+#guard unmappedSupers ["C"] { m3t5Sized with name := "C", supers := ["Show"] } == ["Show"]
+#guard unmappedSupers ["C"] { m3t5Sized with name := "C", supers := ["Sized"] } == ["Sized"]
+#guard unmappedSupers ["C"] { m3t5Sized with name := "C", supers := ["_UnknownSuper"] }
+         == ["_UnknownSuper"]
+#guard ((unmappedSuperWarning "C" "Show").splitOn
+          "class `C` has the superclass `Show`, which is DROPPED").length == 2
+
+/-! ### The dictionary attribution, on the observed spines
+
+    Uniques are the extended fixture's (`/tmp/transpile-SuperClass.json`). -/
+def m3t5CsizeV : Var :=
+  {name := "$csize", unique := 10824, ty := .tyFun (.tyCon "Bag" []) (.tyCon "Int" []), role := .id}
+def m3t5CemptyV : Var :=
+  {name := "$cempty", unique := 10834, ty := .tyCon "Bag" [], role := .id}
+def m3t5CinsertV : Var :=
+  {name := "$cinsert", unique := 10839,
+   ty := .tyFun (.tyCon "Int" []) (.tyFun (.tyCon "Bag" []) (.tyCon "Bag" [])), role := .id}
+def m3t5SizedDictV : Var :=
+  {name := "$fSizedBag", unique := 9900, ty := .tyCon "_Unknown" [], role := .dict}
+def m3t5CsizeBind : Bind := .nonRec m3t5CsizeV (.lit (.litInt 0))
+def m3t5CemptyBind : Bind := .nonRec m3t5CemptyV (.lit (.litInt 0))
+def m3t5CinsertBind : Bind := .nonRec m3t5CinsertV (.lit (.litInt 0))
+-- `$fSizedBag = $csize` — the newtype dictionary.
+def m3t5SizedDfun : Bind :=
+  .nonRec {name := "$fSizedBag", unique := 9900, ty := .tyCon "Sized" [.tyCon "Bag" []],
+           role := .dict}
+    (.var m3t5CsizeV)
+-- `$fContainerBag = C:Container @Bag $fSizedBag $cempty $cinsert`.
+def m3t5ContainerDfun : Bind :=
+  .nonRec {name := "$fContainerBag", unique := 9904,
+           ty := .tyCon "Container" [.tyCon "Bag" []], role := .dict}
+    (.app (.app (.app (.app
+      (.var {name := "C:Container", unique := 9950, ty := .tyCon "_Unknown" [], role := .id})
+      (.type_ (.tyCon "Bag" [])))
+      (.var m3t5SizedDictV))
+      (.var m3t5CemptyV))
+      (.var m3t5CinsertV))
+def m3t5Binds : CoreProgram :=
+  [m3t5CsizeBind, m3t5CemptyBind, m3t5CinsertBind, m3t5SizedDfun, m3t5ContainerDfun]
+def m3t5SizedInst : Instance :=
+  {className := "Sized", headTypes := [.tyCon "Bag" []], dfunName := "$fSizedBag",
+   dfunUnique := 9900}
+def m3t5ContainerInst : Instance :=
+  {className := "Container", headTypes := [.tyCon "Bag" []], dfunName := "$fContainerBag",
+   dfunUnique := 9904}
+
+-- THE FIX, at its source: both methods attributed, superclass dict skipped.
+#guard (dfunMethodBinds m3t5Binds m3t5Container m3t5ContainerInst).map (fun (m, v, _) => (m, v.unique))
+         == [("empty", 10834), ("insert", 10839)]
+-- The newtype-dictionary shape.
+#guard (dfunMethodBinds m3t5Binds m3t5Sized m3t5SizedInst).map (fun (m, v, _) => (m, v.unique))
+         == [("size", 10824)]
+-- DECLINE ARMS, each returning `[]` (never a partial attribution):
+-- name disagreement — the tripwire for a GHC field order that stops matching
+-- `classOpItems` order,
+#guard (dfunMethodBinds m3t5Binds
+          { m3t5Container with methods := m3t5Container.methods.reverse }
+          m3t5ContainerInst).isEmpty
+-- arity disagreement (the class channel lists a method the dictionary lacks),
+#guard (dfunMethodBinds m3t5Binds
+          { m3t5Container with methods := m3t5Container.methods.take 1 }
+          m3t5ContainerInst).isEmpty
+-- no dfun bind at all (an instance whose dict-builder was filtered),
+#guard (dfunMethodBinds [m3t5CsizeBind] m3t5Sized m3t5SizedInst).isEmpty
+-- and a `$c` Var the binds do not contain (the ref would dangle, so it is not
+-- claimed as an attribution).
+#guard (dfunMethodBinds [m3t5SizedDfun] m3t5Sized m3t5SizedInst).isEmpty
+
+-- THE OLD MATCHER'S VERDICT on the same two methods, for contrast: `[]` spine ⇒
+-- both unresolved ⇒ the whole instance dropped, which is Task 1's observation 4.
+#guard classifyInstanceMethod [] m3t5Binds "Container" (emitType (.tyCon "Bag" []))
+         (m3t5Container.methods.head!) == .unresolved
+#guard classifyInstanceMethod [] m3t5Binds "Container" (emitType (.tyCon "Bag" []))
+         (m3t5Container.methods.getLast!) == .unresolved
+-- …and WITH the dictionary attribution, both are fields.
+#guard classifyInstanceMethod [] m3t5Binds "Container" (emitType (.tyCon "Bag" []))
+         (m3t5Container.methods.head!)
+         (dfunMethodBinds m3t5Binds m3t5Container m3t5ContainerInst)
+         == .field "_dollar_cempty_10834"
+#guard classifyInstanceMethod [] m3t5Binds "Container" (emitType (.tyCon "Bag" []))
+         (m3t5Container.methods.getLast!)
+         (dfunMethodBinds m3t5Binds m3t5Container m3t5ContainerInst)
+         == .field "_dollar_cinsert_10839"
+-- End to end: the instance that used to vanish.
+#guard emitInstanceUser [] [m3t5Sized, m3t5Container] m3t5Binds m3t5ContainerInst
+         == some ("instance : Container (GHCCore.tyConOpaque \"Bag\") where\n" ++
+                 "  empty := _dollar_cempty_10834\n  insert := _dollar_cinsert_10839")
+-- …and it is no longer reported as dropped.
+#guard unresolvedInstanceMethods
+         { binds := m3t5Binds, typeDecls := [], instances := [m3t5SizedInst, m3t5ContainerInst],
+           classDecls := [m3t5Sized, m3t5Container] }
+         == ([] : List (Name × String × Name))
+
+/-! ### `sortInstances` — parent instance before child instance
+
+    MEASURED, not argued. `examples/haskell/SuperClass.hs` declares `instance
+    Container Bag` ABOVE `instance Sized Bag` on purpose; the instance channel is
+    in source order (`[Ord, Eq, Capped, Container, Sized]` for that file), and
+    with the child emitted first Lean answered
+
+        error: …/SuperClass.lean:75:25: Fields missing: `size`
+
+    — the flattened form of probe (a)'s negative control. Re-run with the two
+    source blocks swapped, the emitted `instance` order is the same either way
+    (parent first) and only the `$csize` def moves, which is order-irrelevant. -/
+
+#guard (sortInstances [m3t5Sized, m3t5Container] [m3t5ContainerInst, m3t5SizedInst]).map (·.className)
+         == ["Sized", "Container"]
+-- Already-correct input unchanged (the stability every other fixture relies on).
+#guard (sortInstances [m3t5Sized, m3t5Container] [m3t5SizedInst, m3t5ContainerInst]).map (·.className)
+         == ["Sized", "Container"]
+-- Builtin instances are not dependencies and are not reordered around: `Capped`'s
+-- parent is `Ord`, which contributes no `extends` and hence no ordering need.
+#guard (sortInstances [m3t5Capped]
+          [ {className := "Capped", headTypes := [.tyCon "Level" []],
+             dfunName := "$fCappedLevel", dfunUnique := 10541},
+            {className := "Ord", headTypes := [.tyCon "Level" []],
+             dfunName := "$fOrdLevel", dfunUnique := 10555} ]).map (·.className)
+         == ["Capped", "Ord"]
+-- A DIFFERENT head is not a dependency: `Container Bag` does not wait for
+-- `Sized Box`. (Order preserved, so the child still comes first — and Lean's
+-- `Fields missing` is then the correct diagnosis, not something to sort away.)
+#guard (sortInstances [m3t5Sized, m3t5Container]
+          [ m3t5ContainerInst,
+            {className := "Sized", headTypes := [.tyCon "Box" []], dfunName := "$fSizedBox",
+             dfunUnique := 1} ]).map (·.className)
+         == ["Container", "Sized"]
+-- No user classes at all ⇒ identity, which is why the 26 non-class fixtures are
+-- byte-identical.
+#guard (sortInstances [] [m3t5ContainerInst, m3t5SizedInst]).map (·.className)
+         == ["Container", "Sized"]
+
+/-! ### Regression — what this task could have moved, and what it did
+
+    Every new parameter is TRAILING with a `[]` default (`emitClassDecl`'s
+    `classNames`, `stripClassConstraints`' `superBinders` and its threading through
+    `emitDefHeader`/`emitBind`/`emitProgram`/`emitProgramWith`,
+    `classifyInstanceMethod`'s `spine`), so every pre-existing call site — this
+    file's `#guard`s included — keeps its exact meaning. The two exceptions are
+    mechanical: `stripClassConstraintsGo` gained a positional second argument
+    (`[]` at both call sites here), and `dfunMethodBinds` is consulted before the
+    old matcher wherever an instance is emitted.
+
+    The three ORDER changes are the real risk, and all three are stable on input
+    that needs no reordering: `sortClassDecls`, `sortInstances`, and the
+    `extends` clause itself (empty unless a super names a LOCAL class).
+
+    MEASURED: all 26 fixtures with a saved emitted file were re-transpiled through
+    the full `./transpile.sh` pipeline (plugin + shim + specs) and diffed —
+    byte-identical, `SuperClass.lean` alone excepted, which is this task's
+    deliverable. THE SCOPE OF THAT WORD, precisely, because it is weaker than the
+    Task 4 note above: the comparison is against the committed pre-change
+    `Generated/` files, snapshotted before any edit — NOT against a re-emission
+    from a stashed pre-change binary, which is what Task 4 did. Sound, since those
+    files were produced by the pre-change transpiler from the same fixtures, but it
+    assumes they were up to date at HEAD rather than re-deriving them.
+    Includes every class fixture (`UserClass`, `DefaultMethods`,
+    `OperatorShadow`, `TwoClassesDistinctMethods`, `UserClassNeq`,
+    `BuiltinConstraints`, `Ratio`, `RecordOps`, `NewtypeBasic`, `OrdInstance`,
+    `NumOrd`). Byte-identity is also what settles the fixtures whose `lake build`
+    is RED — `UserClass` (a `blaster ❌ Falsified` at its one theorem),
+    `TupleTriple`, `BothNotations`, `RatioCeilTruncate`, `RatioComparisons`, and
+    `RatioFalseTest` (intentionally false): an identical emitted file has an
+    identical build result, so every one of those reds predates this task (the
+    plan's Task 8 notes already carry `UserClass` as known-red).
+    The three refusal fixtures still refuse with their own messages
+    (`NewtypeInstances` — newtype instance head; `UserClassNeqWithEq` — the `/=`
+    method; `TwoClassesSameMethod` — still rejected by GHC itself, before the
+    transpiler runs).
+
+    `SuperClass.lean`'s own delta, relative to the DEGRADED file Task 1 recorded:
+    `class Container … extends Sized a`, an emitted `instance : Container Bag`
+    with both fields, the parent instance sorted ahead of it, and the new
+    builtin-super half (`class Capped`, `instance : Capped Level`, and the
+    `[Ord t] … [Capped t]` headers on `capBoth`/`capOrdered`). Its seven
+    properties verify: two `blaster` `✅ Valid`, five ground `decide`/`rfl`.
+    stderr is EMPTY — the `Container Bag` drop warning M3 Task 4 added is gone
+    because the drop is gone. -/
 
 end GhcCoreToLean.Tests

@@ -253,6 +253,16 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- emission uses (`Emit.classifyInstanceMethod`), so the two cannot disagree.
     for (cls, head, m) in Emit.unresolvedInstanceMethods userProg do
       IO.eprintln s!"warning: {Emit.unresolvedInstanceMethodWarning cls head m}"
+    -- Name every SUPERCLASS the emitted `class` block drops (M3 Task 5): one that
+    -- is neither a locally-declared class (→ `extends`) nor a builtin with a
+    -- `Maps.classConMap` recipe (→ constraint-site binders). Warning, not refusal,
+    -- for the same reason as the instance skip above: a dropped parent whose
+    -- methods are never called through the child costs nothing, and one whose
+    -- methods ARE called is already loud at `lake build`. Without this the drop
+    -- would be entirely silent at the transpiler — which is what the plugin's
+    -- `ppSuperPred` comment had assumed Task 5 would prevent by other means.
+    for (cls, super) in Emit.droppedSupers userProg do
+      IO.eprintln s!"warning: {Emit.unmappedSuperWarning cls super}"
     -- Tripwire for the shim's role heuristic. A `$dm<method>` Var is a
     -- default-method BODY; the shim used to classify it as a dictionary (any
     -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT
