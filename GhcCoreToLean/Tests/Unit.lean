@@ -4260,15 +4260,17 @@ def m3t5ContainerInst : Instance :=
     that needs no reordering: `sortClassDecls`, `sortInstances`, and the
     `extends` clause itself (empty unless a super names a LOCAL class).
 
-    MEASURED: all 26 fixtures with a saved emitted file were re-transpiled through
-    the full `./transpile.sh` pipeline (plugin + shim + specs) and diffed —
-    byte-identical, `SuperClass.lean` alone excepted, which is this task's
-    deliverable. THE SCOPE OF THAT WORD, precisely, because it is weaker than the
-    Task 4 note above: the comparison is against the committed pre-change
-    `Generated/` files, snapshotted before any edit — NOT against a re-emission
-    from a stashed pre-change binary, which is what Task 4 did. Sound, since those
-    files were produced by the pre-change transpiler from the same fixtures, but it
-    assumes they were up to date at HEAD rather than re-deriving them.
+    MEASURED, in two passes. The task's own pass compared against the on-disk
+    pre-change `Generated/` files (untracked — `Generated/` is gitignored), which
+    assumes those snapshots were current rather than re-deriving them; that
+    assumption proved false for at least `BothNotations.lean` (stale since it
+    predates the `import GhcCoreToLean.Runtime` header change). The REVIEW then
+    redid it the Task 4 way — parent binary stashed, both binaries run over the
+    same dumps — and found **29 fixtures byte-identical**, `SuperClass.lean`
+    alone excepted, which is this task's deliverable. The three multi-module
+    fixtures (`OperatorCommons`, `RatioFalseTest`, `RecordClient`) need
+    `LEAN_IMPORTS` plus the manifest's newtype channel supplied, or they diff for
+    harness reasons rather than drift.
     Includes every class fixture (`UserClass`, `DefaultMethods`,
     `OperatorShadow`, `TwoClassesDistinctMethods`, `UserClassNeq`,
     `BuiltinConstraints`, `Ratio`, `RecordOps`, `NewtypeBasic`, `OrdInstance`,

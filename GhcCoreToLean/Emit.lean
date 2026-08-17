@@ -1334,8 +1334,12 @@ private partial def spineOf : Expr → Expr × List Expr
     matches on name AND unique: the name alone is ambiguous in exactly that case,
     and the spine hands us the right unique.
 
-    Returns `[]` — decline, no attribution — rather than a partial list, so a
-    caller can never mix the two attribution mechanisms within one instance. Kept
+    Declines with `[]` when the spine shape or the name guard rejects the
+    instance. It does NOT guarantee a total list: the final `filterMap` drops any
+    method whose `$c` bind is absent from `binds` (verified: with `$cinsert`
+    filtered out, this returns just `[("empty", …)]`). That partial case is safe
+    because `emitInstanceUser` requires EVERY method to resolve, so a partial list
+    drops the instance LOUDLY rather than mixing mechanisms per method. Kept
     non-`private` so `Tests/Unit.lean` can guard the decline arms directly. -/
 def dfunMethodBinds (binds : CoreProgram) (cd : ClassDecl) (i : Instance)
     : List (Name × Var × Expr) :=
