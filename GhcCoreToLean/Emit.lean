@@ -685,13 +685,30 @@ def filterBinds (keep : Var → Expr → Bool) (binds : CoreProgram) : CoreProgr
 
 /-! ## Data type declarations and instances -/
 
+/-- The four instances Lean's `Ord` does NOT supply but the transpiler's lowered
+    operators need: `decide (a ≤ b)` / `decide (a < b)` want `LE`/`LT` (Lean's are
+    `Prop`-valued), and `Min.min`/`Max.max` want `Min`/`Max`. Core makes
+    `leOfOrd`/`ltOfOrd`/`minOfLe`/`maxOfLe` plain `def`s, not instances, so every
+    `Ord` the transpiler emits has to name them.
+
+    ONE definition, two emission sites, deliberately: the data block for a DERIVED
+    `Ord` (`emitDataDecl`) and the instance section for a HAND-WRITTEN one
+    (`emitInstance`). Both derive all four FROM `compare`, which is what makes the
+    order coherent by construction at every type this emitter produces (see the
+    `M3 Task 3` block in `Tests/Unit.lean`) — and what makes a hand-written `$c<`/
+    `$cmin` body unreachable; M3 Task 6 owns that call, argued at `ordRoute`. -/
+def ordCompanionInsts (leanTy : String) : String :=
+  s!"instance : LE {leanTy} := leOfOrd\ninstance : LT {leanTy} := ltOfOrd\n" ++
+  s!"instance : Min {leanTy} := minOfLe\ninstance : Max {leanTy} := maxOfLe"
+
 /-- Emit a Haskell `data T = …` declaration as a Lean `inductive`. Bare
     constructor uses are *not* brought into scope via `open T` — that makes
     `T` ambiguous between the type and the ctor in Lean's elaborator. The
     body post-passes rewrite Haskell-style refs to the qualified `T.C` form.
     Field selectors GHC auto-generates are emitted alongside as regular
     defs. -/
-def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
+def emitDataDecl (derivedEq derivedOrd : Bool) (d : DataDecl)
+    (handwrittenOrd : Bool := false) : String :=
   let leanName := sanitize d.name
   let ctorLines := d.ctors.map fun c =>
     let argTys := c.fields.map (emitType ·.ty)
@@ -704,14 +721,23 @@ def emitDataDecl (derivedEq hasOrd : Bool) (d : DataDecl) : String :=
   -- matches GHC's derived semantics. `Ord` additionally needs `LE`/`LT`/`Min`/
   -- `Max` (Lean's `Ord` doesn't supply them) so the transpiler's lowered
   -- `decide (a ≤ b)` / `Min.min` / … resolve.
+  --
+  -- `handwrittenOrd` (M3 Task 6) is the type whose `Ord` is the USER's, emitted as
+  -- an `instance : Ord T where compare := …` block with the same four companions
+  -- (`ordCompanionInsts`) — NOT here, because that block references a `$ccompare`
+  -- def emitted after the data block. All this flag does here is `DecidableEq`,
+  -- and it is Task 3's mandatory handoff rather than a convenience: the `Ord`
+  -- constraint recipe contains `[BEq t]`, so an `Ord`-constrained call at such a
+  -- type needs SOME `BEq` route. `deriving Ord` used to supply it via this same
+  -- `DecidableEq`; with the derived order gone the flag keeps it. A type that also
+  -- has a hand-written `Eq` gets its explicit `instance : BEq T` as a second
+  -- candidate, and the explicit one wins — measured, and pinned by the `M3T6R`
+  -- `#guard`s in `Tests/Unit.lean` (the same measurement `M3T3R` made for a
+  -- DERIVED `Ord`, redone with the order coming from an instance block).
   let derivs := "Repr, Inhabited"
-    ++ (if derivedEq || hasOrd then ", DecidableEq" else "")
-    ++ (if hasOrd then ", Ord" else "")
-  let ordInsts :=
-    if hasOrd then
-      s!"\n\ninstance : LE {leanName} := leOfOrd\ninstance : LT {leanName} := ltOfOrd"
-        ++ s!"\ninstance : Min {leanName} := minOfLe\ninstance : Max {leanName} := maxOfLe"
-    else ""
+    ++ (if derivedEq || derivedOrd || handwrittenOrd then ", DecidableEq" else "")
+    ++ (if derivedOrd then ", Ord" else "")
+  let ordInsts := if derivedOrd then s!"\n\n{ordCompanionInsts leanName}" else ""
   s!"inductive {leanName} where\n{body}\nderiving {derivs}{ordInsts}"
 
 /-- Emit a user class as a Lean `class`, one `(v : Type)` binder per type
@@ -952,10 +978,17 @@ def isDerivedShowMethod (n : Name) : Bool :=
     primops `dataToTag#`/`tagToEnum#`) and return their head-type strings. Such
     Eq instances can't be body-translated and are routed through Lean
     `deriving DecidableEq` instead. Hand-written Eq (e.g. Ratio's cross-multiply
-    `==`) never uses tag primops, so it keeps its body-translation. (Ord is
-    handled by instance-existence, not this scan — see `emitFullProgram` — since
-    a derived `compare` on a small enum is case-based and indistinguishable from
-    a hand-written one.) -/
+    `==`) never uses tag primops, so it keeps its body-translation.
+
+    `Ord`'s counterpart is `ordRoute`, which since M3 Task 6 makes the SAME
+    tag-primop test on `$ccompare` (it used to be instance-existence-based, which
+    was silently wrong for a hand-written non-structural `Ord`). This comment used
+    to say the test could not work for `Ord` "since a derived `compare` on a small
+    enum is case-based and indistinguishable from a hand-written one" — the premise
+    is CORRECT and measured (2-constructor enums and every constructor-with-fields
+    shape are case-based), but the conclusion was wrong: such a body is
+    TRANSLATABLE, and translating GHC's derived `compare` yields the derived order.
+    See `ordRoute`'s section header for that argument and its exhaustive check. -/
 private def derivedEqTypes (binds : CoreProgram) : List String :=
   let step (acc : List String) (v : Var) (e : Expr) : List String :=
     if usesTagPrim e && eqMethodNames.contains v.name then
@@ -1024,11 +1057,40 @@ def attachMethodShadows (binds : CoreProgram) (mm : List MethodRef) : List Metho
     { m with shadowedBy :=
         (bs.filterMap (fun (n, u) => if n == m.method then some u else none)).eraseDups }
 
-/-- Look up a top-level binding by name. -/
-private def findBind (binds : CoreProgram) (n : Name) : Option (Var × Expr) :=
+/-- Look up a top-level binding by name, and by UNIQUE as well when the caller has
+    one. Names alone are ambiguous in principle — GHC does not suffix `$c<method>`
+    or `$f<Class><Ty>` names per instance, and `/tmp/transpile-Ratio.json` has two
+    binds named `$c/=` distinguished only by unique — so a caller holding a unique
+    should pass it. Callers with no unique (`translatedDefaults`/`classDefaultBody`
+    on `$dm<method>`, `reconstructClasses`) pass `none` and keep the name-only
+    behaviour exactly. -/
+private def findBind (binds : CoreProgram) (n : Name) (u : Option Nat := none)
+    : Option (Var × Expr) :=
+  let hit (v : Var) : Bool := v.name == n && (u.all (· == v.unique))
   binds.findSome? fun b => match b with
-    | .nonRec v e => if v.name == n then some (v, e) else none
-    | .rec_ pairs => pairs.find? (fun (v, _) => v.name == n)
+    | .nonRec v e => if hit v then some (v, e) else none
+    | .rec_ pairs => pairs.find? (fun (v, _) => hit v)
+
+/-- `Instance.dfunUnique` translated into the CORE DUMP's unique numbering.
+
+    THE TWO CHANNELS DO NOT NUMBER UNIQUES THE SAME WAY, and comparing them raw
+    silently loses the match. MEASURED: `/tmp/transpile-SuperClass.json` carries
+    `dfunName: "$fOrdLevel", dfunUnique: 8214565720323795259` while the bind named
+    `$fOrdLevel` in the same file has `unique: 10555`. The instance channel is the
+    decl plugin's `getKey (nameUnique …)` — GHC's packed 64-bit key, `(tag << 56)
+    ||| index` (`shim/decl-plugin/GhcDeclDump.hs:141`) — whereas a bind's unique is
+    the shim's `BinderId (Unique _ n) → n`, i.e. the INDEX alone
+    (`shim/Main.hs:146-148`). Stripping the high byte reconciles them.
+
+    VERIFIED over every instance in all 40 dumps in `/tmp/transpile-*.json`: 60/60
+    instances have `dfunUnique % 2^56` equal to the unique of the bind with that
+    dfun name, 0 mismatches, and the high byte is `114` (`'r'`) throughout. The same
+    scan found 0 dumps with two top-level binds sharing a dfun name, which is why
+    this is hardening rather than a fix — and why the one caller
+    (`dfunMethodBinds`) falls back to the name-only lookup if the unique-keyed one
+    comes up empty: if a future GHC or shim ever renumbers, that degrades to
+    today's behaviour instead of dropping every instance. -/
+def dfunDumpUnique (dfunKey : Nat) : Nat := dfunKey % 72057594037927936
 
 /-- Replace every `tyCon headName []` occurrence with `tyVar tv` (generalize an
     instance-specialized method type back to the class-parameter form). -/
@@ -1349,7 +1411,14 @@ def dfunMethodBinds (binds : CoreProgram) (cd : ClassDecl) (i : Instance)
       match b with
       | .nonRec w e => if hit w then some (w, e) else none
       | .rec_ pairs => pairs.find? (fun (w, _) => hit w)
-  match findBind binds i.dfunName with
+  -- The dfun by NAME AND UNIQUE: the instance channel hands us both, and a dfun
+  -- name is not guaranteed unique in a module. `dfunDumpUnique` is load-bearing —
+  -- the two channels number uniques differently, and matching `i.dfunUnique` RAW
+  -- resolved nothing, which dropped `SuperClass.hs`'s `Container Bag` instance
+  -- (measured; see that function). The `orElse` is the documented degradation if
+  -- the encoding ever drifts again.
+  match (findBind binds i.dfunName (some (dfunDumpUnique i.dfunUnique))).orElse
+          (fun _ => findBind binds i.dfunName) with
   | none          => []
   | some (_, rhs) =>
     let (head, args) := spineOf rhs
@@ -1375,6 +1444,171 @@ def dfunMethodBinds (binds : CoreProgram) (cd : ClassDecl) (i : Instance)
 /-- The emitted (unique-suffixed) def name of that binding. -/
 private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
   (findClassMethodBind binds method headTyStr).map (fun (v, _) => localId v)
+
+/-! ### `Ord`: derived, hand-written, or neither (M3 Task 6)
+
+An `Ord` instance takes exactly one of three routes, and `ordRoute` is the SINGLE
+decision procedure — consulted by `emitInstance` (what to emit), `emitFullProgram`
+(which `$c` binds to suppress, and whether the data decl derives `Ord`/
+`DecidableEq`) and `unsupportedOrdInstances` (the diagnostic), so those cannot
+disagree.
+
+WHAT IT REPLACED, and why that was silent-wrong. Until this task the key was
+INSTANCE EXISTENCE: every type with an `Ord` instance got `deriving Ord` plus the
+companions, and `isSuppressedMethod` dropped its real `$ccompare`/`$c<`/… bodies.
+A hand-written non-structural `Ord` was therefore replaced by Lean's structural
+order with zero diagnostics. MEASURED at the parent commit on `data W = W Int` +
+`instance Ord W where compare (W a) (W b) = compare b a`: the emitted `wLt` reads
+`decide (a < b)` against `deriving Ord`, so `wLt (W 1) (W 2)` is `true` in Lean and
+`False` in Haskell — and `theorem … = false := by decide` PROVED the Haskell truth
+false. Task 5 made it worse in reach, not in kind: an `Ord a =>`-constrained call
+at such a head used to fail LOUD (`failed to synthesize LT t`, no binder recipe)
+and now elaborates against the same wrong order.
+
+THE DISCRIMINATORS, both read off `examples/haskell/OrdHandwritten.hs` and the
+six-shape probe recorded in the `M3 Task 6` block of `Tests/Unit.lean`:
+
+* **tag primops** (`usesTagPrim`, as `derivedEqTypes` uses for `Eq`) — GHC's
+  DERIVED `compare` on a multi-constructor type is `case dataToTag# a of … `,
+  untranslatable, so it routes to `deriving Ord`. A hand-written body never
+  contains one (probed: even `compare a b = compare (fromEnum b) (fromEnum a)`
+  keeps the primop inside `$cfromEnum`, since nothing inlines at `-O0`).
+* **a Rec group with the dictionary builder** — GHC emits a method body that
+  depends on the instance's OWN dictionary inside `Rec [$fOrdT, …]`, the same
+  shape M3 Task 4 observed for default methods. That is exactly what a MINIMAL
+  `<=`-only instance's `compare` is (`$ccompare` there is the class default,
+  `if x == y then EQ else if x <= y then LT else GT`, reaching the `Eq`
+  superclass through `$p1Ord @T $fOrdT`), and it is not emittable: the body needs
+  the instance being defined, which Lean does not see forward. `unsupported`
+  drops the whole `Ord`, so every use is loud, and `Main.lean` warns.
+
+  This test reads a Rec group's MEMBERSHIP, which `filterBinds`' docstring warns
+  against classifying by — so note what it does not do: it never reads the group's
+  HEAD or its order, only whether SOME member is a dict builder, which is stable
+  under the per-pair filtering both `Main.keepBinding` and `filterBinds` do. The
+  dfun itself survives to this point in every path checked: `Lower.lowerBind`
+  rewrites bodies and keeps every top-level binder, `Main.isGhcRuntimePlumbing`
+  drops `$fShow…` but no other `$f`, and `emitFullProgram`'s `isJunkName` (which
+  does drop every `$f`) runs on `keptBinds`, AFTER this decision, over a separate
+  list. Witnessed e2e: `OrdHandwritten.hs`'s `MinDef` reaches `unsupported`, which
+  it could not if the dfun had been filtered out of the group by then. Were that to
+  change, this arm would flip to `handwritten` and emit a body referencing an
+  erased dictionary — loud (unknown identifier), not silent.
+
+`.handwritten` carries the `$ccompare` def name so the caller cannot re-derive it
+by a different key.
+
+THE TWO MISCLASSIFICATION DIRECTIONS, both pinned in `Tests/Unit.lean`:
+
+* **hand-written read as DERIVED** (the silent-wrong direction) is closed for every
+  body GHC generates from ordinary Haskell, because the only way a tag primop
+  reaches a `$ccompare` body at `-O0` is a LITERAL `dataToTag#` in user source.
+  That residual is real and MEASURED (`{-# LANGUAGE MagicHash #-}` +
+  `compare a b = compare (I# (dataToTag# b)) (I# (dataToTag# a))` ⇒ `tagprim=True`
+  in the dump), not hypothetical; it stays silent-wrong, no worse than the
+  pre-task state where every hand-written `Ord` was. Closing it needs instance
+  ORIGIN from the decl-plugin (the same extension M2 named for `deriving` on a
+  newtype); a shape test on the derived body was rejected as fragile — a
+  false negative there would make working derived enums loud.
+* **derived read as HAND-WRITTEN** is SOUND, and it is the COMMON case, not a
+  corner. MEASURED (six shapes in one dump, `OrdBoundary` in the `M3 Task 6` block):
+  GHC's derived `compare` uses tag primops ONLY for an all-nullary enum with ≥3
+  constructors. A 2-constructor enum gets a nested `case` instead, and ANY
+  constructor with fields gets one too — so `data Coin = Heads | Tails deriving Ord`
+  (the `OrdInstance` fixture) and `data Pair = Pair Int Int deriving Ord` both take
+  the `.handwritten` route. The old comment on `derivedEqTypes` guessed exactly this
+  ("a derived compare on a small enum is case-based and indistinguishable from a
+  hand-written one") and it is right.
+
+  Sound because the derived `compare` body IS the derived order, and the companions
+  are functions of `compare` either way — so the emitted instance computes what
+  `deriving Ord` computes. MEASURED rather than argued: the `M3T6B` `#guard`s pin
+  `compare a b == <emitted body> a b` for the 2-ctor enum, the 3-ctor
+  with-fields and the single-ctor-two-field shapes, exhaustively over the
+  constructor space with fields sampled to hit `<`/`=`/`>`.
+
+  What remains is a translation risk, not a semantic one: the body must EMIT.
+  `Ordering` and `LT`/`EQ`/`GT` are mapped in `Maps.lean` on the expression side and
+  on the case-ALT side (`Generated/OrdInstance.lean` and
+  `Generated/OrdHandwritten.lean` exercise both), and a body that failed to
+  translate would be loud. One such body EXISTS today, and it predates this task:
+  derived `==` on a multi-constructor type with fields emits GHC's `void#` fallback
+  (`GHC.Prim.void_hash_`, unknown identifier). Measured with BOTH binaries on the
+  same dump — 5 occurrences each, all inside `$c==` defs, none inside `$ccompare` —
+  so the `Eq` path owns it and no derived `compare` shape probed here is affected.
+
+HAND-WRITTEN `$c<` / `$cmin` / … BODIES ARE DROPPED, and here is the decision in
+full, because M3 Task 3's block explicitly hands it to this task. `<`, `≤`, `min`,
+`max` at a hand-written-`Ord` type come from `ordCompanionInsts`, i.e. from
+`compare`, so an instance defining `compare` AND a disagreeing `<` loses the `<`.
+Three reasons, in increasing strength:
+
+* Those bodies are not the user's own code in the first place. OBSERVED: for
+  `instance Ord W where compare …`, GHC puts every other `Ord` method in
+  `Rec [$fOrdW, $cmax, $c>=, $c>, $c<=, $cmin, $c<]` with bodies calling
+  `compare @W $fOrdW` / `<= @W $fOrdW`, i.e. the class DEFAULTS specialized to this
+  instance. Dropping them loses nothing a user wrote — unless the user wrote both
+  `compare` and `<`, which is the only case this paragraph is really about.
+* There is nowhere to wire one. The companions cannot be arbitrary: `decide (a < b)`
+  needs `Decidable (a < b)`, which core provides ONLY as
+  `DecidableRel (@LT.lt α ltOfOrd)` — matching `ltOfOrd` LITERALLY. MEASURED: swap
+  in `instance : LT W := ⟨fun a b => <hand-written> a b = true⟩` and the very next
+  `decide (a < b)` is `error: failed to synthesize Decidable (a < b)`. So a
+  hand-written `<` body cannot become the `LT` instance without breaking every
+  `<` at that type; `ltOfOrd` off `compare` is the only shape that works.
+* Lean is then MORE lawful than a law-violating Haskell instance (Task 3's framing),
+  which is a defensible place to land rather than a compromise.
+
+A user who defines BOTH `compare` and `<` gets the `compare` one. A user who defines
+`<` (or `<=`) ONLY has no `compare` of their own at all: the default lands in that
+Rec group and the whole instance is `unsupported` — loud and warned, rather than
+half-translated. -/
+inductive OrdRoute where
+  /-- GHC-derived: `deriving Ord` + companions in the data block, `$c` bodies
+      suppressed (they use tag primops and have no Lean image). -/
+  | derived
+  /-- The user's own `compare`, emitted as an instance block pointing at this def
+      name, plus the same companions. -/
+  | handwritten (compareRef : String)
+  /-- No emittable `compare` (absent, or the dictionary-dependent class default of
+      a minimal `<=`-only instance): no `Ord` at all, loud at every use site. -/
+  | unsupported
+deriving DecidableEq, Repr
+
+/-- The `$ccompare` bind at `headTyStr`, and whether it shares a top-level `Rec`
+    group with a dictionary builder (`$f…`) — GHC's marker for a body that needs
+    the instance's own dictionary, i.e. a class default rather than the user's
+    code. Head matching is `findClassMethodBind`'s (`$ccompare`'s first value
+    argument is the instance head), duplicated here only to also report the Rec
+    group, which that function's return type cannot carry. -/
+private def findCompareBind (binds : CoreProgram) (headTyStr : String)
+    : Option (Var × Expr × Bool) :=
+  let matchesHead (v : Var) : Bool :=
+    v.name == "$ccompare" &&
+      (match firstValArgTy v.ty with
+       | some t => emitType t == headTyStr
+       | none   => false)
+  binds.findSome? fun b => match b with
+    | .nonRec v e => if matchesHead v then some (v, e, false) else none
+    | .rec_ pairs =>
+      (pairs.find? (fun (v, _) => matchesHead v)).map fun (v, e) =>
+        (v, e, pairs.any (fun (w, _) => w.name.startsWith "$f"))
+
+/-- Which of the three routes the `Ord` instance at `headTyStr` takes — see the
+    section header for the full argument. Keyed on the head STRING (the spelling
+    every instance-matching key in this file uses, computed before the resolution
+    passes run), so it can be called from the instance side and the bind side
+    alike. Recomputed per call (`emitFullProgram` asks twice per `Ord` head,
+    `emitInstance` and `unsupportedOrdInstances` once each) and each call scans the
+    binds; the product is bounded by the `Ord`-instance count, which is why the
+    single decision procedure is preferred over caching it in a threaded list. -/
+def ordRoute (binds : CoreProgram) (headTyStr : String) : OrdRoute :=
+  match findCompareBind binds headTyStr with
+  | none                    => .unsupported
+  | some (v, e, inDictRec) =>
+    if usesTagPrim e then .derived
+    else if inDictRec then .unsupported
+    else .handwritten (localId v)
 
 /-! ### Default methods
 
@@ -1668,6 +1902,33 @@ def unresolvedInstanceMethodWarning (cls head mname : Name) : String :=
   s!"  Main.lean's drop rules); or the class-shape dump declares a method this module\n" ++
   s!"  has no binding for."
 
+/-- The `Ord` instances that get NO Lean image (`OrdRoute.unsupported` — see the
+    `Ord`-route section header), for `Main.lean`'s warning. Not a refusal: the drop
+    is loud at `lake build` (every `compare`/`<`/`min` at that type fails to
+    synthesize) and refusing would newly reject modules whose unusable `Ord` is
+    never used — the same call `unresolvedInstanceMethods` makes. Same `ordRoute`
+    the emission uses, over the same `p.binds`, so warning and emission cannot
+    disagree about which instances vanish. -/
+def unsupportedOrdInstances (p : Program) : List Name :=
+  (p.instances.filter (·.className == "Ord")).filterMap fun i =>
+    match ordRoute p.binds (i.headTypes.map emitType |> String.intercalate " ") with
+    | .unsupported => some (headTypeNames i)
+    | _            => none
+
+/-- The warning for one `unsupportedOrdInstances` entry. -/
+def unsupportedOrdWarning (head : Name) : String :=
+  s!"instance `Ord {head}` is DROPPED: no translatable `compare` body for it.\n" ++
+  s!"  Either there is no `$ccompare` binding at that head, or the one there is\n" ++
+  s!"  GHC's CLASS DEFAULT (`if x == y then EQ else if x <= y then LT else GT`),\n" ++
+  s!"  which a minimal `instance Ord {head} where (<=) = …` produces — that body needs\n" ++
+  s!"  the instance's own dictionary, so it cannot be emitted before the instance it\n" ++
+  s!"  defines. NOTHING structural is substituted (that substitution was this\n" ++
+  s!"  transpiler's silent-wrong behaviour until M3 Task 6); instead every\n" ++
+  s!"  `compare`/`<`/`<=`/`min`/`max` at `{head}` fails loudly at `lake build` with\n" ++
+  s!"  `failed to synthesize`.\n" ++
+  s!"  Fix: define `compare` in the instance (a `<=`-only minimal definition is not\n" ++
+  s!"  translated)."
+
 /-- Emit a Lean `instance` block. `Eq` → Lean `BEq`, `Ord` → Lean `Ord` (the
     latter via `deriving` in the data block), and user classes via
     `emitInstanceUser`. Returns `none` for classes we don't model (Show, Read). -/
@@ -1684,12 +1945,27 @@ def emitInstance (defaults : List (Name × Name)) (classes : List ClassDecl)
     | some methodRef => some s!"instance : BEq {tyStr} where\n  beq := {methodRef}"
     | none           => none
   | "Ord" =>
-    -- Ord is reconstructed via `deriving Ord` + `leOfOrd`/… in the data block
-    -- (emitted by `emitDataDecl`), so instances precede the binds that use
-    -- `≤`/`<`/`min`/`max` (Lean instances are not forward-visible). Nothing to
-    -- emit here. The GHC `$ccompare`/`$c<=`/… method defs are suppressed in
-    -- `emitFullProgram`.
-    none
+    -- Three routes, decided by `ordRoute` (see its section header):
+    --
+    -- * DERIVED — `deriving Ord` + companions in the data block (`emitDataDecl`),
+    --   which is also what puts them ahead of every bind using `≤`/`<`/`min`/`max`.
+    --   Nothing here, and the untranslatable `$ccompare`/`$c<`/… defs are
+    --   suppressed in `emitFullProgram`.
+    -- * HAND-WRITTEN — the user's `compare`, wired here, with the same four
+    --   companions derived from it. They cannot go in the DATA block: they need
+    --   `Ord T`, which needs the `$ccompare` def, which the data block precedes.
+    --   `emitFullProgram` therefore emits this string in a section of its own,
+    --   immediately after that def and ahead of every other method def — the
+    --   ordering is load-bearing in two measured ways (nested derived-`Ord` types,
+    --   and another class's `$c` method using `min` at this head); see the
+    --   `ordStr` comment there and the `M3 Task 6` block in `Tests/Unit.lean`.
+    -- * UNSUPPORTED — no `Ord` at all; `Main.lean` warns and every use is loud.
+    match ordRoute binds tyStr with
+    | .derived            => none
+    | .unsupported        => none
+    | .handwritten cmpRef =>
+      some (s!"instance : Ord {tyStr} where\n  compare := {cmpRef}\n\n"
+              ++ ordCompanionInsts tyStr)
   -- Show is deliberately not translated: GHC's `$cshowsPrec` body is string
   -- plumbing that rarely matches Lean's `ToString`, and emitted data decls
   -- already `derive Repr`, which Blaster uses to print counterexamples.
@@ -1755,7 +2031,7 @@ type), and pass 4 would rewrite the needle to a `NewtypeBasic.Age` that does not
 exist — so the erasure has to consume the needle before pass 4 sees it. Sound
 because the published underlying string is module-independent by construction
 (`newtypeExports`), and because instance MATCHING still happens on the opaque
-spelling: `derivedEqTypes`/`ordTypes`/`findClassMethod` keys are built before any
+spelling: `derivedEqTypes`/`ordRoute`/`findClassMethod` keys are built before any
 of these passes run, so erasing `Age` → `Int` here cannot cross-match instances.
 -/
 
@@ -1917,11 +2193,28 @@ the one failure mode this project forbids:
   `instance : BEq Int where beq := <mod-7 function>` inside the module namespace,
   so every `==` on `Int` in the module (theorem text included) silently means
   mod-7. Observed: `((1 : Int) == 8) = false` is *refuted* by `decide`.
-* **Ord vanishes.** `newtype Coin = Coin Int` + `instance Ord Coin where compare
-  (Coin a) (Coin b) = compare b a` matches `ordTypes` on the opaque head, so
-  `isSuppressedMethod` drops every `$c` method, while the newtype is filtered out
-  of `datas` and gets no `deriving Ord` either. The user's reversed `compare` is
-  gone and Lean's own `Int` order takes over — with zero diagnostics.
+* **Ord relocates too, and it did not always.** `newtype Coin = Coin Int` +
+  `instance Ord Coin where compare (Coin a) (Coin b) = compare b a`. When this
+  guard was written the reversed `compare` VANISHED: the head matched the old
+  instance-existence `ordTypes`, so `isSuppressedMethod` dropped every `$c` method
+  while the newtype was filtered out of `datas` and got no `deriving Ord` either,
+  and Lean's own `Int` order took over with zero diagnostics. Since M3 Task 6 the
+  same input takes the `ordRoute` HAND-WRITTEN route, and the failure mode becomes
+  RELOCATION, exactly like `Eq`'s. MEASURED by handing that Program to
+  `emitFullProgram` directly (the refusal lives in `Main.lean`, upstream of it):
+
+      def _dollar_ccompare_42 : (Int → (Int → Ordering)) := compare
+      instance : Ord Int where
+        compare := _dollar_ccompare_42
+      instance : LE Int := leOfOrd
+      instance : LT Int := ltOfOrd
+      instance : Min Int := minOfLe
+      instance : Max Int := maxOfLe
+
+  — the reversed order AND its four companions land on `Int` inside the module
+  namespace, so every `<`/`≤`/`min`/`max` on `Int` there silently reverses. The
+  refusal below is what keeps either form from happening; the change of failure
+  mode is recorded because the guard's justification must not read as stale.
 
 So: ANY instance whose head type is a newtype is a hard transpiler error.
 
@@ -2550,20 +2843,30 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
     kept.flatMap fun d => d.ctors.map (·.name)
   -- Eq: detect *derived* Eq (tag-primop `$c==`) → route through `deriving
   -- DecidableEq` and suppress the untranslatable method defs; hand-written Eq
-  -- keeps body-translation. Ord: any type with an Ord instance is reconstructed
-  -- via `deriving Ord` + `leOfOrd`/… in the data block (so the instances precede
-  -- the binds that use `≤`/`<`/`min`/`max` — Lean instances aren't forward-
-  -- visible); its GHC `$ccompare`/`$c<=`/… method defs are all dead boilerplate
-  -- and suppressed.
+  -- keeps body-translation.
+  --
+  -- Ord (M3 Task 6): `ordRoute` per instance head, NOT instance existence — that
+  -- was the silent-wrong this task closed (every hand-written non-structural `Ord`
+  -- was replaced by `deriving Ord`; see the `Ord`-route section header). A DERIVED
+  -- head keeps the old treatment: `deriving Ord` + companions in the data block,
+  -- every `$c` method suppressed. A HAND-WRITTEN head keeps exactly ONE `$c` bind,
+  -- `$ccompare`, which the emitted `instance : Ord T` points at; the rest are
+  -- suppressed as before, and are unemittable rather than merely unwanted (they
+  -- call the instance's own dictionary — see the section header). An UNSUPPORTED
+  -- head keeps nothing.
   let derivedEq : List String := derivedEqTypes p.binds
-  let ordTypes  : List String :=
+  let ordHeads : List String :=
     p.instances.filterMap fun i =>
       if i.className == "Ord" then some (i.headTypes.map emitType |> String.intercalate " ") else none
+  let derivedOrd     : List String := ordHeads.filter (ordRoute p.binds · == .derived)
+  let handwrittenOrd : List String := ordHeads.filter fun h =>
+    match ordRoute p.binds h with | .handwritten _ => true | _ => false
   let headMatches (v : Var) (s : List String) : Bool :=
     match methodHeadStr v with | some hs => s.contains hs | none => false
   let isSuppressedMethod (v : Var) : Bool :=
     (eqMethodNames.contains v.name  && headMatches v derivedEq)
-    || (ordMethodNames.contains v.name && headMatches v ordTypes)
+    || (ordMethodNames.contains v.name && headMatches v ordHeads
+        && !(v.name == "$ccompare" && headMatches v handwrittenOrd))
   let keptBinds : CoreProgram := filterBinds (fun v _ => !isSuppressedMethod v) p.binds
   -- User classes → class decls + method→class map (selector rewrite). The decl
   -- plugin's shapes win over the instance-driven reconstruction (see
@@ -2595,7 +2898,8 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   let datas := ((sortDataDecls p.typeDecls).filter fun d =>
       kept.any (·.name == d.name)).map fun d =>
     let hs := emitType (.tyCon d.name [])
-    emitDataDecl (derivedEq.contains hs) (ordTypes.contains hs) d
+    emitDataDecl (derivedEq.contains hs) (derivedOrd.contains hs) d
+      (handwrittenOrd := handwrittenOrd.contains hs)
   -- Default methods: the class body carries the `:=` defaults translated from
   -- GHC's `$dm<method>` binds, and `defaults` is THE key that also suppresses
   -- those binds and their instance-side wrappers below (see the "Default
@@ -2632,8 +2936,13 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
     v.name.startsWith "$c" &&
       (let m := v.name.drop 2
        defaults.any (fun (_, dm) => dm == m) && isDefaultWrapperBody m e)
+  -- A hand-written `Ord`'s `$ccompare` leaves the general method-def section: it
+  -- gets its own section, `ordStr`, emitted FIRST (see below).
+  let isHandwrittenCompare (v : Var) : Bool :=
+    v.name == "$ccompare" && headMatches v handwrittenOrd
   let methodDefs := filterBinds
-    (fun v e => v.name.startsWith "$c" && !isWrapperBind v e) keptBinds
+    (fun v e => v.name.startsWith "$c" && !isWrapperBind v e && !isHandwrittenCompare v)
+    keptBinds
   let userBinds  := filterBinds
     (fun v _ => !v.name.startsWith "$c" && !isJunkName v.name && !isTranslatedDm v.name)
     keptBinds
@@ -2643,13 +2952,62 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- cannot drift, and a method with its own class constraint would be covered.
   let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames superBinders
   let userStr   := emitProgramWith methodMap classNames userBinds ctorNames superBinders
+  -- HAND-WRITTEN `Ord`, its own section, in DATA-DEPENDENCY order, each type's
+  -- three pieces adjacent: the `$ccompare` def, then `instance : Ord T`, then the
+  -- LE/LT/Min/Max companions.
+  --
+  -- WHY A SECTION AND NOT `methodStr` + `instStr` (measured, both failures):
+  --
+  -- * NESTED types. `data A = A Int deriving Ord; data B = B A deriving Ord` are
+  --   both `.handwritten` (neither derived body has a tag primop), and B's compare
+  --   body is `compare a1 b1` AT TYPE `A`. With the def in `methodStr` and the
+  --   instance in `instStr`, `instance : Ord A` came after B's def:
+  --   `error: failed to synthesize Ord A`. Pre-task both types got data-block
+  --   `deriving Ord`, so this was a REGRESSION on ordinary Haskell, invisible to
+  --   the fixture corpus (no fixture nests two derived-`Ord` types).
+  -- * ANOTHER class's `$c` method using `≤`/`<`/`min`/`max` at a hand-written-`Ord`
+  --   head — `instance Capped Frac where cap x y = min x y`. Also loud with the
+  --   instance in `instStr`, and also fine now that the whole `Ord` precedes
+  --   `methodStr`. `OrdHandwritten.hs`'s `Capped Frac` instance is exactly that
+  --   shape, so it is fixtured rather than merely argued.
+  --
+  -- It stays in `bodyRaw` rather than joining `dataBlock`: the compare body pattern-
+  -- matches on constructors and so needs `resolveUserCtors`, which must never run
+  -- over the data block (it would rewrite the inductive's own `| Ctor ` lines).
+  -- Ordering key is the emitted DATA order (`sortDataDecls`), which is exactly the
+  -- field-dependency order the nested case needs; a head with no local decl (an
+  -- orphan instance on an imported type) sorts last, stably.
+  let headOf (i : Instance) : String := i.headTypes.map emitType |> String.intercalate " "
+  let dataOrder : List String :=
+    (sortDataDecls p.typeDecls).map fun d => emitType (.tyCon d.name [])
+  let isHandwrittenOrdInst (i : Instance) : Bool :=
+    i.className == "Ord" &&
+      (match ordRoute p.binds (headOf i) with | .handwritten _ => true | _ => false)
+  let hwOrdInsts := p.instances.filter isHandwrittenOrdInst
+  -- Selection by walking the data order, rather than sorting by an index: total,
+  -- stable, and it places an orphan head (no local decl) last by construction.
+  let orderedHwOrd : List Instance :=
+    (dataOrder.flatMap fun h => hwOrdInsts.filter (headOf · == h))
+      ++ hwOrdInsts.filter (fun i => !dataOrder.contains (headOf i))
+  let ordBlocks : List String := orderedHwOrd.filterMap fun i => do
+    let (v, e) ← findClassMethodBind keptBinds "$ccompare" (headOf i)
+    let inst   ← emitInstance defaults userClasses derivedEq p.binds i
+    let defStr := emitProgramWith methodMap classNames [.nonRec v e] ctorNames superBinders
+    some s!"{defStr}\n\n{inst}"
+  let ordStr := String.intercalate "\n\n" ordBlocks
   -- Superclass-dependency order again, now for the instances: a child instance
   -- omits its parent field and Lean synthesizes it from the parent instance in
   -- scope, which must therefore already be emitted (`sortInstances`).
-  let insts := (sortInstances userClasses p.instances).filterMap
+  --
+  -- `Ord` is filtered out AFTER the sort, never before it: those instances are
+  -- emitted in `ordStr` above (the derived and unsupported routes emit nothing
+  -- here anyway, so this filter is behaviour-preserving for them), and filtering
+  -- before the sort could in principle move the survivors relative to each other.
+  let insts := ((sortInstances userClasses p.instances).filter (·.className != "Ord")).filterMap
     (emitInstance defaults userClasses derivedEq p.binds)
   let instStr := String.intercalate "\n\n" insts
-  let bodyRaw := String.intercalate "\n\n" (List.filter (· != "") [methodStr, instStr, userStr])
+  let bodyRaw := String.intercalate "\n\n"
+    (List.filter (· != "") [ordStr, methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes kept bodyRaw
                     |> resolveNewtypes nts
                     |> resolveUserCtors kept

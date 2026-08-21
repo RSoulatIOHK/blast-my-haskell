@@ -263,6 +263,13 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- `ppSuperPred` comment had assumed Task 5 would prevent by other means.
     for (cls, super) in Emit.droppedSupers userProg do
       IO.eprintln s!"warning: {Emit.unmappedSuperWarning cls super}"
+    -- Name every `Ord` instance that gets no Lean image (M3 Task 6): a minimal
+    -- `<=`-only definition, whose `compare` is GHC's dictionary-dependent class
+    -- default. Warning, not refusal, for the same reason as the two above — and
+    -- the alternative it replaced was worse than either: until Task 6 such a type
+    -- silently got Lean's STRUCTURAL order via `deriving Ord`.
+    for head in Emit.unsupportedOrdInstances userProg do
+      IO.eprintln s!"warning: {Emit.unsupportedOrdWarning head}"
     -- Tripwire for the shim's role heuristic. A `$dm<method>` Var is a
     -- default-method BODY; the shim used to classify it as a dictionary (any
     -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT

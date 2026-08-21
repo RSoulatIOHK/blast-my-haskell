@@ -4294,4 +4294,438 @@ def m3t5ContainerInst : Instance :=
     stderr is EMPTY — the `Container Bag` drop warning M3 Task 4 added is gone
     because the drop is gone. -/
 
+/-! ## M3 Task 6 — hand-written non-structural `Ord`
+
+    The defect this closes is the oldest silent-wrong in the emitter: `ordTypes` was
+    INSTANCE-EXISTENCE-based, so ANY type with an `Ord` instance got `deriving Ord`
+    and its real `$ccompare`/`$c<`/… bodies were dropped by `isSuppressedMethod`. A
+    hand-written non-structural `Ord` was therefore replaced by Lean's structural
+    order, silently. `Emit.ordRoute` decides per instance now; its section header
+    carries the design, and this block carries the measurements.
+
+### The A/B, quoted
+
+    `examples/haskell/OrdHandwritten.hs`, one dump (`/tmp/transpile-OrdHandwritten.
+    json`), two binaries — the parent binary built by stashing `Emit.lean`/`Main.lean`,
+    the way M3 Task 4's regression pass did. PRE-fix, `decide` does not merely fail
+    to prove the Haskell truths, it PROVES THEM FALSE:
+
+        error: …/OrdHandwritten.lean:209:71: Tactic `decide` proved that the proposition
+          revLt (Rev.Rev 1) (Rev.Rev 2) = false
+        is false
+        error: …/OrdHandwritten.lean:233:70: Tactic `decide` proved that the proposition
+          fracMin (Frac.Frac 1 2) (Frac.Frac 2 5) = Frac.Frac 2 5
+        is false
+        error: …/OrdHandwritten.lean:236:66: Tactic `decide` proved that the proposition
+          fracOrdered (Frac.Frac 1 2) (Frac.Frac 2 5) = false
+        is false
+
+    …and `blaster` refutes the quantified ones with counterexamples:
+
+        error: …/OrdHandwritten.lean:217:76: ❌ Falsified
+        error: …/OrdHandwritten.lean:217:76: Counterexample:
+        error: …/OrdHandwritten.lean:217:76: - a: 0
+        error: …/OrdHandwritten.lean:217:76: - b: (- 1)
+
+    Counted: of the fixture's 20 properties, PRE-fix 11 are `decide`-refuted
+    (`revLt`×2, `revCompare`, `revMin`, `fracLt`×2, `fracMin`, `fracOrdered`×2,
+    `fracCap`×2) and 2 are `blaster`-falsified with counterexamples
+    (`revLt_reverses_all`, `fracLt_all`) — 13 refuted, 7 passing (the `Rank`,
+    `Pair`, `fracEq` and `minDefEq` ones, none of which discriminates). POST-fix all
+    20 hold: 2 `blaster` `✅ Valid`, 18 ground `decide`, and
+    `lake build GhcCoreToLean.Generated.OrdHandwritten` reports 0 errors.
+
+    THE TWO SILENT-WRONGS SEPARATELY, since they are different defects:
+
+    * MONOMORPHIC (`revLt`, `fracLt`) — pre-existing, predates M3. The emitted
+      `wLt`-style body is `decide (a < b)` against `deriving Ord`.
+    * `Ord`-CONSTRAINED (`fracMin` via `minOf :: Ord a => …`, and `fracOrdered` via
+      `cappedOrdered :: Capped a => …` where `class Ord a => Capped a`) — this is the
+      loud→silent REGRESSION M3 Task 5 introduced. Before Task 5 a builtin-superclass
+      constraint site got no binder recipe, so `decide (x < y)` there could not
+      elaborate at all (`failed to synthesize LT t`); Task 5 supplied `[Ord t] [LT t]
+      … [BEq t]` and every binder then resolved — against the structural order. The
+      pre-fix refutation of `fracOrdered_viaCapped` above IS that regression:
+      elaborated, and wrong. Closing the root cause closes it, which is this task's
+      acceptance criterion.
+
+    The pre-fix file also shows the drop in the negative: ZERO `$ccompare` defs
+    emitted for five `Ord` instances, and `inductive MinDef … deriving Repr,
+    Inhabited, DecidableEq, Ord` for a type whose hand-written `(<=)` is the REVERSE
+    of that structural order, with no warning on stderr.
+
+### What is derived, measured — the boundary is not where the plan assumed
+
+    Six shapes in one module (`OrdBoundary`, scratch), asking only whether GHC's
+    `$ccompare` body contains `dataToTag#`/`tagToEnum#`:
+
+        data E2 = A2 | B2                              tagprim=False  → handwritten
+        data E3 = A3 | B3 | C3                         tagprim=True   → derived
+        data E4 = A4 | B4 | C4 | D4                    tagprim=True   → derived
+        data Q2 = Q2a Int | Q2b Int                    tagprim=False  → handwritten
+        data Q3 = Q3a Int | Q3b Int | Q3c Int          tagprim=False  → handwritten
+        data S1 = S1 Int Int                           tagprim=False  → handwritten
+
+    (all `deriving (Eq, Ord)`). So the DERIVED route is now reached ONLY by an
+    all-nullary enum with ≥3 constructors; everything else — including
+    `OrdInstance.hs`'s `data Coin = Heads | Tails deriving (Eq, Ord)` — takes the
+    hand-written route with GHC's own derived body. The plan's byte-identity
+    expectation ("OrdInstance … should stay derived/identical") is therefore WRONG,
+    and `Generated/OrdInstance.lean` legitimately changed: `deriving …, Ord` +
+    four companions became a `$ccompare` def + `instance : Ord Coin` + the same four
+    companions. It builds clean and `pick` still computes `Heads ≤ Tails`.
+
+### `M3T6B` — the misclassification is SOUND, exhaustively
+
+    Direction (b) (derived read as hand-written) is sound because the derived
+    `compare` body IS the derived order. Measured, not argued: the three bodies below
+    are verbatim transpiler output for the three shapes above, checked against Lean's
+    own `deriving Ord` on the same inductive over the whole constructor space with
+    fields sampled to hit `<`, `=` and `>`. -/
+
+inductive M3T6BE2 where | A2 : M3T6BE2 | B2 : M3T6BE2
+deriving Repr, Inhabited, DecidableEq, Ord
+inductive M3T6BQ3 where
+  | Q3a : Int → M3T6BQ3 | Q3b : Int → M3T6BQ3 | Q3c : Int → M3T6BQ3
+deriving Repr, Inhabited, DecidableEq, Ord
+inductive M3T6BS1 where | S1 : Int → Int → M3T6BS1
+deriving Repr, Inhabited, DecidableEq, Ord
+
+def m3t6e2cmp (a b : M3T6BE2) : Ordering :=
+  (match a with
+| M3T6BE2.A2 => (match b with
+| M3T6BE2.A2 => Ordering.eq
+| _ => Ordering.lt)
+| M3T6BE2.B2 => (match b with
+| M3T6BE2.B2 => Ordering.eq
+| _ => Ordering.gt))
+
+def m3t6q3cmp (a b : M3T6BQ3) : Ordering :=
+  (match a with
+| M3T6BQ3.Q3a a1 => (match b with
+| M3T6BQ3.Q3a b1 => ((compare) (a1)) (b1)
+| _ => Ordering.lt)
+| M3T6BQ3.Q3b a1 => (match b with
+| M3T6BQ3.Q3a _ => Ordering.gt
+| M3T6BQ3.Q3b b1 => ((compare) (a1)) (b1)
+| _ => Ordering.lt)
+| M3T6BQ3.Q3c a1 => (match b with
+| M3T6BQ3.Q3c b1 => ((compare) (a1)) (b1)
+| _ => Ordering.gt))
+
+def m3t6s1cmp (a b : M3T6BS1) : Ordering :=
+  (match a with
+| M3T6BS1.S1 a1 a2 => (match b with
+| M3T6BS1.S1 b1 b2 => (match ((compare) (a1)) (b1) with
+| Ordering.lt => Ordering.lt
+| Ordering.eq => ((compare) (a2)) (b2)
+| Ordering.gt => Ordering.gt)))
+
+def m3t6e2s : List M3T6BE2 := [.A2, .B2]
+def m3t6q3s : List M3T6BQ3 :=
+  ([-1, 0, 1] : List Int).flatMap fun i => [.Q3a i, .Q3b i, .Q3c i]
+def m3t6s1s : List M3T6BS1 :=
+  ([-1, 0, 1] : List Int).flatMap fun i => ([-1, 0, 1] : List Int).map fun j => .S1 i j
+
+#guard m3t6e2s.all fun a => m3t6e2s.all fun b => compare a b == m3t6e2cmp a b
+#guard m3t6q3s.all fun a => m3t6q3s.all fun b => compare a b == m3t6q3cmp a b
+#guard m3t6s1s.all fun a => m3t6s1s.all fun b => compare a b == m3t6s1cmp a b
+-- …and the samples really do exercise all three answers, so the agreement above is
+-- not the vacuous "both always say `eq`".
+#guard (m3t6q3s.flatMap fun a => m3t6q3s.map fun b => m3t6q3cmp a b).eraseDups.length == 3
+#guard (m3t6s1s.flatMap fun a => m3t6s1s.map fun b => m3t6s1cmp a b).eraseDups.length == 3
+
+/-! ### Direction (a) — hand-written read as DERIVED: the residual, measured
+
+    This is the silent-wrong direction, and it is closed for every body GHC
+    generates from ordinary Haskell. Probed adversarially rather than asserted:
+
+    * `compare a b = compare (fromEnum b) (fromEnum a)` on a `deriving Enum` type —
+      `$ccompare` `tagprim=False` (the primop stays inside `$cfromEnum`; nothing
+      inlines at `-O0`), so it is correctly read as hand-written.
+    * `{-# LANGUAGE MagicHash #-}` + `compare a b = compare (I# (dataToTag# b))
+      (I# (dataToTag# a))` — `$ccompare` `tagprim=True`. THAT ONE IS STILL
+      SILENT-WRONG: the reversed order is replaced by the structural one. Confirmed
+      by the byte-identity sweep, where that module (`OrdAdv`) is IDENTICAL under
+      both binaries.
+
+    Kept as a pinned residual rather than closed, for two reasons. Closing it needs
+    instance ORIGIN, which only the decl-plugin can supply (the same extension M2
+    named for `deriving` on a newtype); and the alternative available here — a shape
+    test on GHC's derived-`compare` code — is fragile in the wrong direction: a false
+    negative would make every genuinely derived `Ord` loud. It is also no worse than
+    the pre-task state, where every hand-written `Ord` was silently structural.
+
+### `ordRoute`, `emitDataDecl`, `emitInstance` — the three routes as guards -/
+
+def m3t6RevTy  : GHCType := .tyCon "Rev" []
+def m3t6RevHd  : String  := emitType m3t6RevTy
+def m3t6CmpVar : Var :=
+  { name := "$ccompare", unique := 11235,
+    ty := .tyFun m3t6RevTy (.tyFun m3t6RevTy (.tyCon "Ordering" [])), role := .id }
+-- A body with no tag primop: the user's own `compare`, whatever it computes.
+def m3t6Plain : Expr :=
+  .var { name := "GHC.Classes.compare", unique := 0, ty := .tyCon "_Unknown" [], role := .id }
+-- A body with one: GHC's derived `compare` on a ≥3-constructor enum.
+def m3t6TagPrim : Expr :=
+  .app (.var { name := "GHC.Prim.dataToTag#", unique := 0,
+               ty := .tyCon "_Unknown" [], role := .id }) m3t6Plain
+def m3t6Dfun : Var :=
+  { name := "$fOrdRev", unique := 3350, ty := .tyCon "_Unknown" [], role := .dict }
+def m3t6OrdInst : Instance :=
+  { className := "Ord", headTypes := [m3t6RevTy], dfunName := "$fOrdRev", dfunUnique := 3350 }
+
+-- HAND-WRITTEN: a standalone `$ccompare` with no primop, carrying the def name the
+-- emitted instance must point at.
+#guard ordRoute [.nonRec m3t6CmpVar m3t6Plain] m3t6RevHd == .handwritten "_dollar_ccompare_11235"
+-- DERIVED: tag primop ⇒ the data-block route, exactly as before this task.
+#guard ordRoute [.nonRec m3t6CmpVar m3t6TagPrim] m3t6RevHd == .derived
+-- UNSUPPORTED: `$ccompare` sharing a Rec group with the instance's own dict builder
+-- is GHC's class default (the `<=`-only minimal definition), not the user's body.
+#guard ordRoute [.rec_ [(m3t6Dfun, m3t6Plain), (m3t6CmpVar, m3t6Plain)]] m3t6RevHd == .unsupported
+-- …and the group's ORDER is irrelevant (the dfun came second in the real dump for
+-- some instances and first for others).
+#guard ordRoute [.rec_ [(m3t6CmpVar, m3t6Plain), (m3t6Dfun, m3t6Plain)]] m3t6RevHd == .unsupported
+-- A Rec group with no dict builder is still the user's own body: the test is
+-- membership of a `$f…`, never the group's head or its size.
+#guard ordRoute [.rec_ [(m3t6CmpVar, m3t6Plain)]] m3t6RevHd == .handwritten "_dollar_ccompare_11235"
+-- No `$ccompare` at all, and a `$ccompare` at ANOTHER head, both decline.
+#guard ordRoute [] m3t6RevHd == .unsupported
+#guard ordRoute [.nonRec m3t6CmpVar m3t6Plain] (emitType (.tyCon "Other" [])) == .unsupported
+
+-- The companion block, character-exact and in ONE place: `emitDataDecl` (derived)
+-- and `emitInstance` (hand-written) must not drift apart, since the whole coherence
+-- argument is that `<`/`≤`/`min`/`max` are functions of `compare` on both routes.
+#guard ordCompanionInsts "Rev" ==
+  "instance : LE Rev := leOfOrd\ninstance : LT Rev := ltOfOrd\n" ++
+  "instance : Min Rev := minOfLe\ninstance : Max Rev := maxOfLe"
+
+#guard emitInstance [] [] [] [.nonRec m3t6CmpVar m3t6Plain] m3t6OrdInst ==
+  some (s!"instance : Ord {m3t6RevHd} where\n  compare := _dollar_ccompare_11235\n\n"
+          ++ ordCompanionInsts m3t6RevHd)
+-- Derived and unsupported both emit nothing HERE (the data block, resp. nothing).
+#guard emitInstance [] [] [] [.nonRec m3t6CmpVar m3t6TagPrim] m3t6OrdInst == none
+#guard emitInstance [] [] [] [.rec_ [(m3t6Dfun, m3t6Plain), (m3t6CmpVar, m3t6Plain)]]
+         m3t6OrdInst == none
+
+def m3t6RevDecl : DataDecl :=
+  { name := "Rev", kind := "data",
+    ctors := [{ name := "Rev", fields := [{ name := "_", ty := .tyCon "Int" [] }] }] }
+-- Task 3's mandatory handoff: a hand-written-`Ord` type still gets `DecidableEq`
+-- (so `[BEq t]` in the `Ord` recipe is synthesizable) but NOT `Ord` and NOT the
+-- companions — those come with the instance.
+#guard emitDataDecl false false m3t6RevDecl (handwrittenOrd := true) ==
+  "inductive Rev where\n  | Rev : Int → Rev\nderiving Repr, Inhabited, DecidableEq"
+-- The derived route is unchanged, and the new parameter is trailing+defaulted so
+-- every pre-existing call site (the `emitDataDecl` guards at the top of this file
+-- included) keeps its exact meaning.
+#guard emitDataDecl false true m3t6RevDecl ==
+  "inductive Rev where\n  | Rev : Int → Rev\nderiving Repr, Inhabited, DecidableEq, Ord\n\n"
+    ++ ordCompanionInsts "Rev"
+
+-- The diagnostic, and its scope: only the unsupported route is reported.
+#guard unsupportedOrdInstances
+         { binds := [.rec_ [(m3t6Dfun, m3t6Plain), (m3t6CmpVar, m3t6Plain)]],
+           typeDecls := [m3t6RevDecl], instances := [m3t6OrdInst] } == ["Rev"]
+#guard unsupportedOrdInstances
+         { binds := [.nonRec m3t6CmpVar m3t6Plain], typeDecls := [m3t6RevDecl],
+           instances := [m3t6OrdInst] } == []
+#guard unsupportedOrdInstances
+         { binds := [.nonRec m3t6CmpVar m3t6TagPrim], typeDecls := [m3t6RevDecl],
+           instances := [m3t6OrdInst] } == []
+
+/-! ### Whole-program: which `$c` binds survive, and where the instance lands
+
+    The suppression is the other half of the fix — a hand-written head keeps exactly
+    ONE `$c` bind (`$ccompare`), and the derived head keeps none. Checked through
+    `emitFullProgram` so the section ORDER is checked with it: the `$ccompare` def
+    must precede the `instance : Ord`, which must precede the companions.
+
+    THE SECTION EXISTS BECAUSE TWO DESIGNS FAILED FIRST, both measured. Putting the
+    `$ccompare` def in the ordinary method-def section and the instance in the
+    instance section (the plan's reading of "mind the forward-visibility ordering")
+    is wrong in two ways at once:
+
+    * NESTED derived-`Ord` types. `data A = A Int deriving (Eq, Ord); data B = B A
+      deriving (Eq, Ord)` — both `.handwritten`, and B's compare body is
+      `compare a1 b1` AT TYPE `A`:
+
+          error: …/OrdNested.lean:58:19: failed to synthesize
+            Ord A
+
+      A REGRESSION on ordinary Haskell (pre-task both got data-block `deriving Ord`
+      in `sortDataDecls` order), and one no corpus fixture exhibits — the 30/4
+      byte-identity sweep could not have caught it.
+    * ANOTHER class's `$c` method using an order operator at such a head.
+      `instance Capped Frac where cap x y = min x y` in `OrdHandwritten.hs`:
+
+          error: …/OrdHandwritten.lean:144:4: failed to synthesize
+            Min Frac
+
+      (plus two downstream `decide` failures where the `sorry`-ed def blocked
+      reduction). This was first written up as an unfixable residual and it is not
+      one: it disappears for the same reason the nested case does.
+
+    Both are fixed by giving hand-written `Ord` its OWN section — per type,
+    `$ccompare` def then `instance : Ord T` then the companions — placed first in
+    `bodyRaw`, ordered by the emitted DATA order. It stays in `bodyRaw` rather than
+    joining the data block because the compare body pattern-matches constructors and
+    needs `resolveUserCtors`, which must never see the data block. Re-measured after
+    the move: `OrdNested` elaborates clean, `OrdHandwritten` is 0 errors/20
+    properties, and the 30 byte-identical fixtures did not move (a module with no
+    hand-written `Ord` gets an EMPTY `ordStr`, which `List.filter (· != "")` drops,
+    so `bodyRaw` is character-for-character what it was). -/
+
+def m3t6HandwrittenProg : Program :=
+  { binds := [.nonRec m3t6CmpVar m3t6Plain], typeDecls := [m3t6RevDecl],
+    instances := [m3t6OrdInst] }
+def m3t6DerivedProg : Program :=
+  { binds := [.nonRec m3t6CmpVar m3t6TagPrim], typeDecls := [m3t6RevDecl],
+    instances := [m3t6OrdInst] }
+
+#guard ((emitFullProgram [] m3t6HandwrittenProg).splitOn "def _dollar_ccompare_11235").length == 2
+#guard ((emitFullProgram [] m3t6HandwrittenProg).splitOn "instance : Ord Rev where").length == 2
+#guard ((emitFullProgram [] m3t6HandwrittenProg).splitOn
+         "deriving Repr, Inhabited, DecidableEq\n").length == 2
+-- Order: compare def, then the instance, then its companions.
+#guard ((emitFullProgram [] m3t6HandwrittenProg).splitOn "def _dollar_ccompare_11235").length == 2
+  && (((emitFullProgram [] m3t6HandwrittenProg).splitOn "def _dollar_ccompare_11235")[1]!.splitOn
+        "instance : Ord Rev where").length == 2
+  && ((((emitFullProgram [] m3t6HandwrittenProg).splitOn "instance : Ord Rev where")[1]!.splitOn
+        "instance : LE Rev := leOfOrd").length == 2)
+-- DERIVED: no method def at all, `Ord` on the inductive, companions in the data
+-- block — byte-for-byte the pre-task treatment.
+#guard ((emitFullProgram [] m3t6DerivedProg).splitOn "_dollar_ccompare").length == 1
+#guard ((emitFullProgram [] m3t6DerivedProg).splitOn
+         "deriving Repr, Inhabited, DecidableEq, Ord").length == 2
+#guard ((emitFullProgram [] m3t6DerivedProg).splitOn "instance : Ord Rev where").length == 1
+
+/-! ### `M3T6R` — TWO `BEq` routes, one answer, in the NEW section order
+
+    M3 Task 3 measured this for a type whose `Ord` came from `deriving`; Task 6 makes
+    the `Ord` an instance BLOCK, which is a different elaboration order, and the
+    hazard is unchanged: a hand-written cross-multiply `Eq` (emitted `instance : BEq
+    T`) alongside the `deriving DecidableEq` that Task 6 emits for a hand-written-Ord
+    type gives core's `instBEqOfDecidableEq` a second candidate. If the structural
+    one won, every `Eq`-constrained call at that type would silently report
+    structural equality.
+
+    It does not win: `#synth BEq` answers the local instance. Note what did NOT
+    change — `fracEq_crossMultiplies` in the fixture holds under BOTH binaries, so
+    it is a no-regression check, not a discriminator. What changed is the REASON the
+    `DecidableEq` route exists (`deriving Ord` before, Task 6's explicit flag now),
+    which is why the selection is re-pinned here rather than assumed to carry over. -/
+
+inductive M3T6R where
+  | mk : Int → Int → M3T6R
+deriving Repr, Inhabited, DecidableEq
+
+def m3t6RCmp : M3T6R → M3T6R → Ordering := fun a b => match a, b with
+  | .mk p q, .mk r s => compare (p * s) (r * q)
+def m3t6REq : M3T6R → M3T6R → Bool := fun a b => match a, b with
+  | .mk p q, .mk r s => p * s == r * q
+
+-- The emitter's own order: data + `deriving`, then the `$c` defs, then the
+-- instances (`Ord` first, then its companions).
+instance : Ord M3T6R where compare := m3t6RCmp
+instance : LE M3T6R := leOfOrd
+instance : LT M3T6R := ltOfOrd
+instance : Min M3T6R := minOfLe
+instance : Max M3T6R := maxOfLe
+instance : BEq M3T6R where beq := m3t6REq
+
+-- The full `Ord`-constraint recipe (M3 Task 3), at a head whose `Ord` is an
+-- instance block: every binder still resolves — `DecidableLT`/`DecidableLE` come
+-- from core's `DecidableRel (@LT.lt α ltOfOrd)` matching `ltOfOrd` literally, which
+-- is why the companions must be spelled that way and not inlined.
+def m3t6OrdAt {t : Type} [Ord t] [LT t] [LE t] [DecidableLT t] [DecidableLE t]
+    [Min t] [Max t] [BEq t] (x y : t) : Bool := (x == y) || decide (x < y)
+
+-- 1/2 == 2/4 under cross-multiply (structural: false) — the hand-written `BEq` wins.
+#guard ((M3T6R.mk 1 2) == (M3T6R.mk 2 4)) == true
+#guard m3t6OrdAt (M3T6R.mk 1 2) (M3T6R.mk 2 4) == true
+-- 1/2 > 1/3 under cross-multiply (structural: `1 = 1`, then `2 < 3` ⇒ LT) — the
+-- hand-written ORDER wins, through the constrained call.
+#guard m3t6OrdAt (M3T6R.mk 1 2) (M3T6R.mk 1 3) == false
+#guard m3t6OrdAt (M3T6R.mk 1 3) (M3T6R.mk 1 2) == true
+-- The companions follow `compare`, so `min` disagrees with the structural one too.
+#guard (min (M3T6R.mk 1 2) (M3T6R.mk 1 3)) == M3T6R.mk 1 3
+
+/-! ### `dfunDumpUnique` — the two channels do not number uniques the same way
+
+    The reviewer's hardening nit ("`findBind` at the dfun lookup resolves by NAME
+    only, ignoring `i.dfunUnique` that's right there") turned out NOT to be a
+    no-op: matching the two raw resolved NOTHING, and `SuperClass.hs`'s
+    `instance : Container Bag` disappeared from the emitted output — the one
+    non-Ord diff in the whole byte-identity sweep, which is how it was caught.
+
+    The instance channel's unique is the decl plugin's `getKey (nameUnique …)`,
+    GHC's packed 64-bit key `(tag << 56) ||| index`; a bind's unique is the shim's
+    `BinderId (Unique _ n) → n`, the index alone. `$fOrdLevel` in
+    `/tmp/transpile-SuperClass.json` is the whole discovery in one pair of numbers.
+    Verified across all 40 dumps in `/tmp/transpile-*.json`: 60/60 instances match
+    after masking, 0 mismatches, high byte always `114` (`'r'`); and 0 dumps contain
+    two top-level binds sharing a dfun name, which is why this is hardening. The
+    caller falls back to the name-only lookup when the keyed one misses, so a future
+    renumbering degrades to today's behaviour instead of dropping every instance. -/
+
+#guard dfunDumpUnique 8214565720323795259 == 10555
+-- Already-in-dump-space values (what this file's own `Instance` literals use, and
+-- what the fallback path would see) pass through unchanged.
+#guard dfunDumpUnique 9904 == 9904
+#guard dfunDumpUnique 0 == 0
+
+/-! ### Regression — what this task could have moved, and what it did
+
+    BYTE-IDENTITY, by the Task 4/reviewer method (parent binary stashed and saved,
+    both binaries run over the SAME dumps with the SAME environment) — NOT against
+    on-disk `Generated/` snapshots, which M3 Task 5's review proved stale for at
+    least one file. Final pass: whole corpus re-transpiled first so every dump is
+    current, 36 dumps in `/tmp/transpile-*.json`:
+
+    * **30 IDENTICAL** (stdout AND stderr): `Arithmetic`, `BothNotations`,
+      `BuiltinConstraints`, `CaseBinder`, `DefaultMethods`, `Fib`, `FibComplex`,
+      `ListBasics`, `ListLibrary`, `ListLiterals`, `LocalRec`, `NewtypeBasic`,
+      `NumOrd`, `OperatorCommons`, `OperatorShadow`, `OrdAdv`, `PartialHead`,
+      `PreludeNames`, `Ratio`, `RatioCeilTruncate`, `RatioComparisons`,
+      `RatioFalseTest`, `RecordClient`, `RecordOps`, `SuperClass`, `TupleBasics`,
+      `TupleTriple`, `TwoClassesDistinctMethods`, `UserClass`, `UserClassNeq`.
+      `SuperClass` is identical only after the `dfunDumpUnique` fix — see that block.
+      `NumOrd` and `Ratio` are the two that would have moved had the `Ord` change
+      over-fired: `NumOrd` uses the `Ord` operators monomorphically at `Int` (no
+      instance to route), and `Ratio`'s `CustomRatio`/`CustomRatioSOP` have
+      hand-written `Eq` and NO `Ord` at all. `OrdAdv` is direction (a)'s residual —
+      identical BECAUSE the misclassification is still there.
+    * **4 legitimately DIFFERENT**, every one an `Ord`-route change and nothing else
+      (diffed line-kind by line-kind): `deriving …, Ord` dropped, a `$ccompare` def
+      added, `instance : Ord T` + the four companions added. `OrdInstance` (`Coin`,
+      the 2-ctor enum flip — see the boundary block) is the only CORPUS fixture among
+      them; `OrdHandwritten` is this task's new fixture, `OrdProbe`/`OrdBoundary` its
+      scratch probes. An earlier pass over a wider set of then-present dumps (before
+      /tmp was purged of them) added `PairProbe` and `ShowSuperProbe` to the
+      IDENTICAL column and `DefaultUnderOrd`, `OrdHwCapped`, `OrdHwDirect` (the
+      reviewer's hand-written-`Ord` probes) to this one.
+    * **2 REFUSALS intact**, same exit code, no file written, byte-identical stderr
+      under both binaries: `NewtypeInstances` (newtype instance head) and
+      `UserClassNeqWithEq` (Task 2's builtin-method collision). `TwoClassesSameMethod`
+      is still rejected by GHC itself, before the transpiler runs.
+
+    `lake build GhcCoreToLean.Generated.<M>` green (0 errors) after the change on 25
+    modules, the whole corpus re-transpiled with the final binary first:
+    `OrdHandwritten`, `OrdInstance`, `SuperClass`, `BuiltinConstraints`,
+    `DefaultMethods`, `Ratio`, `RecordOps`, `NewtypeBasic`, `ListLibrary`,
+    `TupleBasics`, `Arithmetic`, `NumOrd`, `PartialHead`, `UserClassNeq`,
+    `TwoClassesDistinctMethods`, `OperatorShadow`, `PreludeNames`, `CaseBinder`,
+    `ListBasics`, `ListLiterals`, `LocalRec`, `Fib`, `FibComplex`, `RecordClient`,
+    `OperatorCommons`. Plus the off-corpus `OrdNested` probe (`lake env lean`, clean
+    — it is the nested case the section fix exists for). The remaining
+    known-red fixtures (`UserClass`'s falsified theorem, `TupleTriple`,
+    `BothNotations`, `RatioCeilTruncate`, `RatioComparisons`, `RatioFalseTest`) are
+    byte-identical, so an identical emitted file has an identical build result and
+    every one of those reds predates this task.
+
+    ONE stderr line is NEW, and only for the new fixture: `OrdHandwritten.hs`'s
+    `Ord MinDef` warning (`unsupportedOrdInstances`). No corpus module has a
+    `<=`-only instance, so no other fixture's stderr moved. -/
+
 end GhcCoreToLean.Tests
