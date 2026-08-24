@@ -4366,9 +4366,33 @@ def m3t5ContainerInst : Instance :=
         data Q3 = Q3a Int | Q3b Int | Q3c Int          tagprim=False  → handwritten
         data S1 = S1 Int Int                           tagprim=False  → handwritten
 
-    (all `deriving (Eq, Ord)`). So the DERIVED route is now reached ONLY by an
-    all-nullary enum with ≥3 constructors; everything else — including
-    `OrdInstance.hs`'s `data Coin = Heads | Tails deriving (Eq, Ord)` — takes the
+    (all `deriving (Eq, Ord)`).
+
+    THE RULE THIS TABLE SUPPORTS IS NOT THE ONE IT FIRST CLAIMED. Written up as
+    "the derived route is reached ONLY by an all-nullary enum with ≥3
+    constructors", it was FALSE, and the six shapes above cannot tell: none of
+    them mixes ≥3 nullary constructors with a non-nullary one. Five more shapes,
+    `OrdTag` (scratch), settle it:
+
+        data N3   = N1 | N2 | N3                3 nullary + 0   tagprim=True
+        data T2   = M1 | M2                     2 nullary + 0   tagprim=False
+        data Mix  = X1 | X2 | X3 Int            2 nullary + 1   tagprim=False
+        data Mix2 = Y1 | Y2 | Y3 | Y4 Int       3 nullary + 1   tagprim=True
+        data Mix3 = Z1 Int | Z2 Int | Z3 Int    0 nullary + 3   tagprim=False
+
+    `Mix2` is the counterexample: not all-nullary, yet DERIVED. The rule is **≥3
+    NULLARY constructors, independent of how many non-nullary ones there are**.
+
+    This matters beyond tidiness, twice over. The soundness argument below
+    ("derived read as hand-written is sound") has to cover every shape that
+    actually reaches the hand-written route, and its scope is "≤2 nullary
+    constructors", not "not an enum". And `Mix2`/`Quad` is exactly the A1 shape
+    (`OrdSectionOrder.hs` (2), `M3T6O` below): a DERIVED type whose FIELD type is
+    hand-written-route, which needs the field's instance emitted before the
+    `deriving Ord` on the inductive.
+
+    So everything with ≤2 nullary constructors — including `OrdInstance.hs`'s
+    `data Coin = Heads | Tails deriving (Eq, Ord)` — takes the
     hand-written route with GHC's own derived body. The plan's byte-identity
     expectation ("OrdInstance … should stay derived/identical") is therefore WRONG,
     and `Generated/OrdInstance.lean` legitimately changed: `deriving …, Ord` +
@@ -4477,7 +4501,7 @@ def m3t6OrdInst : Instance :=
 
 -- HAND-WRITTEN: a standalone `$ccompare` with no primop, carrying the def name the
 -- emitted instance must point at.
-#guard ordRoute [.nonRec m3t6CmpVar m3t6Plain] m3t6RevHd == .handwritten "_dollar_ccompare_11235"
+#guard ordRoute [.nonRec m3t6CmpVar m3t6Plain] m3t6RevHd == .handwritten "_dollar_ccompare_11235" false
 -- DERIVED: tag primop ⇒ the data-block route, exactly as before this task.
 #guard ordRoute [.nonRec m3t6CmpVar m3t6TagPrim] m3t6RevHd == .derived
 -- UNSUPPORTED: `$ccompare` sharing a Rec group with the instance's own dict builder
@@ -4488,7 +4512,7 @@ def m3t6OrdInst : Instance :=
 #guard ordRoute [.rec_ [(m3t6CmpVar, m3t6Plain), (m3t6Dfun, m3t6Plain)]] m3t6RevHd == .unsupported
 -- A Rec group with no dict builder is still the user's own body: the test is
 -- membership of a `$f…`, never the group's head or its size.
-#guard ordRoute [.rec_ [(m3t6CmpVar, m3t6Plain)]] m3t6RevHd == .handwritten "_dollar_ccompare_11235"
+#guard ordRoute [.rec_ [(m3t6CmpVar, m3t6Plain)]] m3t6RevHd == .handwritten "_dollar_ccompare_11235" false
 -- No `$ccompare` at all, and a `$ccompare` at ANOTHER head, both decline.
 #guard ordRoute [] m3t6RevHd == .unsupported
 #guard ordRoute [.nonRec m3t6CmpVar m3t6Plain] (emitType (.tyCon "Other" [])) == .unsupported
@@ -4727,5 +4751,447 @@ def m3t6OrdAt {t : Type} [Ord t] [LT t] [LE t] [DecidableLT t] [DecidableLE t]
     ONE stderr line is NEW, and only for the new fixture: `OrdHandwritten.hs`'s
     `Ord MinDef` warning (`unsupportedOrdInstances`). No corpus module has a
     `<=`-only instance, so no other fixture's stderr moved. -/
+
+/-! ## `M3T6O` — WHERE the `Ord` pieces land, and the RECURSIVE `compare`
+
+    The routing above was right; the LAYOUT it shipped with was not. Five defects,
+    all on ordinary Haskell, none reachable from the then-corpus — which is exactly
+    why the byte-identity sweep above passed while they were present. Each is
+    reproduced as a numbered section of `examples/haskell/OrdSectionOrder.hs`, and
+    the A/B below is three-way: `4e6ac8c~1` (before Task 6, "parent"), `4e6ac8c`
+    (Task 6 as first shipped, "T6"), and this commit ("fix").
+
+    ### C1 — plain `deriving Ord` on a RECURSIVE ADT emitted no `Ord` at all
+
+    `data Tree = Leaf | Node Tree Tree deriving (Eq, Ord)`, no user instance
+    anywhere. 2 constructors ⇒ no tag primop ⇒ not `.derived`; and GHC's derived
+    `compare` recurses as `compare @Tree $fOrdTree`, so `$ccompare` sits in
+    `Rec ['$fOrdTree', '$cmax', '$c>=', '$c>', '$c<=', '$c<', '$cmin', '$ccompare']`
+    — the same group shape a `<=`-only minimal instance produces. `inDictRec`
+    tested only MEMBERSHIP, so both classified `.unsupported`.
+
+    T6: `warning: instance `Ord Tree` is DROPPED` and `treeLt` ⇒
+    `error: failed to synthesize LT Tree`. Blast radius: every recursive ADT with
+    ≤2 nullary constructors and `deriving Ord`, plus every hand-written
+    self-recursive `compare`.
+
+    The two bodies differ in WHAT they take from the dictionary, which is what
+    `ownDictOpsAtHead` reads (post-`Lower` spines, verbatim):
+
+        Tree     (derived, recursive)   compare @Tree $fOrdTree a1 b1
+                                        ⇒ [GHC.Classes.compare]
+        MinDef   (`<=`-only default)    == @MinDef ($p1Ord @MinDef $fOrdMinDef) …
+                                        <= @MinDef $fOrdMinDef …
+                                        ⇒ [GHC.Classes.==, GHC.Classes.<=]
+
+    Only `compare` can be discharged (it is the def being emitted), so exactly the
+    singleton set routes to `.handwritten … (selfRec := true)` and
+    `retargetSelfCompare` points the call at the def's own name. Monotone: every
+    other body lands where it did.
+
+    Parent on shape (1) is NOT clean either, and the reason is worth recording:
+    Lean's own `deriving Ord` on a recursive inductive is not reducible by
+    `decide`, so all five `treeCompare`/`treeLt` ground theorems failed with
+    `Tactic decide failed … reduction got stuck`. The emitted structural def
+    reduces. So fix > parent > T6 here, not merely fix ≥ parent.
+
+    ### A1/A2/B2/B3 — the section had to move INTO the data block
+
+    Four separate failures, one cause: `ordStr` was the first thing in `bodyRaw`,
+    i.e. after the whole data block and before everything else. Measured at T6:
+
+        (2) A1  data Inner = Inner Int Int deriving (Eq,Ord)     -- 0 nullary ⇒ hand-written
+                data Quad = QA|QB|QC|QD Inner deriving (Eq,Ord)  -- 3 nullary ⇒ DERIVED
+                ⇒ error: failed to synthesize Ord Inner
+                  (at `deriving …, Ord` ON `inductive Quad`)
+        (5) A2  class-body DEFAULT using `min` at a hand-written-`Ord` head
+                ⇒ error: failed to synthesize Min B
+                  error: Fields missing: `bestB`
+        (3) B2  `compare (Beta x) (Beta y) = compare (Alpha x) (Alpha y)`
+                ⇒ error: failed to synthesize Ord Alpha
+        (4) B3  cross-multiply `Eq` + `compare` testing `x == y` at its own type
+                ⇒ NO diagnostic; `decide` PROVED
+                  `fracCompare (Frac2 1 2) (Frac2 2 4) = Ordering.eq` FALSE
+
+    A1 cannot be fixed by reordering sections at all: `Quad`'s `Ord` IS its
+    `inductive`'s `deriving` clause, so `Inner`'s instance has to precede an
+    `inductive`. Hence splicing — each type's `Ord` block goes next to its own
+    `inductive`, which `sortDataDecls` has already placed after its field types.
+    A2 then falls out (class decls are last in the data block), and B2 needs the
+    sort to see one more edge kind (`localTypesInExpr`, via `extraDeps`).
+
+    B3 is the silent one, and it contradicted `M3T6R` directly. "The explicit
+    instance wins" is about DECLARATION ORDER — Lean takes the last-declared of
+    equal candidates — so it held at every ordinary use site (both instances
+    precede them) and FAILED inside `$ccompare`, where only the `deriving
+    DecidableEq` that Task 6 itself added was in scope. Fixed by splicing the
+    user's `BEq` ahead of the compare def (`eqHoistHeads`), NOT by dropping the
+    `DecidableEq`: that also supplies `Decidable (a = b)`, and it is the only `BEq`
+    route for a hand-written-`Ord` type with no hand-written `Eq`.
+
+    ### B1 — a compare body calling a user top-level function stays LOUD
+
+    `instance Ord V where compare x y = compare (norm x) (norm y)`. T6 emitted
+    `Unknown identifier norm_2853`: TWO bugs, and the second is why ordering alone
+    was never the whole story. `emitProgramWith … [.nonRec v e] ctorNames` passed a
+    ONE-BIND program, so `collectTopNames` saw only `$ccompare` and the reference
+    got a local-id suffix. Fixed (`splicedTop` is the whole program's name set), so
+    it now emits `norm` — still a forward reference, because user binds are the last
+    section and hoisting them would move this section a third time.
+
+    NOT a regression against parent under this project's own ordering: parent
+    "worked" by DROPPING the hand-written `compare` and installing Lean's
+    structural order silently, which is the failure mode M3 Task 6 exists to
+    remove. Loud-with-the-right-name plus a named transpiler warning
+    (`ordForwardRefs`) is strictly better than silent-wrong. Residual, documented,
+    warned — not a hole.
+
+    ### Also corrected in this commit
+
+    * the tag-primop boundary (the block above): ≥3 NULLARY constructors,
+      independent of non-nullary ones; `Mix2` is the counterexample to the
+      "all-nullary" claim, and A1's shape is that very cell of the table.
+    * `dfunMethodBinds`' `orElse`: a SILENT degradation to name-only matching, not
+      a loud one. Unreachable today (65/65 instances match, tag always 114, and
+      GHC's `mkUnique` masks the index at construction), but the comment implied a
+      diagnostic that does not exist.
+    * `refId` vs `defNameId` disagreed for `$c…` names: `defNameId` spells them
+      with their unique, `refId`'s top-level arm spelled them bare. Latent until
+      `splicedTop` made `$c` names reachable as references; `refId` now exempts
+      them. The corpus is byte-identical over that change, so nothing depended on
+      the broken spelling.
+    * the resolution-pipeline header: pass 1 has FOUR sites now, and pass 3 runs at
+      three of them — the spliced blocks need the ctor pass while sitting inside the
+      data block, which is only sound because each piece is resolved separately and
+      joined already-resolved.
+
+    ### Byte-identity sweep for THIS commit (two-binary method)
+
+    Both binaries built from this tree (`4e6ac8c` and `4e6ac8c`+fix), every
+    `examples/haskell/*.hs` transpiled by each, `.lean` and stderr diffed:
+
+    * **27 of 28 emitted modules BYTE-IDENTICAL.** The one that moved is
+      `OrdHandwritten.lean`, the only corpus fixture with a hand-written `Ord` — its
+      four `Ord` blocks moved out of the leading body section and in among the
+      `inductive`s (`Rank`/`Frac`/`Rev`/`class Capped` relocate; no line of any
+      block's CONTENT changes). It builds clean, all 20 theorems hold, the two
+      quantified ones still print `✅ Valid`.
+    * **stderr** identical everywhere except `OrdHandwritten`'s `Ord MinDef`
+      warning, whose TEXT is the rewritten `unsupportedOrdWarning` (same instance,
+      same route, same drop).
+    * **3 refusals intact**, same exit codes, same messages: `NewtypeInstances`
+      (newtype instance head), `UserClassNeqWithEq` (Task 2's builtin-method
+      collision), `TwoClassesSameMethod` (rejected by GHC itself).
+    * `SuperClass.lean` still carries `instance : Container Bag` (Task 5's
+      positional attribution and the `dfunDumpUnique` match are untouched).
+    * the `refId` change (a `$c` name is no longer spelled bare when it is also a
+      top-level name) is INSIDE that byte-identical set, which is the evidence that
+      no corpus body depended on the broken spelling.
+    * `lake build` green over the whole project, this file's guards included.
+
+    The reviewer's five probes, A/B'd against `4e6ac8c~1` as well, are the
+    off-corpus half: `OrdMixProbe` (C1+A1), `OrdOrderProbe` (B2+A2), `OrdOrder2`
+    (B2, reverse dump order), `OrdEqInCmp` (B3), `OrdFwdProbe` (B1). All clean
+    under the fix except `OrdFwdProbe`, which is the documented B1 residual (loud,
+    warned). `OrdSectionOrder.hs` commits all five shapes as a corpus fixture
+    (15 ground `decide` theorems, all green); against `4e6ac8c~1` it reports 8
+    errors, THREE of them `decide` PROVED FALSE — `betaLt` twice (B2's reversed
+    order replaced by Lean's structural one) and `fracCompare_agreesWithEq` (B3) —
+    and against `4e6ac8c` it reports 14, four of them `failed to synthesize`.
+
+    ### One dump quirk found while building this, and where it is handled
+
+    A `case` binder arrives as `wild` with a shim-assigned unique, and its recorded
+    TYPE is not reliably the scrutinee's: in `OrdSectionOrder`'s `Frac2` compare,
+    `== @Frac2 $fEqFrac2 x wild` has `x : Frac2` and `wild : Alpha` — `Alpha` being
+    an unrelated decl in the same module. Reading "some argument's type" therefore
+    hoisted `Alpha`'s `BEq` as well. Harmless as an ordering (the instance is still
+    emitted exactly once) but not harmless in general: a spurious hoist moves a body
+    into the data block, where a call to a top-level function that used to resolve
+    becomes B1's forward reference. `firstVarArgTy` reads the FIRST value argument
+    only — the dispatch-type convention `methodHeadStr` already uses — and the fix
+    is verified by the emitted set: `Frac2` alone is hoisted, `Alpha`/`Beta`/`Inner`
+    keep their `BEq` in the ordinary instance section. The sort's reference graph
+    (`localTypesInExpr`) still reads every binder type, deliberately: an extra EDGE
+    only constrains the order, and its worst case is a cycle that
+    `sortDataDecls` already handles loudly. -/
+
+-- ### `ordRoute`'s Rec-group split, and the ops that drive it.
+def m3t6ORevTy : GHCType := .tyCon "Rev" []
+def m3t6OHd : String := emitType m3t6ORevTy
+def m3t6OCmpVar : Var :=
+  { name := "$ccompare", unique := 900,
+    ty := .tyFun m3t6ORevTy (.tyFun m3t6ORevTy (.tyCon "Ordering" [])), role := .id }
+def m3t6ODfun : Var :=
+  { name := "$fOrdRev", unique := 901, ty := .tyCon "_Unknown" [], role := .dict }
+def m3t6OArg : Var := { name := "a", unique := 902, ty := m3t6ORevTy, role := .id }
+def m3t6OIntArg : Var := { name := "n", unique := 903, ty := .tyCon "Int" [], role := .id }
+def m3t6OOp (n : Name) : Var :=
+  { name := n, unique := 904, ty := .tyCon "_Unknown" [], role := .id }
+/-- `op x y` with both arguments the same `Var` — enough for every test here, since
+    the reading is "some argument is a `Var` of the head type". -/
+def m3t6OApp (op : Name) (arg : Var) : Expr :=
+  .app (.app (.var (m3t6OOp op)) (.var arg)) (.var arg)
+
+-- Self-recursion ONLY ⇒ emittable, and the route says so.
+-- (`ownDictOpsAtHead` may report an op twice — it re-analyses the partial spine —
+-- so `ordRoute` dedups; the guards do the same.)
+#guard (ownDictOpsAtHead m3t6OHd (m3t6OApp "GHC.Classes.compare" m3t6OArg)).eraseDups
+         == ["GHC.Classes.compare"]
+#guard ordRoute [.rec_ [(m3t6ODfun, .var m3t6OArg),
+                        (m3t6OCmpVar, m3t6OApp "GHC.Classes.compare" m3t6OArg)]] m3t6OHd
+         == .handwritten "_dollar_ccompare_900" true
+-- The `<=`-only class default: `==` and `<=` at the head, both off its own dict.
+#guard ordRoute [.rec_ [(m3t6ODfun, .var m3t6OArg),
+                        (m3t6OCmpVar,
+                         .app (m3t6OApp "GHC.Classes.==" m3t6OArg)
+                              (m3t6OApp "GHC.Classes.<=" m3t6OArg))]] m3t6OHd
+         == .unsupported
+-- `compare` PLUS another own-dict op is unsupported too: only `compare` can be
+-- redirected, so a half-emitted instance is refused rather than shipped.
+#guard ordRoute [.rec_ [(m3t6ODfun, .var m3t6OArg),
+                        (m3t6OCmpVar,
+                         .app (m3t6OApp "GHC.Classes.compare" m3t6OArg)
+                              (m3t6OApp "GHC.Classes.<=" m3t6OArg))]] m3t6OHd
+         == .unsupported
+-- `compare` at ANOTHER type is not a dictionary dependency — which is what every
+-- derived `compare` on a type WITH FIELDS contains (`compare @Int` on each field).
+#guard (ownDictOpsAtHead m3t6OHd (m3t6OApp "GHC.Classes.compare" m3t6OIntArg)).eraseDups == []
+#guard ordRoute [.rec_ [(m3t6ODfun, .var m3t6OArg),
+                        (m3t6OCmpVar, m3t6OApp "GHC.Classes.compare" m3t6OIntArg)]] m3t6OHd
+         == .unsupported
+-- A LOCAL function applied at the head type is not one either (dotted names only).
+#guard (ownDictOpsAtHead m3t6OHd (m3t6OApp "norm" m3t6OArg)).eraseDups == []
+-- Outside a dict group nothing changes: still `.handwritten`, still not `selfRec`.
+#guard ordRoute [.nonRec m3t6OCmpVar (m3t6OApp "GHC.Classes.compare" m3t6OArg)] m3t6OHd
+         == .handwritten "_dollar_ccompare_900" false
+
+-- `firstVarArgTy`: the DISPATCH type, not "some argument's". The second guard is
+-- the `wild`-case-binder quirk in miniature — a later argument whose recorded type
+-- is another decl's must not be read as the instantiation.
+#guard firstVarArgTy [.var m3t6OArg, .var m3t6OIntArg] == some m3t6OHd
+#guard firstVarArgTy [.var m3t6OIntArg, .var m3t6OArg] == some (emitType (.tyCon "Int" []))
+#guard firstVarArgTy [.lit (.litInt 0), .var m3t6OArg] == some m3t6OHd
+#guard firstVarArgTy ([] : List Expr) == none
+#guard firstVarArgTy [.lit (.litInt 0)] == none
+-- …so an op whose FIRST argument is at another type is not an own-dict dependency
+-- even when a later argument's recorded type happens to be the head.
+#guard (ownDictOpsAtHead m3t6OHd
+          (.app (.app (.var (m3t6OOp "GHC.Classes.==")) (.var m3t6OIntArg))
+                (.var m3t6OArg))).eraseDups == []
+
+-- ### The retarget: the class op becomes the def's own binder, and only at the head.
+#guard emitExpr [] [] (retargetSelfCompare m3t6OHd m3t6OCmpVar
+                        (m3t6OApp "GHC.Classes.compare" m3t6OArg))
+         == "((_dollar_ccompare_900) (a_902)) (a_902)"
+-- At another type the body is untouched (the builtin `compare` survives).
+#guard emitExpr [] [] (retargetSelfCompare m3t6OHd m3t6OCmpVar
+                        (m3t6OApp "GHC.Classes.compare" m3t6OIntArg))
+         == "((compare) (n_903)) (n_903)"
+-- `refId` spells a `$c` name with its unique even when it IS a top-level name —
+-- which is what makes the line above agree with `defNameId`.
+#guard refId ["$ccompare"] m3t6OCmpVar == "_dollar_ccompare_900"
+#guard refId ["norm"] { name := "norm", unique := 7, ty := .tyCon "Int" [], role := .id }
+         == "norm"
+
+-- ### The sort's new edge: a compare-body reference, not a field.
+def m3t6OAlpha : DataDecl :=
+  { name := "Alpha", kind := "data",
+    ctors := [{ name := "Alpha", fields := [{ name := "_", ty := .tyCon "Int" [] }] }] }
+def m3t6OBeta : DataDecl :=
+  { name := "Beta", kind := "data",
+    ctors := [{ name := "Beta", fields := [{ name := "_", ty := .tyCon "Int" [] }] }] }
+-- No field edge between them, so the field graph keeps the dump order…
+#guard (sortDataDecls [m3t6OBeta, m3t6OAlpha]).map (·.name) == ["Beta", "Alpha"]
+-- …and the reference edge moves `Alpha` ahead of the type whose `compare` uses it.
+#guard (sortDataDecls [m3t6OBeta, m3t6OAlpha]
+          (fun n => if n == "Beta" then ["Alpha"] else [])).map (·.name)
+         == ["Alpha", "Beta"]
+-- A self-edge and an unknown name are both ignored (totality: still a permutation).
+#guard (sortDataDecls [m3t6OBeta, m3t6OAlpha]
+          (fun _ => ["Beta", "Alpha", "Nope"])).map (·.name) == ["Beta", "Alpha"]
+
+-- ### `localTypesInExpr`: BOTH channels, because a ctor `Var` has no type.
+def m3t6OCtorVar : Var :=
+  { name := "Alpha", unique := 910, ty := .tyCon "_Unknown" [], role := .id }
+def m3t6OOwner : Name → Option Name := fun c => if c == "Alpha" then some "Alpha" else none
+-- Type channel: a binder of type `Alpha`.
+#guard localTypesInExpr ["Alpha", "Beta"] m3t6OOwner "Beta"
+         (.var { name := "p", unique := 911, ty := .tyCon "Alpha" [], role := .id })
+         == ["Alpha"]
+-- Ctor channel: `Alpha x` dumps the ctor as `_Unknown`, so ONLY the name locates it.
+#guard localTypesInExpr ["Alpha", "Beta"] m3t6OOwner "Beta" (.var m3t6OCtorVar) == ["Alpha"]
+#guard localTypesInExpr ["Alpha", "Beta"] (fun _ => none) "Beta" (.var m3t6OCtorVar) == []
+-- Alt patterns count too, and the type's OWN name never becomes its own dependency.
+#guard localTypesInExpr ["Alpha", "Beta"] m3t6OOwner "Beta"
+         (.case_ (.var m3t6OCtorVar) m3t6OArg (.tyCon "Int" [])
+           [.mk (.dataCon "Alpha") [] (.lit (.litInt 0))])
+         == ["Alpha"]
+#guard localTypesInExpr ["Alpha", "Beta"] m3t6OOwner "Alpha" (.var m3t6OCtorVar) == []
+
+-- ### `opArgTypes`: at which types does a body call `==`?
+#guard opArgTypes ["GHC.Classes.=="] (m3t6OApp "GHC.Classes.==" m3t6OArg) == [m3t6OHd]
+#guard opArgTypes ["GHC.Classes.=="] (m3t6OApp "GHC.Classes.<=" m3t6OArg) == []
+#guard opArgTypes ["GHC.Classes.=="] (m3t6OApp "GHC.Classes.==" m3t6OIntArg)
+         == [emitType (.tyCon "Int" [])]
+
+-- ### Whole-program layout. One `Ord` block per type, next to its own inductive.
+def m3t6OAlphaTy : GHCType := .tyCon "Alpha" []
+def m3t6OAlphaHd : String := emitType m3t6OAlphaTy
+def m3t6OAlphaCmp : Var :=
+  { name := "$ccompare", unique := 920,
+    ty := .tyFun m3t6OAlphaTy (.tyFun m3t6OAlphaTy (.tyCon "Ordering" [])), role := .id }
+def m3t6OAlphaOrdInst : Instance :=
+  { className := "Ord", headTypes := [m3t6OAlphaTy], dfunName := "$fOrdAlpha",
+    dfunUnique := 0 }
+def m3t6OAlphaEq : Var :=
+  { name := "$c==", unique := 921,
+    ty := .tyFun m3t6OAlphaTy (.tyFun m3t6OAlphaTy (.tyCon "Bool" [])), role := .id }
+def m3t6OAlphaEqInst : Instance :=
+  { className := "Eq", headTypes := [m3t6OAlphaTy], dfunName := "$fEqAlpha", dfunUnique := 0 }
+/-- `Alpha` with a hand-written `Ord` whose `compare` body tests `==` at `Alpha`
+    (the B3 shape), plus the hand-written `Eq` that `==` must resolve to. -/
+def m3t6OAlphaArg : Var := { name := "p", unique := 922, ty := m3t6OAlphaTy, role := .id }
+/-- One user class, so the A2 invariant ("every spliced block precedes the class
+    decls") is checkable. Its body needs no `:=` default: A2 was a class-body
+    default ordering a hand-written-`Ord` head, but the property that fixes it is
+    purely positional, and pinning the position is what stops a future edit to the
+    data-block assembly from reinstating `failed to synthesize Min B`. -/
+def m3t6OClass : ClassDecl :=
+  { name := "Tag", tyVars := ["a"], supers := [],
+    methods := [{ name := "tg", ty := .tyFun (.tyVar "a") m3t6OAlphaTy, hasDefault := false }] }
+def m3t6OProg : Program :=
+  { binds := [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
+              .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)],
+    typeDecls := [m3t6OAlpha],
+    classDecls := [m3t6OClass],
+    instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] }
+def m3t6OOut : String := emitFullProgram [] m3t6OProg
+
+-- The three pieces exist exactly once each…
+#guard (m3t6OOut.splitOn "inductive Alpha where").length == 2
+#guard (m3t6OOut.splitOn "instance : Ord Alpha where").length == 2
+#guard (m3t6OOut.splitOn "instance : BEq Alpha where").length == 2
+-- …and the ORDER is the whole point: inductive, then the user's `BEq` (so the `==`
+-- inside the compare body is the user's, not `instBEqOfDecidableEq`), then the
+-- compare def, then `Ord`, then the companions.
+def m3t6OAt (needle : String) : Nat := (m3t6OOut.splitOn needle).head!.length
+#guard m3t6OAt "inductive Alpha where" < m3t6OAt "instance : BEq Alpha where"
+#guard m3t6OAt "instance : BEq Alpha where" < m3t6OAt "def _dollar_ccompare_920 "
+#guard m3t6OAt "def _dollar_ccompare_920 " < m3t6OAt "instance : Ord Alpha where"
+#guard m3t6OAt "instance : Ord Alpha where" < m3t6OAt "instance : Min Alpha"
+-- A2: the class decls are the LAST thing in the data block, so every spliced
+-- block — `Ord`, its companions, and the hoisted `BEq` — precedes them. A class
+-- BODY (a default, or a method type mentioning the head) may order that head, and
+-- with the blocks after the data block that was `failed to synthesize Min B` plus
+-- a cascading `Fields missing`.
+#guard m3t6OAt "instance : Min Alpha" < m3t6OAt "class Tag"
+#guard (m3t6OOut.splitOn "class Tag (a : Type) where").length == 2
+-- The hoisted `BEq` is emitted ONCE — it leaves the ordinary instance section
+-- rather than being duplicated into the data block.
+#guard (m3t6OOut.splitOn "beq :=").length == 2
+
+/-! ### `M3T6C` — the RETARGETED recursive body computes the derived order
+
+    `M3T6B` above made this argument for the non-recursive shapes: a derived
+    `compare` read as hand-written is sound because the derived body IS the derived
+    order. The recursive shape needs it re-made, because the emitted body is no
+    longer GHC's verbatim — `retargetSelfCompare` replaced the dictionary call with
+    a call to the def itself, and Lean then has to accept that call as structural
+    recursion rather than well-founded (which would need `decreasing_by` and, in
+    this emitter, a `sorry`).
+
+    Both halves are checked below, over the whole shape space up to depth 3: the
+    body elaborates WITHOUT a termination annotation, and it agrees with Lean's own
+    `deriving Ord` on the same inductive at every pair. `m3t6CCmp` is the emitted
+    text for `data Tree = Leaf | Node Tree Tree deriving (Eq, Ord)` with the
+    binders renamed and the `Ordering` constructor names as emitted; the recursive
+    calls are exactly what the retarget produced. -/
+
+inductive M3T6CTree where
+  | Leaf : M3T6CTree
+  | Node : M3T6CTree → M3T6CTree → M3T6CTree
+deriving Repr, Inhabited, DecidableEq, Ord
+
+def m3t6CCmp (a : M3T6CTree) (b : M3T6CTree) : Ordering :=
+  (match a with
+| M3T6CTree.Leaf => (match b with
+| M3T6CTree.Leaf => Ordering.eq
+| _ => Ordering.lt)
+| M3T6CTree.Node a1 a2 => (match b with
+| M3T6CTree.Node b1 b2 => (match ((m3t6CCmp) (a1)) (b1) with
+| Ordering.lt => Ordering.lt
+| Ordering.eq => ((m3t6CCmp) (a2)) (b2)
+| Ordering.gt => Ordering.gt)
+| _ => Ordering.gt))
+
+def m3t6CTrees : List M3T6CTree :=
+  let l := M3T6CTree.Leaf
+  let n := M3T6CTree.Node
+  [l, n l l, n (n l l) l, n l (n l l), n (n l l) (n l l),
+   n (n (n l l) l) l, n l (n l (n l l))]
+
+-- The whole 7×7 grid: the emitted body and Lean's `deriving Ord` are the same
+-- function. If the retarget had dropped or misplaced a recursive call, or if the
+-- alt order had put the DEFAULT arm first, this would separate them.
+#guard m3t6CTrees.all fun x => m3t6CTrees.all fun y => m3t6CCmp x y == compare x y
+-- Spot-pins for the two recursion sites, so a failure above localises.
+#guard m3t6CCmp (.Node .Leaf .Leaf) (.Node (.Node .Leaf .Leaf) .Leaf) == Ordering.lt
+#guard m3t6CCmp (.Node .Leaf .Leaf) (.Node .Leaf (.Node .Leaf .Leaf)) == Ordering.lt
+#guard m3t6CCmp .Leaf (.Node .Leaf .Leaf) == Ordering.lt
+#guard m3t6CCmp (.Node .Leaf .Leaf) .Leaf == Ordering.gt
+
+-- ### The forward-reference diagnostic (B1), and its scope.
+def m3t6ONorm : Var := { name := "norm", unique := 930, ty := .tyCon "Int" [], role := .id }
+#guard ordForwardRefs
+         { binds := [.nonRec m3t6OAlphaCmp (.var m3t6ONorm),
+                       .nonRec m3t6ONorm (.var m3t6OAlphaArg)],
+           typeDecls := [m3t6OAlpha], instances := [m3t6OAlphaOrdInst] }
+         == [("Alpha", "norm")]
+-- The HOISTED `$c==` half: `compare` tests `==` at `Alpha`, so `Alpha`'s `$c==` is
+-- spliced too — and a top-level call out of THAT body is the same forward
+-- reference. Reported, and attributed to the type the body belongs to.
+#guard ordForwardRefs
+         { binds := [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
+                     .nonRec m3t6OAlphaEq (.var m3t6ONorm),
+                     .nonRec m3t6ONorm (.var m3t6OAlphaArg)],
+           typeDecls := [m3t6OAlpha],
+           instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] }
+         == [("Alpha", "norm")]
+-- …and the hoist itself is what makes that reachable: with no `==` at `Alpha` in
+-- the compare body, the `$c==` stays in the ordinary method section (where `norm`
+-- IS in scope) and nothing is reported.
+#guard ordForwardRefs
+         { binds := [.nonRec m3t6OAlphaCmp (.var m3t6OAlphaArg),
+                     .nonRec m3t6OAlphaEq (.var m3t6ONorm),
+                     .nonRec m3t6ONorm (.var m3t6OAlphaArg)],
+           typeDecls := [m3t6OAlpha],
+           instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] }
+         == []
+-- `eqHoistHeads` is the shared key: same answer, same inputs, one definition.
+#guard eqHoistHeads [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
+                     .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+         [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
+-- A DERIVED `Eq` is never hoisted: there is no user `$c==` to hoist, and the
+-- `deriving DecidableEq` route is already in the data block.
+#guard eqHoistHeads [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
+                     .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+         [m3t6OAlphaHd] [m3t6OAlphaHd] 3 == []
+
+-- A body that calls nothing top-level reports nothing…
+#guard ordForwardRefs
+         { binds := [.nonRec m3t6OAlphaCmp (.var m3t6OAlphaArg),
+                       .nonRec m3t6ONorm (.var m3t6OAlphaArg)],
+           typeDecls := [m3t6OAlpha], instances := [m3t6OAlphaOrdInst] }
+         == []
+-- …and neither does an `Ord` that is not on the hand-written route (a `$ccompare`
+-- in a dict group needing more than `compare` emits no body to have a ref in).
+#guard ordForwardRefs
+         { binds := [.rec_ [(m3t6ODfun, .var m3t6OArg),
+                            (m3t6OAlphaCmp,
+                             .app (m3t6OApp "GHC.Classes.==" m3t6OArg) (.var m3t6ONorm))],
+                     .nonRec m3t6ONorm (.var m3t6OArg)],
+           typeDecls := [m3t6OAlpha], instances := [m3t6OAlphaOrdInst] }
+         == []
 
 end GhcCoreToLean.Tests

@@ -54,11 +54,24 @@ def localId (v : Var) : String :=
 def qualifyName (n : Name) : String :=
   String.intercalate "." ((n.splitOn ".").map sanitize)
 
+/-- GHC class-method bindings are named `$c<op>` (e.g. `$c==`). With more than
+    one instance of a class these collide after sanitization, so we suffix them
+    with their unique (like a local). -/
+def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
+
 /-- For a Var reference: bare name if it's a known top-level binding,
     `<name>_<unique>` otherwise. Top-level names are resolved against
-    a set of names collected from the program. -/
+    a set of names collected from the program.
+
+    A `$c<op>` name is EXEMPT from the top-level arm, because `defNameId` spells
+    those with their unique (`isClassMethodName`) — so the bare arm would emit
+    `_dollar_ccompare` for a def actually named `_dollar_ccompare_2966`. The two
+    functions used to disagree, and the disagreement became reachable when M3
+    Task 6's `Ord` section started passing the WHOLE program's top-name set (so a
+    `$c` bind could reference a user top-level function by its bare name); before
+    that, `$c` names were in `top` too, but no emitted body referenced one. -/
 def refId (topNames : List Name) (v : Var) : String :=
-  if topNames.contains v.name then sanitize v.name
+  if topNames.contains v.name && !isClassMethodName v.name then sanitize v.name
   -- A module-qualified name that isn't a local top-level binder is an external
   -- reference (into an imported dependency); emit it qualified, not as a
   -- unique-suffixed local id. Builtins were already resolved upstream (valueMap
@@ -562,11 +575,6 @@ private partial def collectTyVars : GHCType → List Name
   | .tyCon _ args => args.flatMap collectTyVars
   | .tyLit _      => []
 
-/-- GHC class-method bindings are named `$c<op>` (e.g. `$c==`). With more than
-    one instance of a class these collide after sanitization, so we suffix them
-    with their unique (like a local). -/
-private def isClassMethodName (n : Name) : Bool := n.startsWith "$c"
-
 private def defNameId (v : Var) : String :=
   if isClassMethodName v.name then localId v else sanitize v.name
 
@@ -606,27 +614,43 @@ private def emitDefHeader (mm : List MethodRef) (classNames : List Name) (top : 
 
 /-! ## Top-level binds -/
 
+/-- `recOverride` replaces the `occursInExpr` verdict that decides whether a def
+    gets `decreasing_by all_goals sorry`. Only the `Ord`/`Eq` blocks spliced into
+    the data block pass it (`some false`), and only because a self-recursive
+    `compare` is retargeted onto its OWN binder (`retargetSelfCompare`): that
+    mention is not user recursion, and closing it with a `sorry` would put one
+    inside an `Ord` instance and taint every `decide` proof about the order. Those
+    bodies recurse on a constructor field of the scrutinee, which Lean takes as
+    structural recursion; one it cannot take fails loud.
+
+    It reaches the hoisted `$c==` blocks too, since they are spliced by the same
+    code. So a RECURSIVE hand-written `Eq` that gets hoisted also loses the
+    `decreasing_by all_goals sorry` it would get in the ordinary method section, and
+    must pass structural recursion instead. Unmeasured (no probe has produced that
+    shape), loud either way, and the direction is the one this project prefers: a
+    real termination check rather than a `sorry` under an instance. -/
 def emitBind (mm : List MethodRef) (classNames : List Name) (top : List Name) (b : Bind)
-    (superBinders : List (Name × List String) := []) : String :=
+    (superBinders : List (Name × List String) := [])
+    (recOverride : Option Bool := none) : String :=
   -- Result type is computed from the constraint-stripped signature so the
   -- erased dict arrow isn't mistaken for a value arg. `superBinders` is NOT
   -- threaded here: it only ever adds BINDERS, never changes the stripped type
   -- (`.2`), so the header and the result type cannot drift apart over it.
   let resTyOf (v : Var) (nargs : Nat) : GHCType :=
     stripFunTys nargs (stripClassConstraints classNames v.ty).2
+  let recOf (v : Var) (e : Expr) : Bool :=
+    recOverride.getD (occursInExpr v.name e)
   match b with
   | .nonRec v e =>
     let (args, body) := peelLams e
     let resTy        := resTyOf v args.length
-    let rec?         := occursInExpr v.name e
-    emitDefHeader mm classNames top v args resTy body rec? superBinders
+    emitDefHeader mm classNames top v args resTy body (recOf v e) superBinders
   | .rec_ pairs =>
     match pairs with
     | [(v, e)] =>
       let (args, body) := peelLams e
       let resTy        := resTyOf v args.length
-      let rec?         := occursInExpr v.name e
-      emitDefHeader mm classNames top v args resTy body rec? superBinders
+      emitDefHeader mm classNames top v args resTy body (recOf v e) superBinders
     | _        =>
       let defs := pairs.map fun (v, e) =>
         let (args, body) := peelLams e
@@ -652,9 +676,10 @@ def emitProgram (mm : List MethodRef) (classNames : List Name) (p : CoreProgram)
     The intended use is to splice in user-declared data constructors so
     `App (Var Foo) ...` becomes `Foo a b`, not `Foo_3490`. -/
 def emitProgramWith (mm : List MethodRef) (classNames : List Name) (p : CoreProgram)
-    (extraTopNames : List Name) (superBinders : List (Name × List String) := []) : String :=
+    (extraTopNames : List Name) (superBinders : List (Name × List String) := [])
+    (recOverride : Option Bool := none) : String :=
   let top      := extraTopNames ++ collectTopNames p
-  let bindStrs := p.map (fun b => emitBind mm classNames top b superBinders)
+  let bindStrs := p.map (fun b => emitBind mm classNames top b superBinders recOverride)
   String.intercalate "\n\n" bindStrs
 
 /-- Keep the binds satisfying `keep`, PER PAIR: a `Rec` group is filtered
@@ -725,7 +750,8 @@ def emitDataDecl (derivedEq derivedOrd : Bool) (d : DataDecl)
   -- `handwrittenOrd` (M3 Task 6) is the type whose `Ord` is the USER's, emitted as
   -- an `instance : Ord T where compare := …` block with the same four companions
   -- (`ordCompanionInsts`) — NOT here, because that block references a `$ccompare`
-  -- def emitted after the data block. All this flag does here is `DecidableEq`,
+  -- def, which is SPLICED into the data block immediately after this `inductive`
+  -- rather than emitted here. All this flag does here is `DecidableEq`,
   -- and it is Task 3's mandatory handoff rather than a convenience: the `Ord`
   -- constraint recipe contains `[BEq t]`, so an `Ord`-constrained call at such a
   -- type needs SOME `BEq` route. `deriving Ord` used to supply it via this same
@@ -734,6 +760,16 @@ def emitDataDecl (derivedEq derivedOrd : Bool) (d : DataDecl)
   -- candidate, and the explicit one wins — measured, and pinned by the `M3T6R`
   -- `#guard`s in `Tests/Unit.lean` (the same measurement `M3T3R` made for a
   -- DERIVED `Ord`, redone with the order coming from an instance block).
+  --
+  -- "The explicit one wins" is about DECLARATION ORDER, not priority: among equal
+  -- candidates Lean picks the last declared. So it held at every ordinary use site
+  -- — those follow both instances — and FAILED inside the `$ccompare` def, which
+  -- precedes the user's `BEq`. That was a silent-wrong (a cross-multiply `Eq` plus
+  -- a `compare` testing `x == y` computed STRUCTURAL equality there, with no
+  -- diagnostic), and it is closed by hoisting the user's `BEq` ahead of the compare
+  -- def — `eqHoistHeads` in `emitFullProgram`. Dropping this `DecidableEq` would
+  -- have been the wrong fix: it also supplies `Decidable (a = b)`, which `BEq` does
+  -- not, and it is the only `BEq` route for a type with NO hand-written `Eq`.
   let derivs := "Repr, Inhabited"
     ++ (if derivedEq || derivedOrd || handwrittenOrd then ", DecidableEq" else "")
     ++ (if derivedOrd then ", Ord" else "")
@@ -1415,8 +1451,17 @@ def dfunMethodBinds (binds : CoreProgram) (cd : ClassDecl) (i : Instance)
   -- name is not guaranteed unique in a module. `dfunDumpUnique` is load-bearing —
   -- the two channels number uniques differently, and matching `i.dfunUnique` RAW
   -- resolved nothing, which dropped `SuperClass.hs`'s `Container Bag` instance
-  -- (measured; see that function). The `orElse` is the documented degradation if
-  -- the encoding ever drifts again.
+  -- (measured; see that function).
+  --
+  -- The `orElse` is a SILENT degradation to name-only matching, not a loud one:
+  -- should the packed encoding drift, this falls back to the FIRST bind of that
+  -- name with no diagnostic, and in a module with two instances whose dfuns share
+  -- a name it would attribute the wrong one. That is the arm's whole purpose (a
+  -- drifted encoding must not drop every instance), and the mask itself is
+  -- verified rather than assumed — GHC masks the index at construction in
+  -- `mkUnique`, and 65/65 instances across the dumps match with tag 114 — so the
+  -- fallback is unreachable today. Making it loud is the improvement to make if it
+  -- ever fires.
   match (findBind binds i.dfunName (some (dfunDumpUnique i.dfunUnique))).orElse
           (fun _ => findBind binds i.dfunName) with
   | none          => []
@@ -1475,12 +1520,25 @@ six-shape probe recorded in the `M3 Task 6` block of `Tests/Unit.lean`:
   keeps the primop inside `$cfromEnum`, since nothing inlines at `-O0`).
 * **a Rec group with the dictionary builder** — GHC emits a method body that
   depends on the instance's OWN dictionary inside `Rec [$fOrdT, …]`, the same
-  shape M3 Task 4 observed for default methods. That is exactly what a MINIMAL
-  `<=`-only instance's `compare` is (`$ccompare` there is the class default,
-  `if x == y then EQ else if x <= y then LT else GT`, reaching the `Eq`
-  superclass through `$p1Ord @T $fOrdT`), and it is not emittable: the body needs
-  the instance being defined, which Lean does not see forward. `unsupported`
-  drops the whole `Ord`, so every use is loud, and `Main.lean` warns.
+  shape M3 Task 4 observed for default methods. Rec membership alone is NOT the
+  discriminator: TWO different bodies produce it, and the first release of this
+  task classified both `.unsupported`, which broke plain `deriving Ord` on every
+  recursive ADT (see `ownDictOpsAtHead`, which splits them):
+
+  * a MINIMAL `<=`-only instance's `compare` — the class default,
+    `if x == y then EQ else if x <= y then LT else GT`, reaching the `Eq`
+    superclass through `$p1Ord @T $fOrdT` and `<=` through `$fOrdT`. Not
+    emittable: the body needs several methods of the instance being defined,
+    which Lean does not see forward. `unsupported` drops the whole `Ord`, so
+    every use is loud, and `Main.lean` warns.
+  * a SELF-RECURSIVE `compare`, which recurses as `compare @T $fOrdT` and so
+    lands in the very same group. `data Tree = Leaf | Node Tree Tree deriving
+    (Eq, Ord)` is this shape — 2 constructors, so no tag primop routes it to
+    `.derived`. It IS emittable: the only thing it needs from its own dictionary
+    is `compare`, i.e. the def being emitted, so `retargetSelfCompare` rewrites
+    the call to the def's own name and Lean's structural recursion takes it.
+    MEASURED end-to-end; the `M3T6C` block in `Tests/Unit.lean` pins the order
+    against Lean's own `deriving Ord` on the same inductive.
 
   This test reads a Rec group's MEMBERSHIP, which `filterBinds`' docstring warns
   against classifying by — so note what it does not do: it never reads the group's
@@ -1511,14 +1569,26 @@ THE TWO MISCLASSIFICATION DIRECTIONS, both pinned in `Tests/Unit.lean`:
   newtype); a shape test on the derived body was rejected as fragile — a
   false negative there would make working derived enums loud.
 * **derived read as HAND-WRITTEN** is SOUND, and it is the COMMON case, not a
-  corner. MEASURED (six shapes in one dump, `OrdBoundary` in the `M3 Task 6` block):
-  GHC's derived `compare` uses tag primops ONLY for an all-nullary enum with ≥3
-  constructors. A 2-constructor enum gets a nested `case` instead, and ANY
-  constructor with fields gets one too — so `data Coin = Heads | Tails deriving Ord`
-  (the `OrdInstance` fixture) and `data Pair = Pair Int Int deriving Ord` both take
-  the `.handwritten` route. The old comment on `derivedEqTypes` guessed exactly this
-  ("a derived compare on a small enum is case-based and indistinguishable from a
-  hand-written one") and it is right.
+  corner. GHC's derived `compare` uses tag primops IFF the type has **≥3 NULLARY
+  constructors, independently of how many non-nullary ones it has**. That is the
+  measured rule and it is NOT the one this comment first claimed ("an all-nullary
+  enum with ≥3 constructors"); the counterexample that settles it is `Mix2`:
+
+      data N3   = N1 | N2 | N3                       3 nullary        tagprim=True
+      data T2   = M1 | M2                            2 nullary        tagprim=False
+      data Mix  = X1 | X2 | X3 Int                   2 nullary + 1    tagprim=False
+      data Mix2 = Y1 | Y2 | Y3 | Y4 Int              3 nullary + 1    tagprim=True
+      data Mix3 = Z1 Int | Z2 Int | Z3 Int           0 nullary + 3    tagprim=False
+
+  (all `deriving (Eq, Ord)`; `$ccompare` scanned for `dataToTag#`/`tagToEnum#`).
+  `Mix2` is not all-nullary yet takes the `.derived` route, which is why the
+  earlier wording mattered: the scope of the soundness argument below is "every
+  shape with ≤2 nullary constructors", not "every non-enum". So
+  `data Coin = Heads | Tails deriving Ord` (the `OrdInstance` fixture) and
+  `data Pair = Pair Int Int deriving Ord` both take the `.handwritten` route. The
+  old comment on `derivedEqTypes` guessed exactly this ("a derived compare on a
+  small enum is case-based and indistinguishable from a hand-written one") and it
+  is right.
 
   Sound because the derived `compare` body IS the derived order, and the companions
   are functions of `compare` either way — so the emitted instance computes what
@@ -1562,16 +1632,37 @@ Three reasons, in increasing strength:
 A user who defines BOTH `compare` and `<` gets the `compare` one. A user who defines
 `<` (or `<=`) ONLY has no `compare` of their own at all: the default lands in that
 Rec group and the whole instance is `unsupported` — loud and warned, rather than
-half-translated. -/
+half-translated.
+
+WHAT REMAINS UNSUPPORTED after the self-recursion arm, all loud:
+
+* the `<=`/`<`-only minimal instance (above): its `compare` needs `==` and `<=`
+  from the instance being defined, and only `compare` can be redirected;
+* a hand-written `compare` that recurses AND uses another method of its own `Ord`
+  (`compare x y = if x <= y then … else compare …`): `ownDictOpsAtHead` sees two
+  ops, so the whole `Ord` is dropped rather than emitted with a dangling `<=`;
+* MUTUALLY recursive types (`data A = A B; data B = B A deriving Ord`), whose two
+  `compare` defs would need one Lean `mutual` block — this emitter places each
+  type's block next to its own `inductive`, so the second def's forward reference
+  to the first is loud. Not fixed here; it also needs a `mutual` DATA block,
+  which `sortDataDecls` does not emit either (its cycle arm is already documented
+  as loud-on-forward-reference).
+* a `compare` whose own-dict argument types could not be read at all (nothing
+  matched at the head type). That collapses with the case above deliberately:
+  "we could not tell what it needs" and "it needs more than `compare`" get the
+  same conservative route, which is what the pre-fix code did for both. -/
 inductive OrdRoute where
   /-- GHC-derived: `deriving Ord` + companions in the data block, `$c` bodies
       suppressed (they use tag primops and have no Lean image). -/
   | derived
-  /-- The user's own `compare`, emitted as an instance block pointing at this def
-      name, plus the same companions. -/
-  | handwritten (compareRef : String)
-  /-- No emittable `compare` (absent, or the dictionary-dependent class default of
-      a minimal `<=`-only instance): no `Ord` at all, loud at every use site. -/
+  /-- The user's own `compare` (or GHC's derived one on a shape with ≤2 nullary
+      constructors), emitted as a def plus an instance block pointing at that def
+      name, plus the same companions. `selfRec` marks the body that recurses
+      through its own dictionary, whose `compare @T $fOrdT` call
+      `retargetSelfCompare` must rewrite to `compareRef` before emission. -/
+  | handwritten (compareRef : String) (selfRec : Bool)
+  /-- No emittable `compare` (absent, or a dictionary-dependent body needing more
+      of the instance than `compare`): no `Ord` at all, loud at every use site. -/
   | unsupported
 deriving DecidableEq, Repr
 
@@ -1594,6 +1685,114 @@ private def findCompareBind (binds : CoreProgram) (headTyStr : String)
       (pairs.find? (fun (v, _) => matchesHead v)).map fun (v, e) =>
         (v, e, pairs.any (fun (w, _) => w.name.startsWith "$f"))
 
+/-- The emitted type of an application's FIRST `Var` argument — the type a class
+    op is instantiated at, since `Lower` erases the `@T` type application and the
+    dictionary and leaves the value arguments. `none` when no argument is a bare
+    `Var` (a compound argument carries no type here at all), which can only
+    under-report — the conservative direction for every caller.
+
+    THE FIRST ONE, not any one, and that is load-bearing. A class op's dispatch
+    type is its first value argument's type, which is the convention
+    `methodHeadStr`/`findClassMethodBind` already key on. Reading "some argument"
+    instead over-reports on a dump quirk that is REAL: GHC's `case` binder arrives
+    as `wild` with a shim-assigned unique, and its recorded TYPE is not reliably
+    the scrutinee's — measured on `OrdSectionOrder.hs`, where
+    `== @Frac2 $fEqFrac2 x wild` has `x : Frac2` (right) and `wild : Alpha`
+    (wrong, and `Alpha` is another decl in the same module). Under "some argument"
+    that made `eqHoistHeads` hoist `Alpha`'s `BEq` as well — harmless in itself,
+    but a spurious hoist moves a body into the data block and can turn a `$c==`
+    that calls a top-level function from working into loud. -/
+def firstVarArgTy : List Expr → Option String
+  | []            => none
+  | .var v :: _   => some (emitType v.ty)
+  | _ :: rest     => firstVarArgTy rest
+
+/-- The FOREIGN (dotted, i.e. non-local) operators this body applies to a value of
+    `headTy`. For a `$ccompare` body that shares a Rec group with its own
+    dictionary builder, this is what the body needs FROM that dictionary, and the
+    set decides `ordRoute`'s two Rec-group arms:
+
+    * `["GHC.Classes.compare"]` — self-recursion and nothing else, so redirecting
+      the call to the def being emitted (`retargetSelfCompare`) discharges it;
+    * anything else, EMPTY INCLUDED — more of the instance than `compare`, or a
+      shape whose argument types could not be read; `.unsupported`.
+
+    OBSERVED, the two bodies it separates (spines in the `M3 Task 6` block of
+    `Tests/Unit.lean`): derived `compare` on `data Tree = Leaf | Node Tree Tree`
+    applies only `compare @Tree $fOrdTree a1 b1`, while the `<=`-only class
+    default applies `== @T ($p1Ord @T $fOrdT)` AND `<= @T $fOrdT` — post-`Lower`,
+    `[GHC.Classes.compare]` versus `[GHC.Classes.==, GHC.Classes.<=]`.
+
+    Restricted to DOTTED names on purpose. A call to a local top-level function at
+    the head type (`compare (norm x) (norm y)`) is not a dictionary dependency and
+    must not veto the arm; and a nested `compare` at a DIFFERENT type
+    (`compare @Int` over two fields, which every derived compare on a type with
+    fields contains) is excluded by the argument-type test, not by the name. -/
+partial def ownDictOpsAtHead (headTy : String) : Expr → List Name
+  | .var _            => []
+  | .lit _            => []
+  | .type_ _          => []
+  | .coercion         => []
+  | .cast e           => ownDictOpsAtHead headTy e
+  | .tick e           => ownDictOpsAtHead headTy e
+  | .lam _ b          => ownDictOpsAtHead headTy b
+  | .let_ bnd b       =>
+    (match bnd with
+     | .nonRec _ e => ownDictOpsAtHead headTy e
+     | .rec_ ps    => ps.flatMap (fun p => ownDictOpsAtHead headTy p.2))
+      ++ ownDictOpsAtHead headTy b
+  | .case_ s _ _ alts =>
+    ownDictOpsAtHead headTy s
+      ++ alts.flatMap (fun (.mk _ _ r) => ownDictOpsAtHead headTy r)
+  | e@(.app f a)      =>
+    let (h, as) := spineOf e
+    let here := match h with
+      | .var op =>
+        if op.name.contains '.' && firstVarArgTy as == some headTy then [op.name] else []
+      | _       => []
+    -- Recursing into `f` re-analyses the partial spine (`compare a1` inside
+    -- `compare a1 b1`) and can report the same op twice; `dedup` at the caller
+    -- makes that unobservable, and the alternative (skipping `f`) would miss an
+    -- op applied inside an ARGUMENT of another application.
+    here ++ ownDictOpsAtHead headTy f ++ ownDictOpsAtHead headTy a
+
+/-- Rewrite this body's SELF-RECURSIVE `compare` calls — `compare` applied to a
+    value of `headTy`, which post-`Lower` is the erased `compare @T $fOrdT` — to
+    reference `self` (the `$ccompare` binder itself) instead of the class op.
+
+    The point is that `refId`/`defNameId` then spell it `localId self`, i.e. the
+    very def this body becomes, so Lean's structural recursion closes the loop
+    that GHC closed through the dictionary. Both misfire directions are LOUD, and
+    that is the whole safety argument: retargeting a call that was NOT at the head
+    type gives an argument-type mismatch, and failing to retarget one that was
+    leaves `compare` needing an `Ord {headTy}` that is declared after this def
+    (`failed to synthesize`). Neither can silently change the order computed.
+
+    Applied ONLY on the `.handwritten … (selfRec := true)` route, so a body
+    without a self-call is passed through untouched by construction. -/
+partial def retargetSelfCompare (headTy : String) (self : Var) : Expr → Expr
+  | .cast e           => .cast (retargetSelfCompare headTy self e)
+  | .tick e           => .tick (retargetSelfCompare headTy self e)
+  | .lam v b          => .lam v (retargetSelfCompare headTy self b)
+  | .let_ bnd b       =>
+    let bnd' := match bnd with
+      | .nonRec v e => Bind.nonRec v (retargetSelfCompare headTy self e)
+      | .rec_ ps    => Bind.rec_ (ps.map fun (v, e) => (v, retargetSelfCompare headTy self e))
+    .let_ bnd' (retargetSelfCompare headTy self b)
+  | .case_ s bv ty alts =>
+    .case_ (retargetSelfCompare headTy self s) bv ty
+      (alts.map fun (.mk c bs r) => Alt.mk c bs (retargetSelfCompare headTy self r))
+  | e@(.app f a)      =>
+    let (h, as) := spineOf e
+    match h with
+    | .var op =>
+      if op.name == "GHC.Classes.compare" && firstVarArgTy as == some headTy then
+        (as.map (retargetSelfCompare headTy self)).foldl Expr.app (.var self)
+      else
+        .app (retargetSelfCompare headTy self f) (retargetSelfCompare headTy self a)
+    | _ => .app (retargetSelfCompare headTy self f) (retargetSelfCompare headTy self a)
+  | e                 => e
+
 /-- Which of the three routes the `Ord` instance at `headTyStr` takes — see the
     section header for the full argument. Keyed on the head STRING (the spelling
     every instance-matching key in this file uses, computed before the resolution
@@ -1601,14 +1800,23 @@ private def findCompareBind (binds : CoreProgram) (headTyStr : String)
     alike. Recomputed per call (`emitFullProgram` asks twice per `Ord` head,
     `emitInstance` and `unsupportedOrdInstances` once each) and each call scans the
     binds; the product is bounded by the `Ord`-instance count, which is why the
-    single decision procedure is preferred over caching it in a threaded list. -/
+    single decision procedure is preferred over caching it in a threaded list.
+
+    The Rec-group arm is MONOTONE against the first release of this task, which
+    answered `.unsupported` for every body in a dictionary group: the only route
+    that changed is the one `ownDictOpsAtHead` recognises as self-recursion, and
+    every other body still lands where it did. So no input that worked can break
+    here, and the arm that was added is loud on either misfire
+    (`retargetSelfCompare`). -/
 def ordRoute (binds : CoreProgram) (headTyStr : String) : OrdRoute :=
   match findCompareBind binds headTyStr with
   | none                    => .unsupported
   | some (v, e, inDictRec) =>
     if usesTagPrim e then .derived
-    else if inDictRec then .unsupported
-    else .handwritten (localId v)
+    else if !inDictRec then .handwritten (localId v) false
+    else if dedup (ownDictOpsAtHead headTyStr e) == ["GHC.Classes.compare"]
+    then .handwritten (localId v) true
+    else .unsupported
 
 /-! ### Default methods
 
@@ -1915,19 +2123,176 @@ def unsupportedOrdInstances (p : Program) : List Name :=
     | .unsupported => some (headTypeNames i)
     | _            => none
 
-/-- The warning for one `unsupportedOrdInstances` entry. -/
+/-- The warning for one `unsupportedOrdInstances` entry.
+
+    Deliberately does NOT claim a user instance exists, nor that defining `compare`
+    is always the remedy. The first release of this message asserted both, and on
+    the shape that actually reached it most often — a plain `deriving Ord` on a
+    recursive ADT, no user instance anywhere — it blamed a minimal `(<=)` instance
+    the user had not written and prescribed a `compare` that would have landed in
+    the very same Rec group. That shape is now EMITTED (`ordRoute`'s self-recursion
+    arm), so what is left really is dictionary-dependent beyond `compare`; the
+    message says which cases those are and stops short of promising a fix. -/
 def unsupportedOrdWarning (head : Name) : String :=
   s!"instance `Ord {head}` is DROPPED: no translatable `compare` body for it.\n" ++
-  s!"  Either there is no `$ccompare` binding at that head, or the one there is\n" ++
-  s!"  GHC's CLASS DEFAULT (`if x == y then EQ else if x <= y then LT else GT`),\n" ++
-  s!"  which a minimal `instance Ord {head} where (<=) = …` produces — that body needs\n" ++
-  s!"  the instance's own dictionary, so it cannot be emitted before the instance it\n" ++
-  s!"  defines. NOTHING structural is substituted (that substitution was this\n" ++
-  s!"  transpiler's silent-wrong behaviour until M3 Task 6); instead every\n" ++
+  s!"  Either there is no `$ccompare` binding at that head, or the one there needs\n" ++
+  s!"  MORE of the `Ord {head}` dictionary than `compare` — which Lean does not see\n" ++
+  s!"  forward, since that dictionary is the instance being defined. Two known\n" ++
+  s!"  shapes reach this:\n" ++
+  s!"    * a MINIMAL instance defining only `(<=)` (or only `(<)`), whose `compare`\n" ++
+  s!"      is GHC's class default `if x == y then EQ else if x <= y then LT else GT`\n" ++
+  s!"      — it needs `==` and `<=` from this same instance;\n" ++
+  s!"    * a hand-written `compare` that recurses AND calls another method of its\n" ++
+  s!"      own `Ord` (self-recursion ALONE is fine and is emitted).\n" ++
+  s!"  NOTHING structural is substituted (that substitution was this transpiler's\n" ++
+  s!"  silent-wrong behaviour until M3 Task 6); instead every\n" ++
   s!"  `compare`/`<`/`<=`/`min`/`max` at `{head}` fails loudly at `lake build` with\n" ++
   s!"  `failed to synthesize`.\n" ++
-  s!"  Fix: define `compare` in the instance (a `<=`-only minimal definition is not\n" ++
-  s!"  translated)."
+  s!"  Fix, for the minimal-instance shape: define `compare` itself, in terms of the\n" ++
+  s!"  fields rather than of `<=`. For the recursive shape: express the non-`compare`\n" ++
+  s!"  method call as a `compare … = …` test instead."
+
+/-- The emitted head-type strings at which this body applies one of `ops` — the
+    `firstVarArgTy` reading, i.e. the type the op is instantiated at, with the
+    same limitation (a first argument that is not a bare `Var` carries no type
+    post-`Lower`, so it produces no entry).
+
+    Used for ONE question: at which types does an emitted `Ord`-section body call
+    `==`/`/=`? Those are the `BEq` instances that must precede it. -/
+partial def opArgTypes (ops : List Name) : Expr → List String :=
+  let rec go : Expr → List String
+    | .cast e           => go e
+    | .tick e           => go e
+    | .lam _ b          => go b
+    | .let_ bnd b       =>
+      (match bnd with
+       | .nonRec _ e => go e
+       | .rec_ ps    => ps.flatMap (fun p => go p.2))
+        ++ go b
+    | .case_ s _ _ alts => go s ++ alts.flatMap (fun (.mk _ _ r) => go r)
+    | e@(.app f a)      =>
+      let (h, as) := spineOf e
+      let here := match h with
+        | .var op => if ops.contains op.name then (firstVarArgTy as).toList else []
+        | _       => []
+      here ++ go f ++ go a
+    | _                 => []
+  fun e => (go e).eraseDups
+
+/-- The hand-written-`Eq` `$c==` bind at `h`, if that is the route `h`'s `Eq`
+    takes. `derivedEq` is passed in rather than recomputed, because the caller's
+    bind list may already have the derived `$c==` binds suppressed — recomputing
+    `derivedEqTypes` over THAT list answers "no derived Eq anywhere". -/
+def hwEqBindAt (binds : CoreProgram) (derivedEq : List String) (h : String)
+    : Option (Var × Expr) :=
+  if derivedEq.contains h then none else findClassMethodBind binds "$c==" h
+
+/-- The heads whose hand-written `instance : BEq` must be emitted BEFORE the
+    spliced `Ord` blocks, because some spliced body calls `==`/`/=` at that head.
+
+    THE B3 FIX. Without it the only `BEq` in scope inside a `$ccompare` def was
+    core's `instBEqOfDecidableEq`, off the `deriving DecidableEq` that
+    `emitDataDecl`'s `handwrittenOrd` flag adds — so a cross-multiply `Eq` plus a
+    `compare` testing `x == y` computed STRUCTURAL equality there, silently, while
+    every ordinary use site got the user's instance. Lean picks the last-declared
+    of equal candidates, which is why declaration order is the whole story.
+
+    Seeded by the `$ccompare` bodies and closed over the hoisted `$c==` bodies
+    themselves: one of those may call `==` at a THIRD type, whose `BEq` then has to
+    precede it too. `fuel` bounds the closure (the decl count is enough — each
+    round either adds a head or stops).
+
+    ONE definition, two callers — the emission (`emitFullProgram`) and the
+    forward-reference diagnostic (`ordForwardRefs`) — so the set that gets spliced
+    and the set that gets scanned for forward references cannot disagree. -/
+def eqHoistHeads (binds : CoreProgram) (derivedEq : List String)
+    (handwrittenOrdHeads : List String) (fuel : Nat) : List String :=
+  let eqOps : List Name := ["GHC.Classes.==", "GHC.Classes./="]
+  let cmpBodies := handwrittenOrdHeads.filterMap fun h =>
+    (findClassMethodBind binds "$ccompare" h).map (·.2)
+  let rec grow (fuel : Nat) (acc : List String) : List String :=
+    match fuel with
+    | 0        => acc
+    | fuel + 1 =>
+      let bodies := cmpBodies ++ acc.filterMap fun h => (hwEqBindAt binds derivedEq h).map (·.2)
+      let next := ((bodies.flatMap (opArgTypes eqOps)).filter
+                    fun h => (hwEqBindAt binds derivedEq h).isSome).eraseDups
+      if next == acc then acc else grow fuel next
+  grow fuel []
+
+/-- Names of every `Var` an expression references. -/
+private partial def collectVarNames : Expr → List Name
+  | .var v            => [v.name]
+  | .app f a          => collectVarNames f ++ collectVarNames a
+  | .lam _ b          => collectVarNames b
+  | .cast e           => collectVarNames e
+  | .tick e           => collectVarNames e
+  | .let_ bnd b       =>
+    (match bnd with
+     | .nonRec _ e => collectVarNames e
+     | .rec_ ps    => ps.flatMap (fun p => collectVarNames p.2))
+      ++ collectVarNames b
+  | .case_ s _ _ alts =>
+    collectVarNames s ++ alts.flatMap (fun (.mk _ _ r) => collectVarNames r)
+  | _                 => []
+
+/-- `(head, function)` for every USER TOP-LEVEL function a SPLICED body calls —
+    a hand-written `compare`, and a hand-written `$c==` hoisted ahead of one
+    (`eqHoistHeads`). Those calls are FORWARD references and fail at `lake build`:
+    the spliced blocks live in the data block (see `emitFullProgram`) and user binds
+    are the last section, so nothing the user wrote at the top level is in scope
+    inside either body.
+
+    BOTH body kinds, because both are spliced. The `Eq` half is reachable from
+    ordinary Haskell — `instance Eq F where F a b == F c d = key a == key c`
+    alongside a `compare` that tests `x == y` hoists that `$c==` — and reporting
+    only the `compare` half would leave a comment claiming coverage this does not
+    have.
+
+    Reported rather than fixed. Hoisting the callee would mean moving user binds
+    into the data block too, and a bind can reference anything — its own type's
+    instances included — so the hoist has no order that is right in general; the
+    honest landing is a named diagnostic. The pre-M3T6 behaviour here was not
+    "working" either: it DROPPED the hand-written `compare` and installed Lean's
+    structural order silently, which is the silent-wrong this task exists to remove.
+
+    The `$`-prefixed names are excluded because they are GHC plumbing, not user
+    functions; a `$c`/`$dm` reference out of a compare body is a different (and so
+    far unobserved) shape and would be loud on its own. -/
+def ordForwardRefs (p : Program) : List (Name × Name) :=
+  let topUser : List Name := (collectTopNames p.binds).filter fun n => !n.startsWith "$"
+  let derivedEq := derivedEqTypes p.binds
+  let hwOrd := (p.instances.filter (·.className == "Ord")).filterMap fun i =>
+    let h := i.headTypes.map emitType |> String.intercalate " "
+    match ordRoute p.binds h with
+    | .handwritten _ _ => some (headTypeNames i, h)
+    | _                => none
+  let hoisted := eqHoistHeads p.binds derivedEq (hwOrd.map (·.2)) (p.typeDecls.length + 1)
+  -- The reported head is the TYPE the body belongs to, so an `Eq` hoisted at a
+  -- different head than the `Ord` that needed it is named by its own type.
+  let nameOfHead (h : String) : Name :=
+    match p.typeDecls.find? (fun d => emitType (.tyCon d.name []) == h) with
+    | some d => d.name
+    | none   => h
+  let bodies : List (Name × Expr) :=
+    hwOrd.filterMap (fun (n, h) => (findClassMethodBind p.binds "$ccompare" h).map ((n, ·.2)))
+      ++ hoisted.filterMap fun h => (hwEqBindAt p.binds derivedEq h).map ((nameOfHead h, ·.2))
+  bodies.flatMap fun (n, e) =>
+    (dedup (collectVarNames e)).filterMap fun v =>
+      if topUser.contains v then some (n, v) else none
+
+/-- The warning for one `ordForwardRefs` entry. -/
+def ordForwardRefWarning (head fn : Name) : String :=
+  s!"hand-written `compare` for `{head}` calls the top-level function `{fn}`, which\n" ++
+  s!"  is emitted AFTER it: the `Ord {head}` block is spliced into the data block so\n" ++
+  s!"  that types deriving `Ord` from `{head}`, and class-body defaults ordering\n" ++
+  s!"  `{head}`s, can see it. `lake build` will report `unknown identifier {fn}` — the\n" ++
+  s!"  reference is emitted by its real name, so the failure names the cause.\n" ++
+  s!"  NOTHING structural is substituted (that substitution, which is what this\n" ++
+  s!"  transpiler did before M3 Task 6, made the module compile with Lean's own\n" ++
+  s!"  order instead of `{head}`'s — silently).\n" ++
+  s!"  Fix: inline `{fn}`'s body into the `compare` definition, or move the ordering\n" ++
+  s!"  logic into `{fn}` and make `compare` the only thing that mentions the fields."
 
 /-- Emit a Lean `instance` block. `Eq` → Lean `BEq`, `Ord` → Lean `Ord` (the
     latter via `deriving` in the data block), and user classes via
@@ -1963,7 +2328,7 @@ def emitInstance (defaults : List (Name × Name)) (classes : List ClassDecl)
     match ordRoute binds tyStr with
     | .derived            => none
     | .unsupported        => none
-    | .handwritten cmpRef =>
+    | .handwritten cmpRef _ =>
       some (s!"instance : Ord {tyStr} where\n  compare := {cmpRef}\n\n"
               ++ ordCompanionInsts tyStr)
   -- Show is deliberately not translated: GHC's `$cshowsPrec` body is string
@@ -1992,25 +2357,39 @@ def userDataConMap (decls : List DataDecl) : Name → Option String := fun n =>
 Emitted text passes through an ORDERED pipeline of textual resolution passes.
 Both the order and each pass's site list are load-bearing.
 
-  1. `resolveUserTypes`      opaque local tycon → bare       — bodies, data block,
-                                                               spec text (3 sites)
+  1. `resolveUserTypes`      opaque local tycon → bare       — bodies, inductives +
+                                                               class decls, spliced
+                                                               Ord/Eq blocks, spec
+                                                               text (4 sites)
   2. `resolveNewtypes`       newtype → underlying type       — after 1, before 3,
-                                                               SAME 3 sites
+                                                               SAME 4 sites
   3. `resolveUserCtors`      ctor in application position → `T.C`
-                                                             — bodies + spec text
-                                                               ONLY, never the
-                                                               data block
+                                                             — bodies, spliced
+                                                               Ord/Eq blocks, spec
+                                                               text; NEVER the
+                                                               inductives
   4. `resolveExternalTypes`  remaining opaque → `M.T`        — whole output, last;
                                                                requires 1 to have
                                                                run on EVERY section
 
-Pass 1's three sites are, concretely: `emitFullProgram`'s `bodyResolved`
-(bodies + instances), its `dataBlock`, and `resolveSpecText` (user `@lean` theorem
-text). Passes 3 and 4 run at the first and third of those — pass 4 covering the
-whole joined output rather than the body section alone. Pass 3 must never see the
-data block: it would rewrite the inductive's own `| Ctor ` lines. Pass 4 must run
-last, and pass 1 must have reached every section before it, or a local type still
-spelled opaque gets rewritten to `M.T` for its OWN module `M`.
+Pass 1's four sites are, concretely: `emitFullProgram`'s `bodyResolved`
+(method defs + instances + user binds), its `res12` over each `inductive` and each
+class decl, its `resBody` over each spliced `Ord`/`Eq` block, and `resolveSpecText`
+(user `@lean` theorem text). Pass 3 runs at the first, third and fourth of those;
+pass 4 covers the whole joined output rather than any one section.
+
+THE SPLICED BLOCKS ARE WHY PASS 3'S SITE LIST IS NOT SIMPLY "not the data block".
+A hand-written `Ord`'s `$ccompare` def, and the hand-written `BEq` a compare body
+may need before it, are emitted INSIDE the data block — between the `inductive`s,
+next to their own type (see `emitFullProgram` for the four measured reasons). They
+pattern-match on constructors and so need pass 3, which must never touch an
+`inductive`'s own `| Ctor ` lines. Both hold only because each piece is resolved
+SEPARATELY, with its own pipeline, and the already-resolved strings are then
+joined. That is equivalent to resolving the join: every needle of passes 1–3 is a
+single identifier occurrence, so none can span the `\n\n` between two pieces.
+
+Pass 4 must run last, and pass 1 must have reached every section before it, or a
+local type still spelled opaque gets rewritten to `M.T` for its OWN module `M`.
 
 Newtype erasure (pass 2) adds two constraints of its own, both live:
 
@@ -2679,10 +3058,75 @@ def dataDeclDeps (localNames : List Name) (d : DataDecl) : List Name :=
   let mentioned := d.ctors.flatMap fun c => c.fields.flatMap fun f => tyConNames f.ty
   dedup (mentioned.filter fun n => n != d.name && localNames.contains n)
 
+/-- Local type names a BODY mentions, via the type of every `Var` it references
+    and of every `case` binder. Deduplicated, self-reference dropped (same
+    convention as `dataDeclDeps`, whose result set this widens).
+
+    This is the `Ord` section's real ordering requirement and the reason
+    `sortDataDecls` takes `extraDeps`: a hand-written `compare` at `B` whose body
+    calls `compare` at `A` needs `instance : Ord A` already emitted, and `A` need
+    not be a FIELD of `B` — the field graph has no edge there at all. Measured:
+    `instance Ord B where compare (B x) (B y) = compare (A x) (A y)` emitted
+    `failed to synthesize Ord A` whenever the dump put `B` first.
+
+    It over-approximates on purpose — a body that merely PROJECTS an `A` gets the
+    same edge as one that orders two of them, and a `wild` `case` binder's recorded
+    type is not always the scrutinee's (see `firstVarArgTy`), so an unrelated decl
+    can pick up an edge too. An extra edge only constrains the order further, and
+    the one thing it can do is turn a would-be pair of independent decls into a
+    cycle, which `sortDataDecls` already appends in dump order and leaves loud at
+    `lake build`. That is why the over-approximation is affordable HERE and not in
+    `eqHoistHeads`, which moves a whole body and so reads only the first argument.
+
+    TWO channels, and BOTH are needed. Binder/`Var` types catch a value of `A`
+    that arrives as an argument or a `case` binder — the nested-field shape. But a
+    DATA CONSTRUCTOR `Var` carries no type at all: the shim types it `_Unknown`
+    (measured — `compare (A x) (A y)` dumps `Var A :: TyCon _Unknown`), so
+    `compare (A x) (A y)` would report NO dependency on `A` and the reverse-order
+    dump emitted `unknown identifier A.A`. `ctorOwner` closes that: a ctor
+    occurrence, in a `Var` or in an alt pattern, names its own type. -/
+partial def localTypesInExpr (localNames : List Name) (ctorOwner : Name → Option Name)
+    (self : Name) : Expr → List Name :=
+  let keep (t : GHCType) : List Name :=
+    (tyConNames t).filter fun n => n != self && localNames.contains n
+  let owner (n : Name) : List Name :=
+    match ctorOwner n with
+    | some d => if d != self && localNames.contains d then [d] else []
+    | none   => []
+  let altOwner : AltCon → List Name
+    | .dataCon c => owner c
+    | _          => []
+  let rec go : Expr → List Name
+    | .var v            => keep v.ty ++ owner v.name
+    | .lit _            => []
+    | .type_ t          => keep t
+    | .coercion         => []
+    | .cast e           => go e
+    | .tick e           => go e
+    | .lam v b          => keep v.ty ++ go b
+    | .let_ bnd b       =>
+      (match bnd with
+       | .nonRec v e => keep v.ty ++ go e
+       | .rec_ ps    => ps.flatMap (fun p => keep p.1.ty ++ go p.2))
+        ++ go b
+    | .app f a          => go f ++ go a
+    | .case_ s bv _ alts =>
+      go s ++ keep bv.ty
+        ++ alts.flatMap (fun (.mk c bs r) =>
+             altOwner c ++ bs.flatMap (fun b => keep b.ty) ++ go r)
+  fun e => dedup (go e)
+
 /-- Order data decls so that a decl using another local type as a field type is
     emitted AFTER it. Lean has no forward references and the decl-plugin's
     `tcg_tcs` dump order is not dependency order, so `inductive Rect` would
     otherwise reference a not-yet-declared `Point`.
+
+    `extraDeps` WIDENS the edge set with dependencies the field graph cannot see.
+    Its one caller passes the `Ord` section's compare-body reference graph
+    (`localTypesInExpr`), because that section is emitted INSIDE this order — each
+    type's `Ord` block sits next to its own `inductive` — so a reference out of one
+    compare body into another type's `Ord` is an ordering constraint on the DATA
+    decls. Defaulted to the empty graph so every other call site is unchanged.
 
     CONSTRAINT: the result is always exactly the input decls, reordered. Elements
     only move from `pending` to `acc` and never duplicate, so a preserved length
@@ -2696,15 +3140,17 @@ def dataDeclDeps (localNames : List Name) (d : DataDecl) : List Name :=
     The `| 0, pending` arm is DEAD: `go` starts at `fuel = ds.length` and every
     step consumes one fuel while removing one decl from `pending`, so `pending`
     empties first. It exists only to satisfy the termination checker. -/
-def sortDataDecls (ds : List DataDecl) : List DataDecl :=
+def sortDataDecls (ds : List DataDecl) (extraDeps : Name → List Name := fun _ => []) : List DataDecl :=
   let names := ds.map (·.name)
+  let depsOf (d : DataDecl) : List Name :=
+    dataDeclDeps names d ++ ((extraDeps d.name).filter fun n => n != d.name && names.contains n)
   let rec go (fuel : Nat) (pending : List DataDecl) (placed : List Name)
       (acc : List DataDecl) : List DataDecl :=
     match fuel, pending with
     | _, []            => acc.reverse
     | 0, pending       => acc.reverse ++ pending
     | fuel + 1, pending =>
-      match pending.find? (fun d => (dataDeclDeps names d).all (fun n => placed.contains n)) with
+      match pending.find? (fun d => (depsOf d).all (fun n => placed.contains n)) with
       | some d => go fuel (pending.filter (·.name != d.name)) (d.name :: placed) (d :: acc)
       | none   => acc.reverse ++ pending
   let result := go ds.length ds [] []
@@ -2860,7 +3306,7 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
       if i.className == "Ord" then some (i.headTypes.map emitType |> String.intercalate " ") else none
   let derivedOrd     : List String := ordHeads.filter (ordRoute p.binds · == .derived)
   let handwrittenOrd : List String := ordHeads.filter fun h =>
-    match ordRoute p.binds h with | .handwritten _ => true | _ => false
+    match ordRoute p.binds h with | .handwritten _ _ => true | _ => false
   let headMatches (v : Var) (s : List String) : Bool :=
     match methodHeadStr v with | some hs => s.contains hs | none => false
   let isSuppressedMethod (v : Var) : Bool :=
@@ -2895,11 +3341,35 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- Newtypes stay in the SORT's input — chains thread through them transitively
   -- (`Point` → `Wrapper`(newtype) → `Q`), and filtering first loses the edge —
   -- and are dropped only here, at the emission map.
-  let datas := ((sortDataDecls p.typeDecls).filter fun d =>
-      kept.any (·.name == d.name)).map fun d =>
-    let hs := emitType (.tyCon d.name [])
-    emitDataDecl (derivedEq.contains hs) (derivedOrd.contains hs) d
-      (handwrittenOrd := handwrittenOrd.contains hs)
+  --
+  -- WIDENED by the `Ord` section's compare-body REFERENCE graph (`extraDeps`).
+  -- That section is emitted inside this order — each type's `Ord` block sits next
+  -- to its own `inductive` — so a compare body at `B` that orders two `A`s makes
+  -- `A` an ordering dependency of `B` even though `A` is not a FIELD of `B`. The
+  -- field graph is strictly smaller than the requirement; `localTypesInExpr` says
+  -- what the extra edges are and why over-approximating them is safe.
+  let localTyNames : List Name := p.typeDecls.map (·.name)
+  -- Which local decl a data-constructor name belongs to. Over the FULL decl list
+  -- (newtypes included), because the sort's input is the full list too.
+  let ctorOwner : Name → Option Name := fun c =>
+    (p.typeDecls.find? fun d => d.ctors.any (·.name == c)).map (·.name)
+  let headStrOf (n : Name) : String := emitType (.tyCon n [])
+  let compareBodyAt (h : String) : Option (Var × Expr) :=
+    findClassMethodBind keptBinds "$ccompare" h
+  let ordRefDeps : Name → List Name := fun n =>
+    let h := headStrOf n
+    if !handwrittenOrd.contains h then []
+    else match compareBodyAt h with
+      | some (_, e) => localTypesInExpr localTyNames ctorOwner n e
+      | none        => []
+  let dataOrderDecls := sortDataDecls p.typeDecls ordRefDeps
+  -- Paired with the head string, because the `Ord`/`Eq` blocks below are spliced
+  -- in next to their own `inductive` and need the same key.
+  let datas : List (String × String) :=
+    (dataOrderDecls.filter fun d => kept.any (·.name == d.name)).map fun d =>
+      let hs := headStrOf d.name
+      (hs, emitDataDecl (derivedEq.contains hs) (derivedOrd.contains hs) d
+             (handwrittenOrd := handwrittenOrd.contains hs))
   -- Default methods: the class body carries the `:=` defaults translated from
   -- GHC's `$dm<method>` binds, and `defaults` is THE key that also suppresses
   -- those binds and their instance-side wrappers below (see the "Default
@@ -2936,12 +3406,57 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
     v.name.startsWith "$c" &&
       (let m := v.name.drop 2
        defaults.any (fun (_, dm) => dm == m) && isDefaultWrapperBody m e)
-  -- A hand-written `Ord`'s `$ccompare` leaves the general method-def section: it
-  -- gets its own section, `ordStr`, emitted FIRST (see below).
+  -- HAND-WRITTEN `Ord` — and, when a compare body needs it, a hand-written `Eq` —
+  -- leave the general method-def / instance sections: they are spliced into the
+  -- DATA BLOCK, each type's pieces next to that type's own `inductive`.
+  --
+  -- WHY THE DATA BLOCK AND NOT A LEADING SECTION OF `bodyRaw` (all measured; the
+  -- first release of this task used the leading-section layout and each of these
+  -- was a loud regression on ordinary Haskell that the fixture corpus could not
+  -- see):
+  --
+  -- * A `.derived` type with a `.handwritten` type as a FIELD. `data Inner = Inner
+  --   Int Int deriving (Eq, Ord)` (2 nullary constructors ⇒ no tag primop ⇒
+  --   hand-written route) as the field of `data Quad = QA | QB | QC | QD Inner
+  --   deriving (Eq, Ord)` (3 nullary ⇒ tag primops ⇒ derived route, so its `Ord`
+  --   is `deriving Ord` ON THE INDUCTIVE): `error: failed to synthesize Ord Inner`,
+  --   because the instance sat after the whole data block. Splicing fixes it for
+  --   free — `sortDataDecls` already puts a field type first, so `Inner`'s block
+  --   lands before `inductive Quad`.
+  -- * A class-body DEFAULT using `≤`/`<`/`min`/`max` at a hand-written-`Ord` head:
+  --   `failed to synthesize Min B` plus a cascading `Fields missing: bestB`. Class
+  --   decls are the LAST thing in the data block, so every spliced `Ord` precedes
+  --   them.
+  -- * A compare body referencing another hand-written-`Ord` type that is not a
+  --   FIELD — `ordRefDeps` above; the requirement is the reference graph, which is
+  --   strictly larger than the field graph.
+  -- * A compare body calling `==` at a type whose `Eq` is HAND-WRITTEN. There the
+  --   only `BEq` in scope was `instBEqOfDecidableEq`, off the `deriving
+  --   DecidableEq` this task's `handwrittenOrd` flag adds, so the body computed
+  --   STRUCTURAL equality while the user's `instance : BEq T` sat further down —
+  --   silently, two meanings of `==` in one module. `eqHoistHeads` moves that
+  --   instance ahead of the compare def; Lean picks the LAST declared candidate
+  --   among equal-priority ones, which is exactly why `M3T6R`'s "the explicit one
+  --   wins" held at ordinary use sites and failed inside this section.
+  --
+  -- The resolution pipeline is why splicing needs its own pass rather than a
+  -- reordering: a compare body pattern-matches on constructors and so needs
+  -- `resolveUserCtors`, which must never run over an `inductive`'s own `| Ctor `
+  -- lines. So each spliced block is resolved on its OWN, with the body pipeline,
+  -- and joined already-resolved (see the resolution-pipeline header).
+  let headOf (i : Instance) : String := i.headTypes.map emitType |> String.intercalate " "
+  -- Which hand-written `BEq` instances the spliced bodies need in scope (the B3
+  -- fix). Shared with `ordForwardRefs`, so the set spliced and the set scanned for
+  -- forward references cannot disagree.
+  let eqHoisted : List String :=
+    eqHoistHeads keptBinds derivedEq handwrittenOrd (p.typeDecls.length + 1)
   let isHandwrittenCompare (v : Var) : Bool :=
     v.name == "$ccompare" && headMatches v handwrittenOrd
+  let isHoistedEq (v : Var) : Bool :=
+    v.name == "$c==" && headMatches v eqHoisted
   let methodDefs := filterBinds
-    (fun v e => v.name.startsWith "$c" && !isWrapperBind v e && !isHandwrittenCompare v)
+    (fun v e => v.name.startsWith "$c" && !isWrapperBind v e
+                && !isHandwrittenCompare v && !isHoistedEq v)
     keptBinds
   let userBinds  := filterBinds
     (fun v _ => !v.name.startsWith "$c" && !isJunkName v.name && !isTranslatedDm v.name)
@@ -2952,74 +3467,81 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- cannot drift, and a method with its own class constraint would be covered.
   let methodStr := emitProgramWith methodMap classNames methodDefs ctorNames superBinders
   let userStr   := emitProgramWith methodMap classNames userBinds ctorNames superBinders
-  -- HAND-WRITTEN `Ord`, its own section, in DATA-DEPENDENCY order, each type's
-  -- three pieces adjacent: the `$ccompare` def, then `instance : Ord T`, then the
-  -- LE/LT/Min/Max companions.
-  --
-  -- WHY A SECTION AND NOT `methodStr` + `instStr` (measured, both failures):
-  --
-  -- * NESTED types. `data A = A Int deriving Ord; data B = B A deriving Ord` are
-  --   both `.handwritten` (neither derived body has a tag primop), and B's compare
-  --   body is `compare a1 b1` AT TYPE `A`. With the def in `methodStr` and the
-  --   instance in `instStr`, `instance : Ord A` came after B's def:
-  --   `error: failed to synthesize Ord A`. Pre-task both types got data-block
-  --   `deriving Ord`, so this was a REGRESSION on ordinary Haskell, invisible to
-  --   the fixture corpus (no fixture nests two derived-`Ord` types).
-  -- * ANOTHER class's `$c` method using `≤`/`<`/`min`/`max` at a hand-written-`Ord`
-  --   head — `instance Capped Frac where cap x y = min x y`. Also loud with the
-  --   instance in `instStr`, and also fine now that the whole `Ord` precedes
-  --   `methodStr`. `OrdHandwritten.hs`'s `Capped Frac` instance is exactly that
-  --   shape, so it is fixtured rather than merely argued.
-  --
-  -- It stays in `bodyRaw` rather than joining `dataBlock`: the compare body pattern-
-  -- matches on constructors and so needs `resolveUserCtors`, which must never run
-  -- over the data block (it would rewrite the inductive's own `| Ctor ` lines).
-  -- Ordering key is the emitted DATA order (`sortDataDecls`), which is exactly the
-  -- field-dependency order the nested case needs; a head with no local decl (an
-  -- orphan instance on an imported type) sorts last, stably.
-  let headOf (i : Instance) : String := i.headTypes.map emitType |> String.intercalate " "
-  let dataOrder : List String :=
-    (sortDataDecls p.typeDecls).map fun d => emitType (.tyCon d.name [])
-  let isHandwrittenOrdInst (i : Instance) : Bool :=
-    i.className == "Ord" &&
-      (match ordRoute p.binds (headOf i) with | .handwritten _ => true | _ => false)
-  let hwOrdInsts := p.instances.filter isHandwrittenOrdInst
-  -- Selection by walking the data order, rather than sorting by an index: total,
-  -- stable, and it places an orphan head (no local decl) last by construction.
-  let orderedHwOrd : List Instance :=
-    (dataOrder.flatMap fun h => hwOrdInsts.filter (headOf · == h))
-      ++ hwOrdInsts.filter (fun i => !dataOrder.contains (headOf i))
-  let ordBlocks : List String := orderedHwOrd.filterMap fun i => do
-    let (v, e) ← findClassMethodBind keptBinds "$ccompare" (headOf i)
-    let inst   ← emitInstance defaults userClasses derivedEq p.binds i
-    let defStr := emitProgramWith methodMap classNames [.nonRec v e] ctorNames superBinders
-    some s!"{defStr}\n\n{inst}"
-  let ordStr := String.intercalate "\n\n" ordBlocks
+  -- THE spliced-block top-name set: the WHOLE program's, not the one-bind program
+  -- the first release passed. With only the `$ccompare` bind in scope, a reference
+  -- to a user top-level function `norm` emitted `norm_2853` (a local id) and could
+  -- not resolve under ANY ordering — `Unknown identifier norm_2853`. It now emits
+  -- `norm`, which is still a forward reference (user binds come last, and hoisting
+  -- them would need this section to move again), so `Main.lean` warns about the
+  -- shape by name — see `ordForwardRefs`.
+  let splicedTop := ctorNames ++ collectTopNames keptBinds
+  -- `recOverride := some false`: a `.selfRec` compare's retargeted body mentions
+  -- its own binder, which `emitBind` would otherwise read as user recursion and
+  -- close with `decreasing_by all_goals sorry` — a `sorry` inside an `Ord`
+  -- instance, tainting every `decide` proof about the order. Lean's STRUCTURAL
+  -- recursion takes these bodies as they stand (the recursive call is always on a
+  -- constructor field of the scrutinee), and a body it cannot take is loud.
+  let spliceDef (b : Bind) : String :=
+    emitProgramWith methodMap classNames [b] splicedTop superBinders (recOverride := some false)
+  let resBody (s : String) : String :=
+    resolveUserCtors kept (resolveNewtypes nts (resolveUserTypes kept s))
+  let eqBlockFor (h : String) : Option String := do
+    let (v, e) ← hwEqBindAt keptBinds derivedEq h
+    let i ← p.instances.find? fun i => i.className == "Eq" && headOf i == h
+    let inst ← emitInstance defaults userClasses derivedEq p.binds i
+    some (resBody s!"{spliceDef (.nonRec v e)}\n\n{inst}")
+  let ordBlockFor (h : String) : Option String := do
+    let (v, e) ← compareBodyAt h
+    let i ← p.instances.find? fun i => i.className == "Ord" && headOf i == h
+    let inst ← emitInstance defaults userClasses derivedEq p.binds i
+    -- Self-recursion through the instance's own dictionary becomes recursion
+    -- through the def's own name; see `retargetSelfCompare`.
+    let e' := match ordRoute p.binds h with
+      | .handwritten _ true => retargetSelfCompare h v e
+      | _                   => e
+    some (resBody s!"{spliceDef (.nonRec v e')}\n\n{inst}")
+  let blocksFor (h : String) : List String :=
+    (if eqHoisted.contains h then (eqBlockFor h).toList else [])
+      ++ (if handwrittenOrd.contains h then (ordBlockFor h).toList else [])
+  -- An ORPHAN head (an instance on a type this module does not declare) has no
+  -- `inductive` to sit next to; its blocks go after every local decl, before the
+  -- class decls, which is where the pre-splice layout effectively put them too.
+  let localHeads := datas.map (·.1)
+  let orphanHeads := (handwrittenOrd ++ eqHoisted).eraseDups.filter
+    fun h => !localHeads.contains h
   -- Superclass-dependency order again, now for the instances: a child instance
   -- omits its parent field and Lean synthesizes it from the parent instance in
   -- scope, which must therefore already be emitted (`sortInstances`).
   --
-  -- `Ord` is filtered out AFTER the sort, never before it: those instances are
-  -- emitted in `ordStr` above (the derived and unsupported routes emit nothing
-  -- here anyway, so this filter is behaviour-preserving for them), and filtering
-  -- before the sort could in principle move the survivors relative to each other.
-  let insts := ((sortInstances userClasses p.instances).filter (·.className != "Ord")).filterMap
-    (emitInstance defaults userClasses derivedEq p.binds)
+  -- `Ord` (and a hoisted `Eq`) is filtered out AFTER the sort, never before it:
+  -- those instances are emitted in the data block above (the derived and
+  -- unsupported `Ord` routes emit nothing here anyway, so the filter is
+  -- behaviour-preserving for them), and filtering before the sort could in
+  -- principle move the survivors relative to each other.
+  let insts := ((sortInstances userClasses p.instances).filter fun i =>
+      i.className != "Ord" && !(i.className == "Eq" && eqHoisted.contains (headOf i)))
+    |>.filterMap (emitInstance defaults userClasses derivedEq p.binds)
   let instStr := String.intercalate "\n\n" insts
   let bodyRaw := String.intercalate "\n\n"
-    (List.filter (· != "") [ordStr, methodStr, instStr, userStr])
+    (List.filter (· != "") [methodStr, instStr, userStr])
   let bodyResolved := resolveUserTypes kept bodyRaw
                     |> resolveNewtypes nts
                     |> resolveUserCtors kept
   -- `resolveUserTypes` (opaque → bare) must run on the data block too: a local
   -- type used as another decl's FIELD type arrives as
   -- `(GHCCore.tyConOpaque "Point")` there, exactly as in a body. Only the
-  -- *type* pass runs here — `resolveUserCtors` would rewrite the `| Ctor `
-  -- lines of the inductive itself.
+  -- *type* pass runs on the `inductive`s and the class decls — `resolveUserCtors`
+  -- would rewrite the `| Ctor ` lines of the inductive itself — while the spliced
+  -- `Ord`/`Eq` blocks are already fully resolved (`resBody`) and are joined in
+  -- as-is. Per-piece resolution is equivalent to resolving the join: every needle
+  -- of passes 1–3 is a single identifier occurrence, so none can span the `\n\n`
+  -- that separates two pieces.
+  let res12 (s : String) : String := resolveNewtypes nts (resolveUserTypes kept s)
   let dataBlock :=
-    resolveNewtypes nts
-      (resolveUserTypes kept
-        (String.intercalate "\n\n" (List.filter (· != "") (datas ++ classDecls))))
+    String.intercalate "\n\n" (List.filter (· != "")
+      (datas.flatMap (fun (h, d) => res12 d :: blocksFor h)
+        ++ orphanHeads.flatMap blocksFor
+        ++ classDecls.map res12))
   let sections := List.filter (· != "") [dataBlock, bodyResolved]
   -- External-type resolution runs over the whole output (data fields included).
   -- It is safe because `resolveUserTypes` has already made every LOCAL type bare

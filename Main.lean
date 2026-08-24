@@ -270,6 +270,16 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- silently got Lean's STRUCTURAL order via `deriving Ord`.
     for head in Emit.unsupportedOrdInstances userProg do
       IO.eprintln s!"warning: {Emit.unsupportedOrdWarning head}"
+    -- Name every top-level function a hand-written `compare` body calls. The
+    -- `Ord` blocks are spliced into the data block (so a type deriving `Ord` from
+    -- such a head, and a class-body default ordering one, can see the instance),
+    -- which puts them ahead of every user bind — so the call is a forward
+    -- reference and `lake build` fails on it. Warning rather than refusal, for the
+    -- same reason as the three above: the emitted reference carries the real name,
+    -- so the build failure already names the cause; this says it at the transpiler
+    -- too, where the layout that causes it is decided.
+    for (head, fn) in Emit.ordForwardRefs userProg do
+      IO.eprintln s!"warning: {Emit.ordForwardRefWarning head fn}"
     -- Tripwire for the shim's role heuristic. A `$dm<method>` Var is a
     -- default-method BODY; the shim used to classify it as a dictionary (any
     -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT
