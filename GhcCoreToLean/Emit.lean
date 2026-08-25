@@ -1,5 +1,11 @@
 import GhcCoreToLean.AST
 import GhcCoreToLean.Maps
+-- `Lower` is imported for ONE thing: `eqHoistHeads`'s detection and
+-- `retargetSelfEq`'s rewrite both need the PRE-`Lower` body (the type application
+-- `Lower` erases is the only exact record of a class op's dispatch type), and the
+-- rewritten body then has to be lowered before it can be emitted. No cycle —
+-- `Lower` imports only `AST` and `Maps`.
+import GhcCoreToLean.Lower
 
 namespace GHCCore.Emit
 open GHCCore.Maps
@@ -1685,11 +1691,11 @@ private def findCompareBind (binds : CoreProgram) (headTyStr : String)
       (pairs.find? (fun (v, _) => matchesHead v)).map fun (v, e) =>
         (v, e, pairs.any (fun (w, _) => w.name.startsWith "$f"))
 
-/-- The emitted type of an application's FIRST `Var` argument — the type a class
-    op is instantiated at, since `Lower` erases the `@T` type application and the
-    dictionary and leaves the value arguments. `none` when no argument is a bare
-    `Var` (a compound argument carries no type here at all), which can only
-    under-report — the conservative direction for every caller.
+/-- The emitted type of an application's FIRST `Var` argument — a POST-`Lower`
+    approximation of the type a class op is instantiated at, which works only
+    because `Lower` has erased the `@T` type application and the dictionary and
+    left the value arguments. `none` when no argument is a bare `Var` (a compound
+    argument carries no type here at all).
 
     THE FIRST ONE, not any one, and that is load-bearing. A class op's dispatch
     type is its first value argument's type, which is the convention
@@ -1701,11 +1707,67 @@ private def findCompareBind (binds : CoreProgram) (headTyStr : String)
     (wrong, and `Alpha` is another decl in the same module). Under "some argument"
     that made `eqHoistHeads` hoist `Alpha`'s `BEq` as well — harmless in itself,
     but a spurious hoist moves a body into the data block and can turn a `$c==`
-    that calls a top-level function from working into loud. -/
+    that calls a top-level function from working into loud.
+
+    UNDER-REPORTING IS NOT UNIFORMLY CONSERVATIVE, and an earlier version of this
+    docstring claimed it was ("the conservative direction for every caller").
+    Per caller:
+
+    * `ownDictOpsAtHead`, `retargetSelfCompare` — under-report ⇒ LOUD. Missing an
+      op means `ordRoute` refuses the body, or a self-`compare` is left needing an
+      `Ord` declared later; both fail at `lake build`.
+    * `opArgTypes` (via `classOpHeadTy`) — under-report ⇒ SILENT-WRONG. Missing an
+      `==` means `eqHoistHeads` does not splice the user's `BEq` ahead of the
+      spliced `Ord` block, so that `==` binds `instBEqOfDecidableEq` (structural
+      equality) with no diagnostic anywhere. `instance Eq G where G a b == G c d =
+      a * d == c * b` plus a `compare` testing `G a b == G c d` is exactly that
+      shape: post-`Lower` the spine is `== (G a b) (G c d)`, no bare `Var`, nothing
+      detected. That caller therefore reads the TYPE APPLICATION out of the
+      pre-`Lower` program (`classOpHeadTy`) and uses this function only as the
+      fallback for a post-`Lower` input, where the quirk above is why it still
+      reads the first argument and not any argument. -/
 def firstVarArgTy : List Expr → Option String
   | []            => none
   | .var v :: _   => some (emitType v.ty)
   | _ :: rest     => firstVarArgTy rest
+
+/-- The emitted type a class op is instantiated at, read from the application's
+    TYPE ARGUMENT: `== @Cross $fEqCross (Cross a b) (Cross c d)` ⇒
+    `emitType Cross`. OBSERVED spine, from `/tmp/transpile-OrdSectionOrder.json` —
+    section (6) of that fixture, the `$ccompare` body of
+    `instance Ord Cross where compare (Cross a b) (Cross c d) | Cross a b ==
+    Cross c d = EQ | …`:
+
+        App (App (App (App (Var GHC.Classes.==) (Type (TyCon Cross)))
+                      (Var $fEqCross [role=dict]))
+                 (App (App (Var Cross) (Var a)) (Var b)))
+            (App (App (Var Cross) (Var c)) (Var d))
+
+    i.e. `spineOf` gives `[Type Cross, Var $fEqCross, Cross a b, Cross c d]` and
+    the FIRST element is the answer. Shape-independent: it does not matter what the
+    value arguments look like, which is the whole point — `firstVarArgTy` reads
+    nothing at all here, and on this spine the first bare `Var` is the DICTIONARY
+    (`$fEqCross`, typed `_Unknown` by the shim), so it is not a usable fallback
+    pre-`Lower` either. The measured argument-tag lists for the same fixture's two
+    `Ord` heads are `[Type, Var, App, App]` for `Cross` and `[Type, Var, Var, Var]`
+    for `Frac2` — the second is the only one the pre-fix read could see.
+
+    EXACT for the ops this is used with, and that is a precondition rather than a
+    theorem: it assumes a SINGLE-PARAMETER class whose class variable is the first
+    type argument of the method (`Eq a`'s `==`, `Ord a`'s `compare`). A
+    multi-parameter or higher-kinded op would put something else first and this
+    would answer the wrong type silently — so `opArgTypes`' `ops` list must stay
+    single-parameter class methods.
+
+    FALLS BACK to `firstVarArgTy` when there is no type argument at all. That is
+    the post-`Lower` case (`Lower` erases `.type_` arguments), which the two
+    `eqHoistHeads` callers reach only for a `Program` whose `rawBinds` defaulted
+    to `binds` — a hand-written test literal. Falling back keeps those literals
+    answering what they answered before this fix. -/
+def classOpHeadTy (as : List Expr) : Option String :=
+  match as.findSome? (fun | .type_ t => some (emitType t) | _ => none) with
+  | some h => some h
+  | none   => firstVarArgTy as
 
 /-- The FOREIGN (dotted, i.e. non-local) operators this body applies to a value of
     `headTy`. For a `$ccompare` body that shares a Rec group with its own
@@ -2153,12 +2215,16 @@ def unsupportedOrdWarning (head : Name) : String :=
   s!"  method call as a `compare … = …` test instead."
 
 /-- The emitted head-type strings at which this body applies one of `ops` — the
-    `firstVarArgTy` reading, i.e. the type the op is instantiated at, with the
-    same limitation (a first argument that is not a bare `Var` carries no type
-    post-`Lower`, so it produces no entry).
+    `classOpHeadTy` reading, i.e. the type argument of the application when there
+    is one (exact, and the reason this must be given a PRE-`Lower` body) and the
+    first bare-`Var` argument's type otherwise.
 
     Used for ONE question: at which types does an emitted `Ord`-section body call
-    `==`/`/=`? Those are the `BEq` instances that must precede it. -/
+    `==`/`/=`? Those are the `BEq` instances that must precede it.
+
+    `ops` must be SINGLE-PARAMETER class methods — see `classOpHeadTy`, whose
+    "first type argument is the dispatch type" reading is a precondition on the
+    caller, not something it can check. -/
 partial def opArgTypes (ops : List Name) : Expr → List String :=
   let rec go : Expr → List String
     | .cast e           => go e
@@ -2173,7 +2239,7 @@ partial def opArgTypes (ops : List Name) : Expr → List String :=
     | e@(.app f a)      =>
       let (h, as) := spineOf e
       let here := match h with
-        | .var op => if ops.contains op.name then (firstVarArgTy as).toList else []
+        | .var op => if ops.contains op.name then (classOpHeadTy as).toList else []
         | _       => []
       here ++ go f ++ go a
     | _                 => []
@@ -2186,6 +2252,45 @@ partial def opArgTypes (ops : List Name) : Expr → List String :=
 def hwEqBindAt (binds : CoreProgram) (derivedEq : List String) (h : String)
     : Option (Var × Expr) :=
   if derivedEq.contains h then none else findClassMethodBind binds "$c==" h
+
+/-- The heads whose OWN hand-written `$c==` body applies one of `ops` at that same
+    head — a SELF-RECURSIVE hand-written `Eq`.
+
+    Its own key, not a by-product of the `$ccompare` scan, because the defect it
+    marks does not need a `compare` that mentions `==` at all. The `$c==` def
+    precedes its `instance : BEq T` in EVERY layout — the instance references the
+    def — so a self-`==` inside that body never sees the user's `BEq`. Whether that
+    is silent or loud is decided by one line of the `inductive`: a
+    `handwrittenOrd`/`derivedOrd` head carries `deriving … DecidableEq`, so
+    `instBEqOfDecidableEq` is in scope from the data block and the call computes
+    STRUCTURAL equality with no diagnostic; without that `deriving` the same call
+    is a loud `failed to synthesize BEq T`. The silent half is the one that matters,
+    and `eqHoistHeads` seeds on this so `eqBlockFor` gets the head — that is where
+    `retargetSelfEq` runs, and where `spliceDef`'s `recOverride := some false`
+    makes the resulting self-call STRUCTURAL recursion rather than a
+    `decreasing_by all_goals sorry`.
+
+    CANDIDATES come from `scanBinds` itself — every `$c==` binder's head via
+    `methodHeadStr` — so no caller has to supply a head list that could disagree
+    with the binds. `binds` still decides membership (`hwEqBindAt`), and the body is
+    read from `scanBinds` because `classOpHeadTy` needs the pre-`Lower` type
+    application.
+
+    ONE definition, two consumers — the seed (`eqHoistHeads`) and the residual
+    diagnostic (`hoistedEqSelfResiduals`) — so "which `Eq` recurses at its own
+    head" has a single answer. -/
+def selfEqHeads (binds scanBinds : CoreProgram) (derivedEq : List String)
+    (ops : List Name) : List String :=
+  let headOfEqBinder (v : Var) : List String :=
+    if v.name == "$c==" then (methodHeadStr v).toList else []
+  let cands := (scanBinds.flatMap fun b => match b with
+    | .nonRec v _ => headOfEqBinder v
+    | .rec_ ps    => ps.flatMap (fun (v, _) => headOfEqBinder v)).eraseDups
+  cands.filter fun h =>
+    (hwEqBindAt binds derivedEq h).isSome &&
+      (match findClassMethodBind scanBinds "$c==" h with
+       | some (_, e) => (opArgTypes ops e).contains h
+       | none        => false)
 
 /-- The heads whose hand-written `instance : BEq` must be emitted BEFORE the
     spliced `Ord` blocks, because some spliced body calls `==`/`/=` at that head.
@@ -2202,23 +2307,178 @@ def hwEqBindAt (binds : CoreProgram) (derivedEq : List String) (h : String)
     precede it too. `fuel` bounds the closure (the decl count is enough — each
     round either adds a head or stops).
 
+    ALSO SEEDED by `selfEqHeads`, which is NOT reachable from the `$ccompare` scan:
+    a hand-written `Eq` that recurses at its own head has the same silent-wrong
+    whether or not any `compare` mentions `==` there, because the `$c==` def
+    precedes its `instance : BEq` in every layout. Routing such a head through the
+    hoist is what gets it `retargetSelfEq` and `recOverride := some false`. The
+    seed is UNIONED into each round rather than only into the initial accumulator —
+    `next` is recomputed from scratch, so an element that did not re-derive itself
+    would be dropped — and APPENDED, so when the seed is empty (every corpus module
+    but the two fixture sections) the result is order-for-order what it was.
+
+    TWO BIND LISTS, and the split is the fix for the compound-argument
+    silent-wrong. `scanBinds` is the PRE-`Lower` program (`Program.rawBinds`) and
+    is used only to fetch the BODIES that get scanned, because the type argument
+    `classOpHeadTy` reads is exactly what `Lower` erases. `binds` is the list the
+    emission keeps, and every MEMBERSHIP decision still comes from it: a head is
+    hoisted only if `hwEqBindAt binds` finds a hand-written `$c==` there, so no
+    head can be spliced whose body the emitter does not have. Passing the same
+    list twice reproduces the pre-fix behaviour exactly (`classOpHeadTy` falls
+    back to `firstVarArgTy` when the type argument is gone), which is what a
+    `Program` with a defaulted `rawBinds` does.
+
+    The detected set is now a SUPERSET of the pre-fix one: an `==` whose arguments
+    are compound produced no head at all before and produces its exact head now,
+    so `hwEqBindAt`'s filter is doing strictly more work. Every added element is a
+    genuine `==`-at-that-head, which is why this is not the spurious hoist
+    `localTypesInExpr` warns about — that one comes from reading a type off the
+    wrong `Var`, and the type-application read consults no `Var` at all.
+
     ONE definition, two callers — the emission (`emitFullProgram`) and the
     forward-reference diagnostic (`ordForwardRefs`) — so the set that gets spliced
-    and the set that gets scanned for forward references cannot disagree. -/
-def eqHoistHeads (binds : CoreProgram) (derivedEq : List String)
-    (handwrittenOrdHeads : List String) (fuel : Nat) : List String :=
+    and the set that gets scanned for forward references cannot disagree. The two
+    pass `binds` differently (kept binds vs. the whole program, as they did before
+    this fix) but pass the SAME unfiltered `scanBinds`. -/
+def eqHoistHeads (binds : CoreProgram) (scanBinds : CoreProgram)
+    (derivedEq : List String) (handwrittenOrdHeads : List String) (fuel : Nat)
+    : List String :=
   let eqOps : List Name := ["GHC.Classes.==", "GHC.Classes./="]
-  let cmpBodies := handwrittenOrdHeads.filterMap fun h =>
-    (findClassMethodBind binds "$ccompare" h).map (·.2)
+  -- The body comes from `scanBinds`, the decision that there IS one from `binds`:
+  -- a head with no kept `$ccompare` is not on the hand-written route at all.
+  let bodyOf (method : Name) (h : String) : Option Expr := do
+    let _ ← findClassMethodBind binds method h
+    (findClassMethodBind scanBinds method h).map (·.2)
+  let cmpBodies := handwrittenOrdHeads.filterMap (bodyOf "$ccompare" ·)
+  -- `==` only: retargeting is what the hoist buys such a head, and `retargetSelfEq`
+  -- redirects `==` alone (the def being emitted IS `==`). A `/=`-at-own-head body
+  -- gains nothing from moving, and is reported instead — `hoistedEqSelfResiduals`.
+  let selfSeed := selfEqHeads binds scanBinds derivedEq ["GHC.Classes.=="]
   let rec grow (fuel : Nat) (acc : List String) : List String :=
     match fuel with
     | 0        => acc
     | fuel + 1 =>
-      let bodies := cmpBodies ++ acc.filterMap fun h => (hwEqBindAt binds derivedEq h).map (·.2)
-      let next := ((bodies.flatMap (opArgTypes eqOps)).filter
+      let bodies := cmpBodies ++ acc.filterMap fun h =>
+        if (hwEqBindAt binds derivedEq h).isSome then bodyOf "$c==" h else none
+      let next := ((bodies.flatMap (opArgTypes eqOps) ++ selfSeed).filter
                     fun h => (hwEqBindAt binds derivedEq h).isSome).eraseDups
       if next == acc then acc else grow fuel next
-  grow fuel []
+  grow fuel selfSeed
+
+/-- Rewrite a hand-written `$c==` body's SELF-RECURSIVE `==` calls — `==`
+    instantiated at `headTy`, which PRE-`Lower` is `== @T $fEqT a b` — to
+    reference `self` (the `$c==` binder itself), so `refId`/`defNameId` spell it
+    `localId self`: the very def this body becomes.
+
+    WHY THIS IS NOT `retargetSelfCompare` WITH A DIFFERENT NAME. That function's
+    safety argument is "both misfire directions are LOUD", and the FAILURE-to-
+    retarget half of it does not transfer. `eqHoistHeads` splices the `$c==` def
+    ahead of `instance : BEq T` (it has to — the instance references the def), so a
+    self-`==` left in place resolves against the only `BEq T` in scope there:
+    core's `instBEqOfDecidableEq`, off the `deriving DecidableEq` that
+    `emitDataDecl`'s `handwrittenOrd` flag adds. That is STRUCTURAL equality, with
+    no diagnostic — measured on `OrdSectionOrder.hs`'s parity-`Eq` list `PList`
+    (section (7); `PCons a as == PCons b bs` tests `a mod 2 == b mod 2 && as == bs`),
+    which was correct at depth 1 and silently structural at depth ≥ 2:
+    `decide` PROVED `plistEq (PCons 1 (PCons 2 PNil)) (PCons 3 (PCons 4 PNil)) =
+    true` FALSE. So this retarget must be RELIABLE, not
+    merely loud-on-misfire, which is why it is keyed on the type application
+    (`classOpHeadTy` — exact for any argument shape) and runs PRE-`Lower`, where
+    that argument still exists. The over-retarget half does still fail loudly: a
+    call at some other type becomes `self` applied to values of that type, an
+    argument-type mismatch at `lake build`.
+
+    PRODUCES A PRE-`Lower` EXPRESSION. The replaced spine keeps the arguments it
+    had, type application and dictionary included, applied to `self` instead of to
+    the class op; `Lower.lowerExpr` then erases those two exactly as it would have
+    erased them from the original spine, leaving `self a b`. The caller must lower
+    the result (`emitFullProgram`'s `eqBlockFor` does) — emitting it unlowered
+    would apply the def to a type and a dictionary.
+
+    Only `==` is retargeted, never `/=`: `self` IS `==`, and `$c/=` is not spliced.
+    A `/=` at the own head inside a hoisted `$c==` body is therefore a residual,
+    and `hoistedEqSelfResiduals` reports it by name. -/
+partial def retargetSelfEq (headTy : String) (self : Var) : Expr → Expr
+  | .cast e           => .cast (retargetSelfEq headTy self e)
+  | .tick e           => .tick (retargetSelfEq headTy self e)
+  | .lam v b          => .lam v (retargetSelfEq headTy self b)
+  | .let_ bnd b       =>
+    let bnd' := match bnd with
+      | .nonRec v e => Bind.nonRec v (retargetSelfEq headTy self e)
+      | .rec_ ps    => Bind.rec_ (ps.map fun (v, e) => (v, retargetSelfEq headTy self e))
+    .let_ bnd' (retargetSelfEq headTy self b)
+  | .case_ s bv ty alts =>
+    .case_ (retargetSelfEq headTy self s) bv ty
+      (alts.map fun (.mk c bs r) => Alt.mk c bs (retargetSelfEq headTy self r))
+  | e@(.app f a)      =>
+    let (h, as) := spineOf e
+    match h with
+    | .var op =>
+      if op.name == "GHC.Classes.==" && classOpHeadTy as == some headTy then
+        (as.map (retargetSelfEq headTy self)).foldl Expr.app (.var self)
+      else
+        .app (retargetSelfEq headTy self f) (retargetSelfEq headTy self a)
+    | _ => .app (retargetSelfEq headTy self f) (retargetSelfEq headTy self a)
+  | e                 => e
+
+/-- `(type, op)` for every `==`/`/=` a hand-written `$c==` body still applies at its
+    OWN head after `retargetSelfEq` has run. Two shapes reach it:
+
+    * `/=` at the own head, which `retargetSelfEq` deliberately does not touch
+      (`self` is `==`, and `$c/=` is not spliced);
+    * an `==` the retarget could not establish a head type for — no type argument
+      and no bare-`Var` argument either, which no observed dump produces but which
+      would otherwise be silent.
+
+    Either one resolves against whatever `BEq` the data block already has, since
+    `instance : BEq T` necessarily FOLLOWS the def it points at. On a head that
+    carries `deriving … DecidableEq` — every `handwrittenOrd`/`derivedOrd` head —
+    that is core's `instBEqOfDecidableEq`, i.e. STRUCTURAL equality with no
+    diagnostic; on a head without it the same call is a loud `failed to synthesize
+    BEq T`. This makes the silent case LOUD at the transpiler, and says which of
+    the two the reader is looking at.
+
+    THE SCANNED SET is the hoisted heads UNION `selfEqHeads` for both ops, not the
+    hoisted set alone. `eqHoistHeads` seeds on `==`-at-own-head, so every
+    retargetable head is hoisted and covered either way; the union is what adds a
+    head whose only own-head op is `/=`, which the hoist deliberately leaves where
+    it is. -/
+def hoistedEqSelfResiduals (p : Program) : List (Name × Name) :=
+  let derivedEq := derivedEqTypes p.binds
+  let hwOrd := (p.instances.filter (·.className == "Ord")).filterMap fun i =>
+    let h := i.headTypes.map emitType |> String.intercalate " "
+    match ordRoute p.binds h with
+    | .handwritten _ _ => some h
+    | _                => none
+  let eqOps : List Name := ["GHC.Classes.==", "GHC.Classes./="]
+  let scanned :=
+    (eqHoistHeads p.binds p.rawBinds derivedEq hwOrd (p.typeDecls.length + 1)
+      ++ selfEqHeads p.binds p.rawBinds derivedEq eqOps).eraseDups
+  let nameOfHead (h : String) : Name :=
+    match p.typeDecls.find? (fun d => emitType (.tyCon d.name []) == h) with
+    | some d => d.name
+    | none   => h
+  scanned.flatMap fun h =>
+    match findClassMethodBind p.rawBinds "$c==" h with
+    | none        => []
+    | some (v, e) =>
+      let e' := retargetSelfEq h v e
+      [("GHC.Classes.==", "=="), ("GHC.Classes./=", "/=")].filterMap fun (op, shown) =>
+        if (opArgTypes [op] e').contains h then some (nameOfHead h, shown) else none
+
+/-- The warning for one `hoistedEqSelfResiduals` entry. -/
+def hoistedEqSelfResidualWarning (head op : Name) : String :=
+  s!"hand-written `Eq {head}` applies `{op}` at `{head}` inside its own `==` body, and\n" ++
+  s!"  that call is NOT redirected to the definition being emitted. That definition\n" ++
+  s!"  necessarily PRECEDES `instance : BEq {head}` (the instance references it), so\n" ++
+  s!"  the call resolves against whatever `BEq {head}` the data block already has:\n" ++
+  s!"  core's `instBEqOfDecidableEq` if `{head}` carries `deriving … DecidableEq`\n" ++
+  s!"  (every hand-written- or derived-`Ord` head does) — STRUCTURAL equality, not\n" ++
+  s!"  `{head}`'s own — and otherwise a loud `failed to synthesize BEq {head}`.\n" ++
+  s!"  A self-recursive `==` IS redirected (`retargetSelfEq`); `/=` is not, because\n" ++
+  s!"  the def being emitted is `==`.\n" ++
+  s!"  Fix: express the `{op}` as `not (… == …)`, or move the test out of the\n" ++
+  s!"  instance body into a top-level function that `compare` calls instead."
 
 /-- Names of every `Var` an expression references. -/
 private partial def collectVarNames : Expr → List Name
@@ -2267,7 +2527,8 @@ def ordForwardRefs (p : Program) : List (Name × Name) :=
     match ordRoute p.binds h with
     | .handwritten _ _ => some (headTypeNames i, h)
     | _                => none
-  let hoisted := eqHoistHeads p.binds derivedEq (hwOrd.map (·.2)) (p.typeDecls.length + 1)
+  let hoisted := eqHoistHeads p.binds p.rawBinds derivedEq (hwOrd.map (·.2))
+                   (p.typeDecls.length + 1)
   -- The reported head is the TYPE the body belongs to, so an `Eq` hoisted at a
   -- different head than the `Ord` that needed it is named by its own type.
   let nameOfHead (h : String) : Name :=
@@ -2317,13 +2578,16 @@ def emitInstance (defaults : List (Name × Name)) (classes : List ClassDecl)
     --   Nothing here, and the untranslatable `$ccompare`/`$c<`/… defs are
     --   suppressed in `emitFullProgram`.
     -- * HAND-WRITTEN — the user's `compare`, wired here, with the same four
-    --   companions derived from it. They cannot go in the DATA block: they need
-    --   `Ord T`, which needs the `$ccompare` def, which the data block precedes.
-    --   `emitFullProgram` therefore emits this string in a section of its own,
-    --   immediately after that def and ahead of every other method def — the
-    --   ordering is load-bearing in two measured ways (nested derived-`Ord` types,
-    --   and another class's `$c` method using `min` at this head); see the
-    --   `ordStr` comment there and the `M3 Task 6` block in `Tests/Unit.lean`.
+    --   companions derived from it. This string does NOT land in the instance
+    --   section: `emitFullProgram` SPLICES it into the data block, immediately
+    --   after the `$ccompare` def it points at and next to that type's own
+    --   `inductive` (`ordBlockFor`/`blocksFor`; the sort widened by `ordRefDeps`
+    --   is what puts the pieces in a workable order). Four measured layouts
+    --   failed before that — a derived-`Ord` type with a hand-written-`Ord`
+    --   FIELD, a class-body default using `min` at this head, a compare body
+    --   ordering a non-field type, and a compare body calling `==` at a
+    --   hand-written-`Eq` head (the silent one). See `emitFullProgram`'s "WHY THE
+    --   DATA BLOCK" comment and the `M3 Task 6` block in `Tests/Unit.lean`.
     -- * UNSUPPORTED — no `Ord` at all; `Main.lean` warns and every use is loud.
     match ordRoute binds tyStr with
     | .derived            => none
@@ -3356,6 +3620,17 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   let headStrOf (n : Name) : String := emitType (.tyCon n [])
   let compareBodyAt (h : String) : Option (Var × Expr) :=
     findClassMethodBind keptBinds "$ccompare" h
+  -- ASYMMETRY WITH `eqHoistHeads`, deliberate and LOUD where it bites: these
+  -- extra ordering edges come from `$ccompare` bodies only. A `$c==` that
+  -- `eqHoistHeads` hoists to `X` and whose body references type `Y` therefore
+  -- contributes no edge `Y → X`, so `Y`'s `Ord`/`BEq` block can be emitted after
+  -- `X`'s — `failed to synthesize Ord Y` at `lake build`, never a wrong answer.
+  -- Only reachable when `Y` does not already arrive via a FIELD of `X` (the field
+  -- graph `sortDataDecls` starts from), which is why no corpus module hits it.
+  -- Widening the scan to hoisted `$c==` bodies is the fix if one ever does; it is
+  -- not done here because every such edge would also constrain the order for
+  -- bodies that merely PROJECT a `Y`, and an unnecessary edge can only turn an
+  -- independent pair into a cycle (see `localTypesInExpr`).
   let ordRefDeps : Name → List Name := fun n =>
     let h := headStrOf n
     if !handwrittenOrd.contains h then []
@@ -3449,7 +3724,7 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- fix). Shared with `ordForwardRefs`, so the set spliced and the set scanned for
   -- forward references cannot disagree.
   let eqHoisted : List String :=
-    eqHoistHeads keptBinds derivedEq handwrittenOrd (p.typeDecls.length + 1)
+    eqHoistHeads keptBinds p.rawBinds derivedEq handwrittenOrd (p.typeDecls.length + 1)
   let isHandwrittenCompare (v : Var) : Bool :=
     v.name == "$ccompare" && headMatches v handwrittenOrd
   let isHoistedEq (v : Var) : Bool :=
@@ -3489,7 +3764,18 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
     let (v, e) ← hwEqBindAt keptBinds derivedEq h
     let i ← p.instances.find? fun i => i.className == "Eq" && headOf i == h
     let inst ← emitInstance defaults userClasses derivedEq p.binds i
-    some (resBody s!"{spliceDef (.nonRec v e)}\n\n{inst}")
+    -- A self-recursive `==` becomes recursion through the def's own name — and
+    -- must, because the `instance : BEq` this def backs is emitted AFTER it, so a
+    -- self-`==` left in place binds `instBEqOfDecidableEq` (structural) silently.
+    -- See `retargetSelfEq`: it is keyed on the type application, so it runs on the
+    -- PRE-`Lower` body and the result is lowered here. When the retarget is a
+    -- no-op that lowering reproduces `e` exactly (`Lower.lowerProgram` is
+    -- `lowerExpr` per bind, and `p.rawBinds` is the same bind list pre-`Lower`),
+    -- which is why a hoisted non-recursive `Eq` is byte-identical to before.
+    let e' := match findClassMethodBind p.rawBinds "$c==" h with
+      | some (_, raw) => Lower.lowerExpr (retargetSelfEq h v raw)
+      | none          => e
+    some (resBody s!"{spliceDef (.nonRec v e')}\n\n{inst}")
   let ordBlockFor (h : String) : Option String := do
     let (v, e) ← compareBodyAt h
     let i ← p.instances.find? fun i => i.className == "Ord" && headOf i == h

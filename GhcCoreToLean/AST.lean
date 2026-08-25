@@ -146,6 +146,26 @@ structure Program where
       built from a pre-`classDecls` JSON (or a hand-written test literal) still
       elaborates; `Emit` then falls back to Core reconstruction. -/
   classDecls : List ClassDecl := []
+  /-- THE SAME binds as `binds`, but PRE-`Lower`: same filtering, only the
+      erasure has not happened. `Main.lean` sets it to the list it hands to
+      `Lower.lowerProgram`, so the two differ in exactly one way.
+
+      Why the emitter needs both. `Lower` erases a class-method application's
+      TYPE argument (`== @T $fEqT a b` ⇒ `== a b`), and that argument is the only
+      exact record of the type a class op is instantiated at: post-`Lower` the
+      dispatch type has to be guessed from a value argument's type, which fails
+      outright when no argument is a bare `Var` (`G a b == G c d`). That guess is
+      what `Emit.eqHoistHeads` used to decide which hand-written `BEq` must
+      precede a spliced `Ord` block, and a miss there is SILENT-WRONG: the `==`
+      inside the block falls back to `instBEqOfDecidableEq`, i.e. structural
+      equality. `Emit.classOpHeadTy` reads the type application out of THIS list
+      instead. Emission still uses `binds` — a lowered body is what has a Lean
+      image — so this field is read only by the analyses that need the type.
+
+      Defaulted to `binds` so a hand-written test literal (or any caller that has
+      only the lowered program) keeps the pre-existing post-`Lower` behaviour
+      rather than silently analysing an empty list. -/
+  rawBinds  : CoreProgram := binds
 deriving Inhabited
 
 end GHCCore

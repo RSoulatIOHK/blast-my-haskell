@@ -9,12 +9,21 @@
 -- `Ord` lands, which the first release of Task 6 got wrong in five ways at once —
 -- every one of them a loud failure on ORDINARY Haskell, and not one of them
 -- visible to the rest of the corpus, which is why they survived a byte-identity
--- sweep. Each numbered section below is one of them.
+-- sweep. Sections (1)-(5) are those five.
 --
--- The four `Ord` blocks are spliced into the DATA BLOCK, each next to its own
--- `inductive`, in `sortDataDecls`' order widened by the compare-body reference
+-- Sections (6) and (7) are two later, SILENT ones, both in the mechanism that
+-- fixed (4): the user's `BEq` is spliced ahead of the compare def only if the `==`
+-- is DETECTED, and detection read a value argument's type. (6) is an `==` with no
+-- bare-`Var` argument — nothing detected, nothing hoisted. (7) is a self-recursive
+-- hand-written `Eq`, where the hoist necessarily puts the def before the instance
+-- it backs, so the recursive `==` inside it stayed structural. Detection now reads
+-- the pre-`Lower` TYPE APPLICATION (`Emit.classOpHeadTy`) and the self-call is
+-- retargeted (`Emit.retargetSelfEq`).
+--
+-- Every hand-written `Ord` block is spliced into the DATA BLOCK, each next to its
+-- own `inductive`, in `sortDataDecls`' order widened by the compare-body reference
 -- graph. See `Emit.emitFullProgram`'s "WHY THE DATA BLOCK" comment for the
--- measured failure of every other layout, and the `M3T6O` block in
+-- measured failure of every other layout, and the `M3T6O`/`M3T6E` blocks in
 -- GhcCoreToLean/Tests/Unit.lean for the unit pins.
 module OrdSectionOrder where
     import Prelude
@@ -119,6 +128,100 @@ module OrdSectionOrder where
     zTg :: Z -> Frac2 -> Frac2
     zTg = tg
 
+    -- (6) THE COMPOUND-ARGUMENT SHAPE. Same silent defect as (4), one step
+    -- further: the `==` inside `compare` has no bare-`Var` argument at all, so the
+    -- detection that fixed (4) — read the first `Var` argument's type, post-`Lower`
+    -- — found nothing and the hoist never happened. `Frac2` above is detected only
+    -- because GHC's `x@(Frac2 a b)` binder makes `x` a `Var`; drop the as-pattern
+    -- and the very same instance goes silent again. Detection now reads the TYPE
+    -- APPLICATION (`== @Cross $fEqCross …`, present pre-`Lower`), which no argument
+    -- shape can hide. Measured with the pre-fix binary: transpiler stderr empty and
+    -- `decide` PROVED `crossCompare (Cross 1 2) (Cross 2 4) = Ordering.eq` FALSE.
+    data Cross = Cross Int Int
+
+    instance Eq Cross where
+        Cross a b == Cross c d = a * d == c * b
+
+    instance Ord Cross where
+        compare (Cross a b) (Cross c d)
+            | Cross a b == Cross c d = EQ
+            | a * d < c * b          = LT
+            | otherwise              = GT
+
+    crossCompare :: Cross -> Cross -> Ordering
+    crossCompare = compare
+
+    crossEq :: Cross -> Cross -> Bool
+    crossEq = (==)
+
+    -- (7) A SELF-RECURSIVE hand-written `Eq`, hoisted. The hoist puts the `$c==`
+    -- def ahead of the `instance : BEq PList` it backs — it has to, the instance
+    -- references the def — so the recursive `as == bs` INSIDE that body was the one
+    -- `==` still resolving to `instBEqOfDecidableEq`. Parity equality is therefore
+    -- correct at depth 1 and silently STRUCTURAL at depth ≥ 2. `retargetSelfEq`
+    -- points the recursive call at the def being emitted, the way
+    -- `retargetSelfCompare` already did for `compare` — but keyed on the type
+    -- application, because a MISSED `compare` is loud (`failed to synthesize Ord`)
+    -- and a missed `==` is not.
+    --
+    -- Written with nested `case`s rather than overlapping equations so GHC emits no
+    -- `void#` join point (which has no Lean image and would make this loud for an
+    -- unrelated reason).
+    data PList = PNil | PCons Int PList
+
+    instance Eq PList where
+        PNil == y = case y of
+            PNil      -> True
+            PCons _ _ -> False
+        PCons a as == y = case y of
+            PNil       -> False
+            PCons b bs -> (a `mod` 2 == b `mod` 2) && (as == bs)
+
+    instance Ord PList where
+        compare x y
+            | x == y    = EQ
+            | otherwise = LT
+
+    plistEq :: PList -> PList -> Bool
+    plistEq = (==)
+
+    plistCompare :: PList -> PList -> Ordering
+    plistCompare = compare
+
+    -- (8) The SAME self-recursive `Eq` defect on a head that is NOT hoisted: this
+    -- `compare` never mentions `==`/`/=` at `QList`, so nothing about the `Ord`
+    -- pulls the `Eq` into the data block. It does not need to — the `$c==` def
+    -- precedes `instance : BEq QList` in the ORDINARY layout too (the instance
+    -- references the def, and the whole instance section follows the method-def
+    -- section), and `deriving … DecidableEq` is on the `inductive` because the
+    -- `Ord` takes the hand-written route. So the recursive `as == bs` was
+    -- structural here as well, with the transpiler silent. `eqHoistHeads` now
+    -- SEEDS on "this `Eq` recurses at its own head" (`Emit.selfEqHeads`)
+    -- independently of any `compare`, which routes the head through the same
+    -- retarget-and-splice path as (7).
+    --
+    -- Section (7) alone would NOT have caught this: `PList`'s `compare` tests
+    -- `x == y`, so its head was hoisted for the (4) reason and the retarget rode
+    -- along.
+    data QList = QNil | QCons Int QList
+
+    instance Eq QList where
+        QNil == y = case y of { QNil -> True; QCons _ _ -> False }
+        QCons a as == y = case y of
+            QNil       -> False
+            QCons b bs -> (a `mod` 2 == b `mod` 2) && (as == bs)
+
+    instance Ord QList where
+        compare x y = case x of
+            QNil      -> case y of { QNil -> EQ; QCons _ _ -> LT }
+            QCons a _ -> case y of { QNil -> GT; QCons b _ -> compare a b }
+
+    qlistEq :: QList -> QList -> Bool
+    qlistEq = (==)
+
+    qlistLt :: QList -> QList -> Bool
+    qlistLt = (<)
+
     -- -----------------------------------------------------------------------
     -- Properties. All ground `decide`.
 
@@ -212,4 +315,84 @@ module OrdSectionOrder where
     [lean|
     theorem zTg_isIdentity :
         fracCompare (zTg Z.Z (Frac2.Frac2 1 2)) (Frac2.Frac2 1 2) = Ordering.eq := by decide
+    |]
+
+    -- (6) The COMPOUND-ARGUMENT `==` inside `compare`: same divergence as (4), on
+    -- an instance with no bare-`Var` argument anywhere in the comparison. `decide`
+    -- PROVED the second of these FALSE before the type-application read.
+    [lean|
+    theorem crossEq_crossMultiplies :
+        crossEq (Cross.Cross 1 2) (Cross.Cross 2 4) = true := by decide
+    |]
+
+    [lean|
+    theorem crossCompare_agreesWithEq :
+        crossCompare (Cross.Cross 1 2) (Cross.Cross 2 4) = Ordering.eq := by decide
+    |]
+
+    [lean|
+    theorem crossCompare_strictlyGreater :
+        crossCompare (Cross.Cross 3 2) (Cross.Cross 1 2) = Ordering.gt := by decide
+    |]
+
+    [lean|
+    theorem crossCompare_strictlyLess :
+        crossCompare (Cross.Cross 1 2) (Cross.Cross 3 2) = Ordering.lt := by decide
+    |]
+
+    -- (7) The SELF-RECURSIVE hand-written `Eq`. Depth 1 agrees with the structural
+    -- order (both tails are `PNil`), so it is the no-regression check; depth 2 is
+    -- the discriminator, and `decide` PROVED it FALSE before `retargetSelfEq`.
+    [lean|
+    theorem plistEq_depth1 :
+        plistEq (PList.PCons 1 PList.PNil) (PList.PCons 3 PList.PNil) = true := by decide
+    |]
+
+    [lean|
+    theorem plistEq_depth2 :
+        plistEq (PList.PCons 1 (PList.PCons 2 PList.PNil))
+                (PList.PCons 3 (PList.PCons 4 PList.PNil)) = true := by decide
+    |]
+
+    -- Parity really is parity: differing parity at depth 2 is NOT equal, so the
+    -- recursion is doing the comparison rather than being short-circuited.
+    [lean|
+    theorem plistEq_depth2_differs :
+        plistEq (PList.PCons 1 (PList.PCons 2 PList.PNil))
+                (PList.PCons 3 (PList.PCons 5 PList.PNil)) = false := by decide
+    |]
+
+    -- …and the hand-written `compare` reads that `Eq`, which is what puts the
+    -- hoisted `$c==` in the data block in the first place.
+    [lean|
+    theorem plistCompare_depth2 :
+        plistCompare (PList.PCons 1 (PList.PCons 2 PList.PNil))
+                     (PList.PCons 3 (PList.PCons 4 PList.PNil)) = Ordering.eq := by decide
+    |]
+
+    -- (8) The same recursion, at a head NOTHING hoists. Depth 2 is the
+    -- discriminator and `decide` PROVED it FALSE until `eqHoistHeads` seeded on
+    -- the self-recursion itself.
+    [lean|
+    theorem qlistEq_depth1 :
+        qlistEq (QList.QCons 1 QList.QNil) (QList.QCons 3 QList.QNil) = true := by decide
+    |]
+
+    [lean|
+    theorem qlistEq_depth2 :
+        qlistEq (QList.QCons 1 (QList.QCons 2 QList.QNil))
+                (QList.QCons 3 (QList.QCons 4 QList.QNil)) = true := by decide
+    |]
+
+    [lean|
+    theorem qlistEq_depth2_differs :
+        qlistEq (QList.QCons 1 (QList.QCons 2 QList.QNil))
+                (QList.QCons 3 (QList.QCons 5 QList.QNil)) = false := by decide
+    |]
+
+    -- The `Ord` is untouched by the hoist — it still orders by the first field,
+    -- which is what pins that relocating the `Eq` did not disturb it.
+    [lean|
+    theorem qlistLt_firstFieldWins :
+        qlistLt (QList.QCons 1 QList.QNil) (QList.QCons 2 QList.QNil) = true := by decide
     |]

@@ -4914,7 +4914,16 @@ def m3t6OrdAt {t : Type} [Ord t] [LT t] [LE t] [DecidableLT t] [DecidableLE t]
     keep their `BEq` in the ordinary instance section. The sort's reference graph
     (`localTypesInExpr`) still reads every binder type, deliberately: an extra EDGE
     only constrains the order, and its worst case is a cycle that
-    `sortDataDecls` already handles loudly. -/
+    `sortDataDecls` already handles loudly.
+
+    AMENDED by the `M3T6E` block at the end of this file: reading a VALUE
+    argument's type at all was the wrong channel, and "first argument only" merely
+    narrowed the damage. `Frac2`'s `==` HAS a bare-`Var` argument, which is the
+    only reason B3 was detected here; an `==` whose arguments are compound
+    (`G a b == G c d`) has none, and the hoist was a silent no-op. The read is now
+    the TYPE APPLICATION (`classOpHeadTy`, off `Program.rawBinds`) — exact for any
+    argument shape, and it consults no `Var`, so the `wild` quirk cannot reach it
+    either. -/
 
 -- ### `ordRoute`'s Rec-group split, and the ops that drive it.
 def m3t6ORevTy : GHCType := .tyCon "Rev" []
@@ -5169,14 +5178,349 @@ def m3t6ONorm : Var := { name := "norm", unique := 930, ty := .tyCon "Int" [], r
            instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] }
          == []
 -- `eqHoistHeads` is the shared key: same answer, same inputs, one definition.
-#guard eqHoistHeads [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
-                     .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
-         [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
+-- Both bind arguments are the same list here: post-`Lower` literals, so the
+-- `classOpHeadTy` fallback is what answers (see the `M3T6E` block below for the
+-- pre-`Lower` shapes and the compound-argument hole this arity exists to close).
+def m3t6OHoistBinds : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
+   .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+#guard eqHoistHeads m3t6OHoistBinds m3t6OHoistBinds [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
 -- A DERIVED `Eq` is never hoisted: there is no user `$c==` to hoist, and the
 -- `deriving DecidableEq` route is already in the data block.
-#guard eqHoistHeads [.nonRec m3t6OAlphaCmp (m3t6OApp "GHC.Classes.==" m3t6OAlphaArg),
-                     .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
-         [m3t6OAlphaHd] [m3t6OAlphaHd] 3 == []
+#guard eqHoistHeads m3t6OHoistBinds m3t6OHoistBinds [m3t6OAlphaHd] [m3t6OAlphaHd] 3 == []
+
+/-! ### `M3T6E` — the COMPOUND-ARGUMENT hole in `==`-at-own-head detection
+
+    THE SILENT-WRONG this block exists for. M3 Task 6 gives every
+    hand-written-`Ord` type `deriving DecidableEq`, which makes core's
+    `instBEqOfDecidableEq` a live `BEq` candidate everywhere; `eqHoistHeads` closes
+    the gap by splicing the user's `instance : BEq` ahead of the spliced compare
+    def. Detection was the hole. `firstVarArgTy` reads the first bare-`Var`
+    ARGUMENT, so three lines of ordinary Haskell defeated it:
+
+        data G = G Int Int
+        instance Eq  G where G a b == G c d = a * d == c * b
+        instance Ord G where compare (G a b) (G c d)
+                               | G a b == G c d = EQ
+                               | a * d < c * b  = LT
+                               | otherwise      = GT
+
+    Post-`Lower` that `==` is `== (G a b) (G c d)`: no bare `Var`, no head
+    detected, no hoist. `Frac2` in section (4) of `OrdSectionOrder.hs` escapes only
+    because GHC's `x@(Frac2 a b)` binder leaves `x` a bare `Var`; the argument-tag
+    lists measured on that fixture's dump are `[Type, Var, Var, Var]` for `Frac2`
+    and `[Type, Var, App, App]` for the shape above.
+
+    COMMITTED as section (6) of `OrdSectionOrder.hs` (`Cross`, the `G` above
+    renamed). Measured with the pre-fix binary (`34e7b7e`) on the extended
+    fixture's dump: `instance : BEq Cross` emitted AFTER the compare def,
+    transpiler stderr **0 bytes**, and
+
+        error: Tactic `decide` proved that the proposition
+          crossCompare (Cross.Cross 1 2) (Cross.Cross 2 4) = Ordering.eq
+        is false
+
+    — Haskell says `EQ`. Post-fix the `$c==`/`BEq Cross` pair moves ahead of the
+    compare def and all four `Cross` theorems hold.
+
+    THE READ IS NOW THE TYPE APPLICATION. In Core a class method carries its
+    instantiation type as its first argument (`== @G $fEqG a b`) and `Lower` erases
+    it, so the analysis runs on `Program.rawBinds` — the same bind list pre-`Lower`
+    — and `classOpHeadTy` takes that argument. Shape-independent, and it reads no
+    `Var` at all, which also retires the `wild`-binder hazard above.
+
+    SECOND SHAPE, same root cause: a self-recursive hand-written `Eq`. That `$c==`
+    IS hoisted, but the hoist puts the def BEFORE the `instance : BEq` it backs, so
+    a recursive `as == bs` inside it still bound `instBEqOfDecidableEq`. A parity
+    `Eq` on `data PList = PNil | PCons Int PList` was therefore correct at depth 1
+    and silently STRUCTURAL at depth ≥ 2. COMMITTED as section (7) of
+    `OrdSectionOrder.hs`; measured, `34e7b7e` on the extended fixture's dump, again
+    with 0 bytes of stderr:
+
+        error: Tactic `decide` proved that the proposition
+          plistEq (PList.PCons 1 (PList.PCons 2 PList.PNil))
+                  (PList.PCons 3 (PList.PCons 4 PList.PNil)) = true
+        is false
+        error: Tactic `decide` proved that the proposition
+          plistCompare (PList.PCons 1 (PList.PCons 2 PList.PNil))
+                       (PList.PCons 3 (PList.PCons 4 PList.PNil)) = Ordering.eq
+        is false
+
+    `retargetSelfEq` points that call at the def being emitted. It CANNOT reuse
+    `retargetSelfCompare`'s "both misfire directions are loud" argument — a missed
+    `compare` needs an `Ord` declared later and fails at `lake build`, a missed `==`
+    lands on structural equality and says nothing — which is exactly why it is
+    keyed on the type application and not on `firstVarArgTy`. Post-fix all four
+    `PList` theorems hold, with no `sorry` in the file: the retargeted body is
+    accepted as STRUCTURAL recursion (`spliceDef`'s `recOverride := some false`,
+    which the compare half already relied on).
+
+    THIRD SHAPE, found in review of the first two: the same self-recursive `Eq` at
+    a head that NOTHING HOISTS. The first release of this fix put the retarget in
+    `eqBlockFor`, i.e. only on heads `eqHoistHeads` selected — and `PList` qualifies
+    only incidentally, because its `compare` tests `x == y`. Give the same type a
+    `compare` that never mentions `==` at that head and the hoist never fires, but
+    the defect is untouched: the `$c==` def precedes `instance : BEq T` in the
+    ORDINARY layout too (the method-def section precedes the whole instance
+    section), and `deriving … DecidableEq` is on the `inductive` because the `Ord`
+    took the hand-written route. Measured — `data QList = QNil | QCons Int QList`
+    with a parity `Eq` and a first-field `compare`, stderr 0 bytes, `decide` PROVED
+    the depth-2 equality FALSE.
+
+    THE DISCRIMINATOR between silent and loud is that one `deriving` line, which is
+    why `selfEqHeads` exists as its own key rather than as a by-product of the
+    `$ccompare` scan: without `DecidableEq` the same un-retargeted call is
+    `failed to synthesize BEq T`. `eqHoistHeads` now SEEDS on it, so such a head
+    reaches `eqBlockFor` — which is where both `retargetSelfEq` AND
+    `recOverride := some false` live. Bolting the retarget onto the `methodDefs`
+    path instead would have got the first without the second, and `emitBind` would
+    have read the self-reference as user recursion and closed it with
+    `decreasing_by all_goals sorry` — a `sorry` inside `BEq`. Committed as section
+    (8); all four `QList` theorems hold post-fix.
+
+    THE `/=` RESIDUAL, probed end to end rather than only in a `#guard`.
+    `retargetSelfEq` redirects `==` only (the def being emitted IS `==`), so a `/=`
+    at the own head inside a `$c==` body stays structural. A throwaway probe
+    (`data R = RNil | RCons Int R`, `RCons a as == y = … && not (as /= bs)`) emits
+    786 bytes on stderr:
+
+        warning: hand-written `Eq R` applies `/=` at `R` inside its own `==` body,
+        and that call is NOT redirected to the definition being emitted. …
+
+    NOT committed to the fixture, deliberately: `OrdSectionOrder`'s stderr being 0
+    bytes under BOTH binaries is the evidence that (6)/(7)/(8) were silent, and a
+    fixture warning would spend that. Seeding covers `==` only, so a `/=`-only body
+    is not hoisted (moving it would fix nothing) — which is why
+    `hoistedEqSelfResiduals` scans the hoisted set UNION `selfEqHeads` for both ops
+    rather than the hoisted set alone.
+
+    ### Byte-identity sweep for THIS commit (two-binary method)
+
+    `34e7b7e`'s binary and `34e7b7e`+fix, run over the SAME 50 saved shim dumps
+    (`/tmp/transpile-*.json` — the whole `examples/haskell` corpus plus every probe
+    from the two preceding commits), `.lean` + stdout + stderr + newtype-exports
+    sidecar compared per module. Not re-dumped between binaries: uniques shift on a
+    re-run and the diff would be noise. Two passes, because extending
+    `OrdSectionOrder.hs` changes that module's dump by construction.
+
+    PASS 1 — the corpus as it stood at `34e7b7e`:
+
+    * **47 of 50 BYTE-IDENTICAL**, `OrdSectionOrder` and `OrdHandwritten` INCLUDED
+      — neither contained a compound-argument `==`-at-own-head nor a self-recursive
+      hand-written `Eq`, so the hoist set and every spliced body are unchanged
+      there. That identity is also the check that the new emission path composes:
+      `Frac2`'s hoisted `$c==` is now fetched raw, run through `retargetSelfEq`
+      (a no-op for it) and lowered, and it comes out the same bytes.
+    * The 3 that move are exactly the two shapes above (`GProbe`, `LProbe`) and
+      `OrdEqCompound`, a probe from the preceding commit that happens to be the
+      `G` shape.
+
+    PASS 2 — after (6) and (7) were added to `OrdSectionOrder.hs` and it was
+    re-dumped: **45 of 50**. The two additional movers are accounted for:
+
+    * `OrdSectionOrder` itself, and its diff is ONLY the two new shapes —
+      `PList`'s recursive `==` retargeted to `_dollar_c_eq__eq__…`, and `Cross`'s
+      `$c==` + `instance : BEq Cross` relocated ahead of the compare def. `Frac2`,
+      `Alpha`/`Beta`, `Tree`, `Quad`/`Inner` and the class block are untouched.
+    * `OrdRecEq`, a prior-session recursive-`Eq` probe. Pass 1 compared it as a
+      REFUSAL: the shared `/tmp/transpile-ext-types.tsv` was stale and reported its
+      `L` as both local and imported. Re-running `transpile.sh` rebuilt the
+      manifest, so pass 2 actually emits it — and the diff is the same one-line
+      retarget as `LProbe`.
+
+    PASS 3 — after the `selfEqHeads` SEED (the third shape) and the two probes it
+    needed: **45 of 52**. The 7 that change are exactly the probes for the three
+    shapes (`GProbe`, `LProbe`, `QProbe`) and the `/=` residual (`NProbe`), the two
+    prior-session probes that happen to BE these shapes (`OrdEqCompound`,
+    `OrdRecEq`), and `OrdSectionOrder`. `NProbe`'s EMISSION is byte-identical —
+    only its stderr changes (0 → 786 bytes), so that diagnostic is purely additive.
+
+    ISOLATING THE SEED, pre-seed binary against post-seed over the same dumps: only
+    `QProbe` and `NProbe` move. `OrdSectionOrder` is BYTE-IDENTICAL across the seed
+    (its self-recursive head was already hoisted for the (4) reason), as is every
+    other module, and no stderr changes but `NProbe`'s. So the seed added no
+    spurious hoist — which is the claim `localTypesInExpr`'s warning makes it worth
+    checking.
+
+    * **stderr identical for all modules in all three passes**, apart from the
+      `NProbe` warning the seed's companion diagnostic is FOR — including
+      `OrdSectionOrder`, whose stderr is 0 bytes under each binary, which is what
+      makes "silently wrong" the right description of the pre-fix behaviour on (6),
+      (7) and (8). `hoistedEqSelfResiduals` fires on nothing in the corpus. The
+      refusals are intact and unchanged (`NewtypeInstances`, `UserClassNeqWithEq`).
+    * End to end under the fix: `OrdSectionOrder` 27/27 theorems and
+      `OrdHandwritten` 20/20 (its two quantified ones still print `✅ Valid`),
+      no `sorry` in either file, `lake build` green over the whole project.
+
+    RESIDUAL, and it is LOUD: the `/=`-at-own-head case above, plus any `==` whose
+    head type the dump carries in neither channel. `hoistedEqSelfResiduals` reports
+    both by name from `Main.lean`. -/
+
+def m3t6EDict : Var :=
+  { name := "$fEqAlpha", unique := 940, ty := .tyCon "_Unknown" [], role := .dict }
+/-- `op @T $fEqT l r` — the PRE-`Lower` spine, verbatim from the dump: type
+    application, dictionary, then the value arguments. -/
+def m3t6EAppAt (o : Name) (t : GHCType) (l r : Expr) : Expr :=
+  .app (.app (.app (.app (.var (m3t6OOp o)) (.type_ t)) (.var m3t6EDict)) l) r
+/-- `Alpha n` — a COMPOUND value argument. No bare `Var` in argument position, so
+    `firstVarArgTy` reads nothing from a spine built out of these. -/
+def m3t6ECtorApp : Expr := .app (.var m3t6OCtorVar) (.var m3t6OIntArg)
+def m3t6EIntTy : GHCType := .tyCon "Int" []
+
+-- The read: the TYPE argument, whatever the value arguments look like.
+#guard classOpHeadTy [.type_ m3t6OAlphaTy, .var m3t6EDict, m3t6ECtorApp, m3t6ECtorApp]
+         == some m3t6OAlphaHd
+#guard classOpHeadTy [.type_ m3t6OAlphaTy, .var m3t6EDict,
+                      .var m3t6OAlphaArg, .var m3t6OAlphaArg] == some m3t6OAlphaHd
+-- Why it is "type argument FIRST" and not a union with the old read: pre-`Lower`
+-- the first bare `Var` is the DICTIONARY, which the shim types `_Unknown`.
+#guard firstVarArgTy [.type_ m3t6OAlphaTy, .var m3t6EDict, m3t6ECtorApp, m3t6ECtorApp]
+         == some (emitType (.tyCon "_Unknown" []))
+-- No type argument ⇒ the post-`Lower` fallback, unchanged, `wild` discipline and
+-- all (see `firstVarArgTy`). This is the arm a hand-written test literal takes.
+#guard classOpHeadTy [.var m3t6OAlphaArg, .var m3t6OIntArg] == some m3t6OAlphaHd
+#guard classOpHeadTy [m3t6ECtorApp, m3t6ECtorApp] == none
+#guard classOpHeadTy ([] : List Expr) == none
+-- The spelling has to MATCH the instance-head key, or the hoist never fires. Both
+-- sides are `emitType`, and the dump gives the same `TyCon` JSON in both channels
+-- (`{"tag":"TyCon","name":"G","args":[]}` as `instances[].headTypes[0]` and as the
+-- `Type` argument) — verified on `/tmp/transpile-GProbe.json`.
+#guard classOpHeadTy [.type_ m3t6OAlphaTy]
+         == some (m3t6OAlphaEqInst.headTypes.map emitType |> String.intercalate " ")
+
+-- `opArgTypes`: the compound-argument shape reports its head pre-`Lower`…
+#guard opArgTypes ["GHC.Classes.=="]
+         (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy m3t6ECtorApp m3t6ECtorApp)
+         == [m3t6OAlphaHd]
+-- …and reports NOTHING once `Lower` has erased the type application. THE DEFECT,
+-- pinned: this is the list `eqHoistHeads` used to be handed.
+#guard opArgTypes ["GHC.Classes.=="]
+         (.app (.app (.var (m3t6OOp "GHC.Classes.==")) m3t6ECtorApp) m3t6ECtorApp) == []
+
+-- ### `eqHoistHeads` end to end, in the real pipeline's argument shape:
+-- membership from the LOWERED binds, the scanned bodies from the RAW ones.
+def m3t6ECmpRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy m3t6ECtorApp m3t6ECtorApp),
+   .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+def m3t6ECmpLowered : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp
+     (.app (.app (.var (m3t6OOp "GHC.Classes.==")) m3t6ECtorApp) m3t6ECtorApp),
+   .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+#guard eqHoistHeads m3t6ECmpLowered m3t6ECmpRaw [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
+-- Scanning the LOWERED body instead is the pre-fix behaviour and is the defect;
+-- `Main.lean` always supplies `Program.rawBinds`, so this arm is unreachable there.
+#guard eqHoistHeads m3t6ECmpLowered m3t6ECmpLowered [] [m3t6OAlphaHd] 3 == []
+-- No regression on the shape that DID work: bare-`Var` arguments, now answered by
+-- the type application rather than by the argument.
+def m3t6EBareRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp
+     (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy (.var m3t6OAlphaArg) (.var m3t6OAlphaArg)),
+   .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+#guard eqHoistHeads m3t6EBareRaw m3t6EBareRaw [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
+-- …and it does NOT fire where there is no `==`-at-own-head: an `==` at `Int` (no
+-- `$c==` bind at that head), and another op at the own head.
+def m3t6EIntRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp
+     (m3t6EAppAt "GHC.Classes.==" m3t6EIntTy (.var m3t6OIntArg) (.var m3t6OIntArg)),
+   .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+#guard eqHoistHeads m3t6EIntRaw m3t6EIntRaw [] [m3t6OAlphaHd] 3 == []
+def m3t6ELeRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp
+     (m3t6EAppAt "GHC.Classes.<=" m3t6OAlphaTy (.var m3t6OAlphaArg) (.var m3t6OAlphaArg)),
+   .nonRec m3t6OAlphaEq (.var m3t6OAlphaArg)]
+#guard eqHoistHeads m3t6ELeRaw m3t6ELeRaw [] [m3t6OAlphaHd] 3 == []
+
+-- ### `retargetSelfEq`: the self-call becomes the def's own name, and the result
+-- is emitted only after `Lower` has removed the type/dict arguments it inherited.
+#guard emitExpr [] [] (Lower.lowerExpr (retargetSelfEq m3t6OAlphaHd m3t6OAlphaEq
+                        (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy
+                           (.var m3t6OAlphaArg) (.var m3t6OAlphaArg))))
+         == "((_dollar_c_eq__eq__921) (p_922)) (p_922)"
+-- COMPOUND arguments too — the case `firstVarArgTy` cannot see, i.e. the one a
+-- `retargetSelfCompare`-shaped mirror would have left silently structural.
+#guard emitExpr [] [] (Lower.lowerExpr (retargetSelfEq m3t6OAlphaHd m3t6OAlphaEq
+                        (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy
+                           m3t6ECtorApp m3t6ECtorApp)))
+         == "((_dollar_c_eq__eq__921) ((Alpha_910) (n_903))) ((Alpha_910) (n_903))"
+-- At ANOTHER type the body is untouched: the builtin `==` survives.
+#guard emitExpr [] [] (Lower.lowerExpr (retargetSelfEq m3t6OAlphaHd m3t6OAlphaEq
+                        (m3t6EAppAt "GHC.Classes.==" m3t6EIntTy
+                           (.var m3t6OIntArg) (.var m3t6OIntArg))))
+         == "(((· == ·)) (n_903)) (n_903)"
+-- `/=` is NEVER retargeted — the def being emitted is `==` — so it stays the
+-- builtin, which at a hand-written-`Eq` head is `instBEqOfDecidableEq`'s.
+#guard emitExpr [] [] (Lower.lowerExpr (retargetSelfEq m3t6OAlphaHd m3t6OAlphaEq
+                        (m3t6EAppAt "GHC.Classes./=" m3t6OAlphaTy
+                           (.var m3t6OAlphaArg) (.var m3t6OAlphaArg))))
+         == "(((fun a b => !(a == b))) (p_922)) (p_922)"
+-- After the retarget no `==` at the own head is left…
+#guard opArgTypes ["GHC.Classes.=="]
+         (retargetSelfEq m3t6OAlphaHd m3t6OAlphaEq
+           (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy m3t6ECtorApp m3t6ECtorApp)) == []
+-- …which is exactly what makes the `/=` residual detectable rather than lost.
+#guard opArgTypes ["GHC.Classes./="]
+         (retargetSelfEq m3t6OAlphaHd m3t6OAlphaEq
+           (m3t6EAppAt "GHC.Classes./=" m3t6OAlphaTy m3t6ECtorApp m3t6ECtorApp))
+         == [m3t6OAlphaHd]
+
+-- ### `selfEqHeads` and the SEED: a self-recursive hand-written `Eq` needs the
+-- hoist whether or not any `compare` mentions `==` at that head. Third shape,
+-- reachable on ordinary Haskell and NOT covered by seeding off `$ccompare`.
+-- `m3t6ESelfRaw`'s `compare` applies `<=` at `Alpha`, so the `$ccompare` scan
+-- produces nothing; the `$c==` body applies `==` at `Alpha`.
+def m3t6ESelfRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp
+     (m3t6EAppAt "GHC.Classes.<=" m3t6OAlphaTy (.var m3t6OAlphaArg) (.var m3t6OAlphaArg)),
+   .nonRec m3t6OAlphaEq
+     (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy (.var m3t6OAlphaArg) (.var m3t6OAlphaArg))]
+#guard selfEqHeads m3t6ESelfRaw m3t6ESelfRaw [] ["GHC.Classes.=="] == [m3t6OAlphaHd]
+-- The seed puts it in the hoist set even though `[m3t6OAlphaHd]`'s compare body
+-- contributes nothing…
+#guard eqHoistHeads m3t6ESelfRaw m3t6ESelfRaw [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
+-- …and with NO `Ord` head passed at all, which is the case the `$ccompare` scan
+-- structurally cannot reach.
+#guard eqHoistHeads m3t6ESelfRaw m3t6ESelfRaw [] [] 3 == [m3t6OAlphaHd]
+-- An `Eq` that recurses at ANOTHER type is not a self-recursion and is not seeded
+-- (`m3t6EIntRaw`'s `$c==` body is a bare `Var`, so use an explicit `==` at `Int`).
+def m3t6EOtherRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaEq
+     (m3t6EAppAt "GHC.Classes.==" m3t6EIntTy (.var m3t6OIntArg) (.var m3t6OIntArg))]
+#guard selfEqHeads m3t6EOtherRaw m3t6EOtherRaw [] ["GHC.Classes.=="] == []
+#guard eqHoistHeads m3t6EOtherRaw m3t6EOtherRaw [] [] 3 == []
+-- A DERIVED `Eq` is never seeded either — there is no user `$c==` to move.
+#guard selfEqHeads m3t6ESelfRaw m3t6ESelfRaw [m3t6OAlphaHd] ["GHC.Classes.=="] == []
+-- Seeding is APPENDED, so the pre-existing heads keep their order: `Alpha` is
+-- derived from the compare body here as well and appears once, not twice.
+#guard eqHoistHeads m3t6EBareRaw m3t6EBareRaw [] [m3t6OAlphaHd] 3 == [m3t6OAlphaHd]
+
+-- ### `hoistedEqSelfResiduals`: LOUD for what the retarget cannot reach.
+-- A self-recursive `==` is redirected, so nothing is reported…
+#guard hoistedEqSelfResiduals
+         { binds := m3t6ECmpLowered, rawBinds := m3t6ECmpRaw,
+           typeDecls := [m3t6OAlpha],
+           instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] } == []
+#guard hoistedEqSelfResiduals
+         { binds := m3t6ESelfRaw, rawBinds := m3t6ESelfRaw,
+           typeDecls := [m3t6OAlpha],
+           instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] } == []
+-- …and a `/=` at the own head INSIDE the `$c==` body is, by its type name.
+def m3t6ENeqRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaCmp (m3t6EAppAt "GHC.Classes.==" m3t6OAlphaTy m3t6ECtorApp m3t6ECtorApp),
+   .nonRec m3t6OAlphaEq
+     (m3t6EAppAt "GHC.Classes./=" m3t6OAlphaTy (.var m3t6OAlphaArg) (.var m3t6OAlphaArg))]
+#guard hoistedEqSelfResiduals
+         { binds := m3t6ENeqRaw, rawBinds := m3t6ENeqRaw,
+           typeDecls := [m3t6OAlpha],
+           instances := [m3t6OAlphaOrdInst, m3t6OAlphaEqInst] } == [("Alpha", "/=")]
+-- …including at a head NOTHING hoists: the `/=`-only body is not seeded (moving it
+-- would fix nothing), so the union with `selfEqHeads` is what keeps it reported.
+def m3t6ENeqOnlyRaw : CoreProgram :=
+  [.nonRec m3t6OAlphaEq
+     (m3t6EAppAt "GHC.Classes./=" m3t6OAlphaTy (.var m3t6OAlphaArg) (.var m3t6OAlphaArg))]
+#guard eqHoistHeads m3t6ENeqOnlyRaw m3t6ENeqOnlyRaw [] [] 3 == []
+#guard hoistedEqSelfResiduals
+         { binds := m3t6ENeqOnlyRaw, rawBinds := m3t6ENeqOnlyRaw,
+           typeDecls := [m3t6OAlpha], instances := [m3t6OAlphaEqInst] } == [("Alpha", "/=")]
 
 -- A body that calls nothing top-level reports nothing…
 #guard ordForwardRefs

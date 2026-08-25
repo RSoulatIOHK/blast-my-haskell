@@ -219,7 +219,13 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     writeNewtypeExports prog.typeDecls
     let userBinds := prog.binds.filterMap (keepBinding prog.instances)
     let lowered   := Lower.lowerProgram userBinds
-    let userProg  : Program := { prog with binds := lowered }
+    -- `rawBinds` is the SAME bind list pre-`Lower`, set explicitly rather than
+    -- left to the field's default so the invariant is "same filtering, only the
+    -- erasure differs". `Emit` needs it because `Lower` erases the type
+    -- application (`== @T $fEqT a b` ⇒ `== a b`) that is the only exact record of
+    -- the type a class op is instantiated at — see `Program.rawBinds` and
+    -- `Emit.classOpHeadTy`. Emission still runs off `binds`.
+    let userProg  : Program := { prog with binds := lowered, rawBinds := userBinds }
     -- Refuse a method name declared by two classes: Core references a class
     -- method by its BARE name, so every call site would be qualified with
     -- whichever class the instance dump listed first — typechecks, dispatches to
@@ -280,6 +286,18 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- too, where the layout that causes it is decided.
     for (head, fn) in Emit.ordForwardRefs userProg do
       IO.eprintln s!"warning: {Emit.ordForwardRefWarning head fn}"
+    -- Name every `==`/`/=` a SPLICED hand-written `==` body still applies at its
+    -- own head. A self-recursive `==` is redirected to the def being emitted
+    -- (`retargetSelfEq`) precisely because it cannot be left alone — the
+    -- `instance : BEq` follows the def, so the only `BEq` in scope inside it is
+    -- core's structural `instBEqOfDecidableEq`. What the redirect does NOT cover
+    -- (`/=`, and any `==` whose head type the dump does not carry) would compute
+    -- structural equality with no diagnostic at all, which is the one failure mode
+    -- this project forbids; so it is said out loud here. Warning rather than
+    -- refusal, like the four above: the shapes are absent from every corpus module
+    -- and refusing would newly reject a module whose residual is unreachable.
+    for (head, op) in Emit.hoistedEqSelfResiduals userProg do
+      IO.eprintln s!"warning: {Emit.hoistedEqSelfResidualWarning head op}"
     -- Tripwire for the shim's role heuristic. A `$dm<method>` Var is a
     -- default-method BODY; the shim used to classify it as a dictionary (any
     -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT
