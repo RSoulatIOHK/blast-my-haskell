@@ -492,6 +492,9 @@ private def dedup (xs : List Name) : List Name :=
       constrained only by `Capped a` may still use the parent's operators.
     * `Maps.classConMap C` — a BUILTIN class with a Lean image → that map's
       binder templates, `{t}` filled in (`Eq a =>` ⇒ `[BEq t]`).
+    * `C ∈ classNames` applied to TWO OR MORE bare type variables (M3 Task 7) →
+      `[C a b]`, in its own arm further down with its own restrictions (no
+      `superBinders`, no `classConMap`) — see there.
     Anything else is not a constraint as far as this function is concerned and
     stops the peel, which is what keeps an unmapped builtin (`Fractional a =>`)
     LOUD: the arrow stays, the first value binder gets the dictionary's type, and
@@ -537,6 +540,39 @@ partial def stripClassConstraintsGo (classNames : List Name)
       let (cs, rest) := stripClassConstraintsGo classNames superBinders r
       (bs ++ cs, rest)
     | none => ([], .tyFun (.tyCon c [.tyVar t]) r)
+  -- MULTI-PARAMETER user-class constraint (M3 Task 7): `Convert a b => …` ⇒
+  -- `[Convert a b]`. Deliberately a SEPARATE arm below the one-argument one,
+  -- rather than an n-ary generalization of it, so that no single-parameter
+  -- constraint can reach different code than it did before this arm existed —
+  -- which is what makes the corpus byte-identity claim structural rather than
+  -- merely measured. Everything the one-argument arm declines (`Eq [a]`,
+  -- `Eq Int`, an ordinary `Int ->` value arrow) still lands here and is still
+  -- declined, because both tests below fail for it.
+  --
+  -- Two deliberate NON-uses, each of which would be silent-wrong at two
+  -- parameters:
+  -- * `superBinders` is NOT consulted. Its templates carry a single `{t}` hole,
+  --   and `supers` records parent NAMES only — which parameter a parent
+  --   constrains is unrecoverable (`emitClassDecl`), so filling `{t}` with
+  --   *some* parameter would emit a binder about the wrong one. The superclass
+  --   of a multi-parameter class is dropped and REPORTED instead
+  --   (`multiParamSupers`); `classSuperBinders` returns no entry for such a
+  --   class, so this is belt-and-braces.
+  -- * `Maps.classConMap` is NOT consulted. Every class it maps is
+  --   single-parameter (`Eq`/`Ord`/`Num` in Haskell take one), so a two-argument
+  --   head bearing one of those names is not that class and must not pick up its
+  --   recipe.
+  -- Only BARE type variables are peeled, as above: a partially-applied head like
+  -- `Convert Int b` passes no dictionary in a monomorphic signature and stays
+  -- loud rather than being peeled into a binder mentioning a type constructor.
+  | .tyFun (.tyCon c args) r =>
+    let tvs := args.filterMap fun a => match a with
+      | .tyVar t => some (tyVarId t)
+      | _        => none
+    if args.length >= 2 && tvs.length == args.length && classNames.contains c then
+      let (cs, rest) := stripClassConstraintsGo classNames superBinders r
+      (s!"[{sanitize c} {String.intercalate " " tvs}]" :: cs, rest)
+    else ([], .tyFun (.tyCon c args) r)
   | t => ([], t)
 
 /-- `stripClassConstraintsGo` with the binder list deduplicated. An explicit
@@ -808,10 +844,25 @@ def emitDataDecl (derivedEq derivedOrd : Bool) (d : DataDecl)
     * anything else (an unmapped builtin like `Show`, an imported user class,
       the plugin's `_UnknownSuper`) → nothing, and `unmappedSupers` reports it.
 
-    MULTI-PARAMETER classes get NO `extends` at all: `supers` carries names only
-    (the plugin discards which parameter each constraint applies to — M3 Task 1's
-    handoff), so with two type variables there is nothing to apply the parent to
-    but a guess. Omitting is loud at the use site; guessing would be silent-wrong.
+    MULTI-PARAMETER classes (M3 Task 7) get NO `extends` at all, and this is a
+    REFUSAL, not an oversight: `supers` carries names only (the plugin discards
+    which parameter each constraint applies to — `GhcDeclDump.ppSuperPred`), so
+    with two type variables there is nothing to apply the parent to but a guess.
+    Extending the plugin dump with per-super argument types is the fix M4-or-later
+    can make; guessing would be silent-wrong. MEASURED on
+    `examples/haskell/MultiParam.hs` (`class Sized a => Convert a b` ⇒
+    `"supers":["Sized"], "tyVars":["a","b"]`): every `Convert` instance still
+    emits, `size` at a monomorphic head still works, and only a body reaching
+    `size` THROUGH a `Convert a b` constraint is lost — `failed to synthesize`, at
+    `lake build`. `multiParamSupers` reports the drop, which is the half that was
+    missing: the emitted-class side was already silent about it, since
+    `unmappedSupers` only looks at whether a parent HAS a Lean image.
+
+    The rest of the class emits exactly as a single-parameter one does: one
+    `(v : Type)` binder per entry of `tyVars` (plugin-sourced since Task 1) and
+    the method types as the plugin renders them. This is SUPPORTED, not merely
+    tolerated — `MultiParam.hs` pins `class Convert (a : Type) (b : Type) where
+    conv : (a → b); convBack : (b → a)` end to end.
 
     `defaults` maps a METHOD NAME to the Lean term for its class-body `:=`
     default, translated from GHC's `$dm<method>` bind by `classDefaultBody` (M3
@@ -868,10 +919,53 @@ def emitClassDecl (defaults : List (Name × String)) (c : ClassDecl)
     `unresolvedInstanceMethods`: the consequence is `failed to synthesize` at a
     use site, i.e. already loud at `lake build`, and refusing would newly reject
     modules that transpile today (a `Show`-superclassed class whose parent methods
-    are never called still works). -/
+    are never called still works).
+
+    SINGLE-PARAMETER classes only, since M3 Task 7. On a multi-parameter class
+    EVERY superclass is dropped whatever its Lean image would be, and this
+    function's reason ("no Lean image") is then the wrong reason to report — so
+    `multiParamSupers` reports all of them instead, with the right one, and this
+    one stays silent rather than double-reporting the subset it happens to
+    recognize. -/
 def unmappedSupers (classNames : List Name) (c : ClassDecl) : List Name :=
+  if c.tyVars.length != 1 then [] else
   c.supers.filter fun s =>
     !classNames.contains s && (Maps.classConMap s).isNone
+
+/-- Superclass NAMES dropped because `c` takes more than one type parameter (M3
+    Task 7) — ALL of them, whatever their Lean image would have been.
+    `emitClassDecl` emits no `extends` for such a class and
+    `classSuperBinders` gives it no constraint-site binders, both because the
+    plugin's `supers` channel records parent NAMES without saying which parameter
+    each parent constrains (`GhcDeclDump.ppSuperPred`); see `emitClassDecl` for
+    the full argument.
+
+    Why this exists as its own diagnostic: before it, the drop was SILENT for
+    exactly the parents that would otherwise have been emitted. A `Sized a =>
+    Convert a b` produced `rc=0` and 0 bytes of stderr (measured on
+    `examples/haskell/MultiParam.hs` before this task), because `unmappedSupers`
+    asks only whether a parent has a Lean image and `Sized` — a locally declared
+    class — has one. A WARNING rather than a refusal, on the same argument as
+    `unmappedSupers`: the loss shows up as `failed to synthesize` at any use site
+    that needs the parent through the child's constraint, and a module that never
+    does that (like the fixture) is correct as emitted. -/
+def multiParamSupers (c : ClassDecl) : List Name :=
+  if c.tyVars.length == 1 then [] else c.supers
+
+/-- The warning for one `multiParamSupers` entry. -/
+def multiParamSuperWarning (cls super : Name) (nparams : Nat) : String :=
+  s!"class `{cls}` takes {nparams} type parameters and has the superclass `{super}`,\n" ++
+  s!"  which is DROPPED from the emitted Lean class. The class-shape dump records a\n" ++
+  s!"  superclass by NAME only, so with more than one parameter there is no fact\n" ++
+  s!"  saying which parameter `{super}` constrains — `extends {super} ?` would be a\n" ++
+  s!"  guess, and a wrong guess is silently wrong. The class itself, its methods and\n" ++
+  s!"  its instances are emitted normally; what is lost is reaching `{super}`'s\n" ++
+  s!"  methods THROUGH a `{cls}` constraint, which fails with `failed to synthesize\n" ++
+  s!"  {super} …` at `lake build`. `{super}`'s methods at a concrete type are\n" ++
+  s!"  unaffected.\n" ++
+  s!"  Remedy: constrain the parent explicitly at each use site (`({super} a, {cls} a b) => …`),\n" ++
+  s!"  or extend the decl plugin's `ppSuperPred` to dump each superclass's argument\n" ++
+  s!"  types so the parameter can be identified."
 
 /-- The warning for one `unmappedSupers` entry. -/
 def unmappedSuperWarning (cls super : Name) : String :=
@@ -900,12 +994,24 @@ def unmappedSuperWarning (cls super : Name) : String :=
     contains `[BEq {t}]` and two parents may overlap. The fuel is the class count:
     a superclass CYCLE is impossible in Haskell, so exhausting it means the class
     graph is malformed and the binders are simply truncated (loud at the use
-    site), never looped. -/
+    site), never looped.
+
+    A MULTI-PARAMETER class contributes NOTHING and gets no entry, at any depth
+    (M3 Task 7). A template's `{t}` is filled with the one type variable of the
+    constraint site, and with two parameters there is no fact saying which of
+    them the parent constrains (`supers` is names only), so any fill would be a
+    guess about the wrong variable. Belt-and-braces: `stripClassConstraints`'
+    multi-parameter arm does not read `superBinders` either, and the reverse
+    direction — a multi-parameter class as the PARENT of a single-parameter one —
+    is not expressible in Haskell (a superclass constraint may mention only the
+    child's own class variables, so `class Convert a b => C a` does not compile).
+    The drop is reported by `multiParamSupers`. -/
 def classSuperBinders (classes : List ClassDecl) : List (Name × List String) :=
   let rec go (fuel : Nat) (c : ClassDecl) : List String :=
     match fuel with
     | 0      => []
     | fuel+1 =>
+      if c.tyVars.length != 1 then [] else
       c.supers.flatMap fun s =>
         match Maps.classConMap s with
         | some recipe => recipe
@@ -2156,6 +2262,23 @@ def droppedSupers (p : Program) : List (Name × Name) :=
   let classes := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
   let classNames := classes.map (·.name)
   classes.flatMap fun c => (unmappedSupers classNames c).map fun s => (c.name, s)
+
+/-- Every `(class, superclass, parameter count)` dropped for the multi-parameter
+    reason, program-wide — the Program-level view of `multiParamSupers`, wired to
+    an `eprintln` in `Main.lean`. Disjoint from `droppedSupers` by construction
+    (each of the two per-class functions is empty exactly where the other can be
+    non-empty), so no superclass is reported twice. Computed on the MERGED class
+    set like every other diagnostic here — and note that only the PLUGIN channel
+    can produce a multi-parameter shape at all: `reconstructClasses` invents a
+    single type variable, so a run with no decls sidecar reports nothing here and
+    emits a one-parameter class for a two-parameter Haskell one. That fallback
+    mis-shape is loud (the emitted class's method types mention a variable the
+    header does not bind, and every instance head has two arguments where the
+    class takes one). -/
+def droppedMultiParamSupers (p : Program) : List (Name × Name × Nat) :=
+  let classes := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
+  classes.flatMap fun c =>
+    (multiParamSupers c).map fun s => (c.name, s, c.tyVars.length)
 
 /-- The warning for one `unresolvedInstanceMethods` entry. -/
 def unresolvedInstanceMethodWarning (cls head mname : Name) : String :=

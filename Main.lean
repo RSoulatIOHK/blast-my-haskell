@@ -269,6 +269,17 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- `ppSuperPred` comment had assumed Task 5 would prevent by other means.
     for (cls, super) in Emit.droppedSupers userProg do
       IO.eprintln s!"warning: {Emit.unmappedSuperWarning cls super}"
+    -- The other half of the same drop (M3 Task 7): on a MULTI-PARAMETER class
+    -- every superclass is dropped regardless of its Lean image, because the dump
+    -- does not say which parameter the parent constrains. The loop above cannot
+    -- see those — it asks only whether a parent has an image — so a
+    -- locally-declared parent of a two-parameter class used to vanish with
+    -- `rc=0` and empty stderr (measured on `MultiParam.hs`). Warning, not
+    -- refusal, on the same argument: the fixture is correct as emitted, and a
+    -- module that does need the parent through the child's constraint fails at
+    -- `lake build`.
+    for (cls, super, n) in Emit.droppedMultiParamSupers userProg do
+      IO.eprintln s!"warning: {Emit.multiParamSuperWarning cls super n}"
     -- Name every `Ord` instance that gets no Lean image (M3 Task 6): a minimal
     -- `<=`-only definition, whose `compare` is GHC's dictionary-dependent class
     -- default. Warning, not refusal, for the same reason as the two above — and

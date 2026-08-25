@@ -2290,6 +2290,16 @@ def m3parseClass (s : String) : Except String ClassDecl := do
     PREDICTED, not observed: no fixture declares a multi-parameter class with a
     superclass, so the ambiguous arm is unexercised.
 
+    TASK 7's ANSWER, for the record: REFUSE, and report. `examples/haskell/
+    MultiParam.hs` now DOES declare `class Sized a => Convert a b` (so the
+    ambiguous arm is exercised, and dumps `supers: ["Sized"], tyVars: ["a","b"]`
+    exactly as predicted); the dump was left alone, `emitClassDecl` emits no
+    `extends`, and `Emit.multiParamSupers` names the drop from `Main.lean`. The
+    thing this handoff did not anticipate is that the drop was SILENT even after
+    Task 5 added `unmappedSupers`, because that function asks only whether the
+    parent has a Lean image and a locally-declared `Sized` has one. See the
+    `M3 Task 7` block.
+
 ### Observation 3 — the Core spines (`/tmp/transpile-SuperClass.json`)
 
     Every UNQUALIFIED `$`-name in the whole dump, with counts — 16 distinct, 73
@@ -2525,12 +2535,14 @@ def m3PluginOnly : ClassDecl :=
     methods := [ { name := "empty", ty := .tyVar "a" } ] }
     == "class Container (a : Type) where\n  empty : a"
 -- A MULTI-parameter class now emits one binder per parameter rather than
--- truncating to the reconstruction's invented single `a`. Pinned as today's
--- behavior, NOT as support: `stripClassConstraints` and `findClassMethod` are
--- still single-head (Task 7), so instances of such a class are still dropped and
--- call sites still fail to synthesize. This is loud either way; the point of
--- pinning it is that Task 7 must change this string deliberately, not by
--- accident.
+-- truncating to the reconstruction's invented single `a`. Task 7 turned this from
+-- "today's behavior" into SUPPORT, and the string did not have to change — see
+-- the `M3 Task 7` block. Two claims this comment made were WRONG and are
+-- corrected there by measurement: instances of such a class are NOT dropped
+-- (Task 5's `dfunMethodBinds` attributes them positionally, so it never needed
+-- the head string that `findClassMethod` keys on), and `findClassMethod` was
+-- therefore NOT the thing that needed fixing. `stripClassConstraints` was the one
+-- real seam.
 #guard emitClassDecl []
   { name := "Convert", tyVars := ["a", "b"], supers := [],
     methods := [ { name := "conv", ty := .tyFun (.tyVar "a") (.tyVar "b") } ] }
@@ -4010,6 +4022,8 @@ def m3t5Plugin : List ClassDecl := [m3t5Capped, m3t5Container, m3t5Sized]
             "  empty : a\n  insert : (Int → (a → a))"
 -- MULTI-PARAMETER: no `extends` at all, because `supers` does not say WHICH
 -- parameter the parent constrains. Loud at the use site; a guess would be silent.
+-- Since Task 7 it is loud at the TRANSPILER too (`multiParamSupers` — this arm
+-- was reporting nothing whenever the parent had a Lean image).
 #guard emitClassDecl [] { m3t5Container with tyVars := ["a", "b"] } ["Sized", "Container"]
          == "class Container (a : Type) (b : Type) where\n" ++
             "  empty : a\n  insert : (Int → (a → a))"
@@ -5537,5 +5551,512 @@ def m3t6ENeqOnlyRaw : CoreProgram :=
                      .nonRec m3t6ONorm (.var m3t6OArg)],
            typeDecls := [m3t6OAlpha], instances := [m3t6OAlphaOrdInst] }
          == []
+
+/-! ## M3 Task 7 — multi-parameter type classes
+
+    The fixture is `examples/haskell/MultiParam.hs`: `class Sized a => Convert a b`
+    with `conv :: a -> b`, `convBack :: b -> a`, two monomorphic data types and
+    two MIRRORED instances (`Convert Celsius Fahrenheit`, `Convert Fahrenheit
+    Celsius`), so every `$c` bind name occurs twice and is distinguished only by
+    unique.
+
+    WHAT WAS ALREADY DONE before this task, and how much. Three of the four seams
+    the plan named turned out to be closed already, and the observation is what
+    established that rather than a code read:
+
+    * `ClassDecl` has been multi-param-shaped since Task 1, and `emitClassDecl`
+      emits one `(v : Type)` binder per entry. That was pinned as today's
+      behaviour; it is now SUPPORTED, and the fixture is the evidence.
+    * The instance attribution is `dfunMethodBinds` (Task 5), which reads the
+      dictionary POSITIONALLY and never looks at an instance-head string, so it
+      works unchanged at two parameters. `findClassMethod`/`findClassMethodBind` —
+      the plan's "key fix" — are STRUCTURALLY INCAPABLE here (their key is one
+      value-argument type against the space-joined head, which for two parameters
+      is a two-token string that no single type can equal), and they are the
+      FALLBACK, tried only when the dictionary declines. They were deliberately
+      NOT changed: a per-head structural matcher would be code no fixture
+      reaches, and its decline is already loud (the instance drops and
+      `unresolvedInstanceMethods` reports it). The `[]`-spine guards below pin
+      that division of labour.
+    * `reconstructClasses` DOES produce a junk one-parameter `Convert` (it invents
+      the single tyvar `"a"` and `generalizeTy` only generalizes the first head
+      type, leaving `conv : a → Fahrenheit`), and `mergeClassDecls` discards it:
+      the plugin record wins by name. Its `MethodRef` half survives and is what
+      rewrites the call sites to `Convert.conv` — that half needs names only.
+
+    What actually needed writing was `stripClassConstraints` (below), plus the
+    superclass diagnostic.
+
+### Observation 1 — the dump, verbatim
+
+    `.transpile-sandbox/.decls/MultiParam.decls.json` (= the `classDecls` channel
+    of `/tmp/transpile-MultiParam.json`), whitespace-compacted:
+
+        [{"methods":[{"hasDefault":false,"name":"conv",
+                      "type":{"arg":{"name":"a","tag":"TyVar"},
+                              "res":{"name":"b","tag":"TyVar"},"tag":"TyFun"}},
+                     {"hasDefault":false,"name":"convBack",
+                      "type":{"arg":{"name":"b","tag":"TyVar"},
+                              "res":{"name":"a","tag":"TyVar"},"tag":"TyFun"}}],
+          "name":"Convert","supers":["Sized"],"tyVars":["a","b"]}
+        ,{"methods":[{"hasDefault":false,"name":"size",
+                      "type":{"arg":{"name":"a","tag":"TyVar"},
+                              "res":{"args":[],"name":"Int","tag":"TyCon"},"tag":"TyFun"}}],
+          "name":"Sized","supers":[],"tyVars":["a"]}]
+
+    So `tyVars` is a genuine two-element list and the method types are rendered in
+    terms of BOTH class variables — which is exactly what the Core-reconstruction
+    fallback cannot do.
+
+    `instances`, both `Convert` entries (`headTypes` is a two-element list, in
+    class-parameter order):
+
+        {"className":"Convert","dfunName":"$fConvertCelsiusFahrenheit",
+         "dfunUnique":8214565720323793925,
+         "headTypes":[{"args":[],"name":"Celsius","tag":"TyCon"},
+                      {"args":[],"name":"Fahrenheit","tag":"TyCon"}]}
+        {"className":"Convert","dfunName":"$fConvertFahrenheitCelsius",
+         "dfunUnique":8214565720323793921,
+         "headTypes":[{"args":[],"name":"Fahrenheit","tag":"TyCon"},
+                      {"args":[],"name":"Celsius","tag":"TyCon"}]}
+
+### Observation 2 — the dfun spines, and which attribution fires
+
+    Flattened from the same dump (`@T` = a `Type` argument, `(dict)`/`(id)` = the
+    `Var`'s role):
+
+        $fConvertCelsiusFahrenheit/9221 = C:Convert @Celsius @Fahrenheit
+            $fSizedCelsius/9203(dict) $cconv/9456(id) $cconvBack/9469(id)
+        $fConvertFahrenheitCelsius/9217 = C:Convert @Fahrenheit @Celsius
+            $fSizedFahrenheit/9223(dict) $cconv/9397(id) $cconvBack/9437(id)
+        $fSizedCelsius/9203    = $csize        (newtype dictionary, one method)
+        $fSizedFahrenheit/9223 = $csize
+
+    with the method binds
+
+        $cconv/9456     : Celsius -> Fahrenheit      $cconvBack/9469 : Fahrenheit -> Celsius
+        $cconv/9397     : Fahrenheit -> Celsius      $cconvBack/9437 : Celsius -> Fahrenheit
+
+    i.e. `dfunMethodBinds`' MULTI-FIELD arm with TWO type arguments to drop and
+    one superclass dictionary to drop, and the two `$cconv`s differing only by
+    unique. The packed-key reconciliation holds at two parameters too:
+    8214565720323793925 = 114·2^56 + 9221 (`dfunDumpUnique`, guarded below).
+
+    THE ATTRIBUTION PATH IS THE DICTIONARY, and it has to be, since the fallback's
+    key cannot match — pinned by the `[]`-spine guards. The emitted instances
+    prove the pairing is right rather than merely present: `Convert Celsius
+    Fahrenheit` gets `conv := <9456 : Celsius → Fahrenheit>` and `convBack :=
+    <9469 : Fahrenheit → Celsius>`, and the mirror gets the other two. A wrong
+    pairing would have swapped bodies between the two instances, which the two
+    `fToC_offsets`/`fToCBack_offsets` properties are there to catch.
+
+    THE BINDER-ORDER RISK, and why it too fails loud. `[Convert a b]` emits the
+    class parameters in `tyVars`/`headTypes` order; with two MIRRORED instances in
+    scope, a swapped order would still find *an* instance at `useConvId`'s use
+    site, so the use site alone would not catch it. `convId`'s own body would,
+    though: `Convert.conv x` with `x : a` needs `Convert a ?` and a swapped binder
+    puts `Convert b a` in scope, which does not match — Lean reports it rather
+    than picking the mirror. So the one shape where an order bug could have been
+    silent is covered by the def that carries the binder, not by its callers.
+
+### Observation 3 — the ONE real defect, before and after
+
+    TWO FIXTURE VERSIONS ARE QUOTED BELOW, deliberately and not interchangeably.
+    The `lake build` transcript is from the 7-property DRAFT (before `Sized`,
+    `celsSize` and its property were added — hence its line numbers and its "5 of
+    7"), because that is the run that measured the pre-fix degradation end to end.
+    The two-line diff after it is the COMMITTED 8-property fixture, both binaries
+    over the same dump. Same defect, same fix, different files; the numbers do not
+    add up across the two and are not meant to.
+
+    PRE-FIX emission of the two constrained-polymorphic defs (verbatim, from the
+    HEAD binary run over the draft's dump):
+
+        def convId {t_v9122 : Type} {t_v9123 : Type}
+            (x_9127 : ((GHCCore.tyConOpaque "Convert") (t_v9122) (t_v9123))) : (t_v9122 → t_v9123) :=
+          (Convert.conv) (x_9127)
+
+    Both halves of M3 fact 3, reproduced at two parameters: the first value binder
+    is typed as the DICTIONARY (which `Lower` has already erased from the term) and
+    the result type is shifted by one arrow. `lake build`:
+
+        error: …/MultiParam.lean:71:57: Unknown identifier `GHCCore.tyConOpaque`
+        error: …/MultiParam.lean:74:61: Unknown identifier `GHCCore.tyConOpaque`
+        warning: …:80:4: declaration uses 'sorry'      -- useConvId
+        warning: …:83:4: declaration uses 'sorry'      -- useConvIdBack
+        error: …:111:69: translateType: unexpected sort type Lean.Expr.sort …
+        error: …:114:75: translateType: unexpected sort type Lean.Expr.sort …
+
+    LOUD, then: 5 of the 7 properties still verified and the two that go through
+    `convId`/`convIdBack` failed. POST-FIX, the whole diff over that dump is these
+    two lines (plus the new warning):
+
+        def convId {t_v9122 : Type} {t_v9123 : Type} [Convert t_v9122 t_v9123]
+            (x_9127 : t_v9122) : t_v9123 :=
+          (Convert.conv) (x_9127)
+        def convIdBack {t_v9120 : Type} {t_v9121 : Type} [Convert t_v9120 t_v9121]
+            (y_9128 : t_v9121) : t_v9120 :=
+          (Convert.convBack) (y_9128)
+
+### Lean-side probe — which MPTC shapes elaborate
+
+    Scratch file, `lake env lean` (Lean 4 v4.24.0), the class + two mirrored
+    instances above plus:
+
+        def aToB : A → B := Convert.conv          -- (1) pinned by the signature
+        def f1 (x : A) : Int := valB (Convert.conv x)  -- (2) pinned by the caller
+        def convId {a b : Type} [Convert a b] (x : a) : b := Convert.conv x
+        def useConvId : A → B := convId           -- (3) constraint binder + use
+        def f2 (x : A) := Convert.conv x          -- (4) pinned by nothing
+
+    → (1), (2), (3) all elaborate, and the five `#eval`s print `10, 4, 14, 10, 4`
+    (the expected values). `[Convert a b]` IS a valid binder, the body resolves
+    against it, and a monomorphic use instantiates it in both parameter orders.
+    (4) is the only failure, and it is LOUD:
+
+        error: typeclass instance problem is stuck, it is often due to metavariables
+          Convert A (?m.2 x)
+
+    So the supported shape is "the second parameter is determined by the context",
+    which is also the only shape GHC accepts without `AllowAmbiguousTypes`: an
+    unpinned `conv` is rejected upstream, so shape (4) does not reach a dump.
+    MEASURED, on `roundTrip :: Convert a b => a -> a` (a first draft of the
+    fixture — GHC 9.2.7, verbatim):
+
+        error: • Could not deduce (Convert a b0)
+            arising from a type ambiguity check for the type signature for ‘roundTrip’
+          … The type variable ‘b0’ is ambiguous
+          … To defer the ambiguity check to use sites, enable AllowAmbiguousTypes
+
+    which is the same fact for FUNCTIONAL DEPENDENCIES generally: `| a -> b` needs
+    `FunctionalDependencies`, overlap needs `OverlappingInstances`/`{-# OVERLAPPING
+    #-}`, and GHC rejects a module that uses either without the extension — the
+    loudness is upstream of the transpiler, not a check it makes. Nothing in the
+    emitter models a fundep, so no fundep-dependent inference can be silently
+    reproduced.
+
+### The superclass decision: REFUSE, and stop being silent about it
+
+    `class Sized a => Convert a b` dumps `"supers":["Sized"]` — a NAME, with no
+    argument types (`GhcDeclDump.ppSuperPred` drops them). With two parameters
+    `extends Sized ?` is a guess, so `emitClassDecl` emits no `extends`, which was
+    already its behaviour. Extending the plugin to dump per-super argument types
+    was the alternative and was NOT taken: it is a plugin rebuild plus a new parse
+    channel for a shape no fixture needs, and the plan permits refusing for M3.
+
+    What DID have to change is that the refusal was SILENT. `unmappedSupers` asks
+    only whether a parent has a Lean image, and `Sized` — declared right there in
+    the module — has one, so the drop produced `rc=0` and 0 bytes of stderr
+    (measured on this fixture with the HEAD binary). `multiParamSupers` now reports
+    every superclass of a multi-parameter class, and `unmappedSupers` reports none
+    of them, so the two are disjoint and nothing is announced twice. The emitted
+    stderr, verbatim:
+
+        warning: class `Convert` takes 2 type parameters and has the superclass `Sized`,
+          which is DROPPED from the emitted Lean class. …
+
+    CONSEQUENCE, pinned: `size` at a concrete head still works (`celsSize` in the
+    fixture, verified), every `Convert` instance still emits, and what is lost is
+    reaching `size` THROUGH a `Convert a b` constraint — `failed to synthesize
+    Sized …` at `lake build`. The fixture deliberately contains no such call.
+
+### e2e
+
+    `./transpile.sh examples/haskell/MultiParam.hs` → `rc=0`, the one warning
+    above; `lake build GhcCoreToLean.Generated.MultiParam` → 8/8 `✅ Valid`, no
+    errors, no `sorry` in the file. The 8 cover: both instances' `conv` and
+    `convBack` at concrete heads, a call site pinned only by its caller
+    (`convThenValue`), BOTH constrained-polymorphic defs instantiated
+    monomorphically (`useConvId`, `useConvIdBack` — the header path), a
+    two-method composition, and the dropped superclass's method at a concrete head.
+
+### Byte-identity sweep for THIS commit (two-binary method)
+
+    `fa04130`'s binary and `fa04130`+fix, run over the SAME 53 saved shim dumps
+    (`/tmp/transpile-*.json`: the whole `examples/haskell` corpus plus every probe
+    from the preceding commits, MultiParam included), `.lean` + `.map.json` +
+    stdout + stderr + newtype sidecar compared per module — 260 artifact files
+    over 51 emitted modules. Not re-dumped between binaries (uniques shift per
+    run). Output paths normalized, since `stdout` and the source map both record
+    the output file name.
+
+    **258 of 260 IDENTICAL. The two that move are `MultiParam.lean` (the two
+    `convId`/`convIdBack` headers above) and `MultiParam.stderr` (0 → the
+    multi-param-superclass warning).** Nothing else in the corpus changes a byte,
+    which is what the new `stripClassConstraints` arm being a SEPARATE arm below
+    the one-argument one buys: no single-parameter constraint, and no ordinary
+    value arrow, can reach different code than before. The two refusals
+    (`NewtypeInstances`, `UserClassNeqWithEq`) exit non-zero under BOTH binaries
+    with identical stderr.
+
+    Class fixtures re-transpiled and re-elaborated with the fixed binary
+    (`lake env lean`, which re-runs the specs rather than replaying them):
+    `SuperClass` 2 quantified ✅ / 0 err, `DefaultMethods` 4 ✅ / 0,
+    `OrdHandwritten` 20 theorems (2 quantified ✅) / 0, `OrdSectionOrder` 27
+    theorems (all ground `decide`, so 0 `✅ Valid` lines) / 0 err,
+    `BuiltinConstraints` 9 ✅ / 0, `TwoClassesDistinctMethods` 3 ✅ / 0,
+    `UserClassNeq` 1 ✅ / 0, `OperatorShadow` 2 ✅ / 0, `MultiParam` 8 ✅ / 0.
+    `UserClass` is RED and was red before this task: its committed property is
+    `boxTotal boxes = total boxes + 1`, which blaster correctly FALSIFIES
+    (`git show HEAD:examples/haskell/UserClass.hs` has the `+ 1`). Task 8 owns
+    that call. -/
+
+/-- `Convert` exactly as the plugin dumps it (observation 1). -/
+def m3t7Convert : ClassDecl :=
+  { name := "Convert", tyVars := ["a", "b"], supers := ["Sized"],
+    methods := [ { name := "conv",     ty := .tyFun (.tyVar "a") (.tyVar "b") },
+                 { name := "convBack", ty := .tyFun (.tyVar "b") (.tyVar "a") } ] }
+def m3t7Sized : ClassDecl :=
+  { name := "Sized", tyVars := ["a"], supers := [],
+    methods := [ { name := "size", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+
+/-! ### `emitClassDecl` — two binders, and no `extends` for either kind of parent -/
+
+-- SUPPORTED, not merely tolerated: this is the string `Generated/MultiParam.lean`
+-- contains, and `Sized` is dropped from the header even though it IS a user class
+-- (the `["Sized", "Convert"]` argument says so).
+#guard emitClassDecl [] m3t7Convert ["Sized", "Convert"]
+         == "class Convert (a : Type) (b : Type) where\n  conv : (a → b)\n  convBack : (b → a)"
+-- A BUILTIN parent is dropped from a multi-param header as well — same reason,
+-- and its binder recipe is not injected at constraint sites either (below).
+#guard emitClassDecl [] { m3t7Convert with supers := ["Ord"] } ["Convert"]
+         == "class Convert (a : Type) (b : Type) where\n  conv : (a → b)\n  convBack : (b → a)"
+-- The single-parameter sibling in the same module is untouched.
+#guard emitClassDecl [] m3t7Sized ["Sized", "Convert"]
+         == "class Sized (a : Type) where\n  size : (a → Int)"
+
+/-! ### `stripClassConstraints` — the new multi-variable arm
+
+    `convId`'s type, verbatim from the dump: `∀ a b. Convert _v9122 _v9123 →
+    _v9122 → _v9123`. -/
+
+def m3t7ConvIdTy : GHCType :=
+  .forAll "a" (.forAll "b"
+    (.tyFun (.tyCon "Convert" [.tyVar "_v9122", .tyVar "_v9123"])
+      (.tyFun (.tyVar "_v9122") (.tyVar "_v9123"))))
+
+-- THE FIX: one binder naming BOTH variables in class-parameter order, and the
+-- remaining type realigned with the term binders `Lower` left behind. (`GHCType`
+-- has no `BEq`, so the type side is compared through `emitType` — the same way
+-- every other type guard in this file does it.)
+#guard (stripClassConstraints ["Convert"] m3t7ConvIdTy).1 == ["[Convert t_v9122 t_v9123]"]
+#guard emitType (stripClassConstraints ["Convert"] m3t7ConvIdTy).2
+         == emitType (.tyFun (.tyVar "_v9122") (.tyVar "_v9123"))
+-- `superBinders` is NOT consulted at two parameters, even when an entry exists for
+-- this very class: a `{t}` template has one hole and `supers` does not say which
+-- parameter it belongs to, so filling it would emit a binder about the wrong
+-- variable. (`classSuperBinders` also refuses to build such an entry — belt and
+-- braces, and this guard is the belt.)
+#guard (stripClassConstraints ["Convert"] m3t7ConvIdTy [("Convert", ["[Ord {t}]"])]).1
+         == ["[Convert t_v9122 t_v9123]"]
+-- NOT a user class ⇒ not peeled, and the type comes back UNCHANGED (this is the
+-- pre-fix behaviour, which is what a run with no class-shape channel still gets).
+#guard (stripClassConstraints [] m3t7ConvIdTy).1 == ([] : List String)
+#guard emitType (stripClassConstraints [] m3t7ConvIdTy).2
+         == emitType (.tyFun (.tyCon "Convert" [.tyVar "_v9122", .tyVar "_v9123"])
+                        (.tyFun (.tyVar "_v9122") (.tyVar "_v9123")))
+-- `Maps.classConMap` is NOT consulted at two arguments: every class it maps takes
+-- ONE parameter in Haskell, so a two-argument head spelled `Eq` is not that class.
+#guard (stripClassConstraints []
+         (.tyFun (.tyCon "Eq" [.tyVar "a", .tyVar "b"]) (.tyVar "a"))).1 == ([] : List String)
+#guard emitType (stripClassConstraints []
+           (.tyFun (.tyCon "Eq" [.tyVar "a", .tyVar "b"]) (.tyVar "a"))).2
+         == emitType (.tyFun (.tyCon "Eq" [.tyVar "a", .tyVar "b"]) (.tyVar "a"))
+-- Only BARE type variables peel. A partially-applied head stops the peel rather
+-- than emitting `[Convert Int b]`-ish nonsense; unreachable from a dump (a
+-- monomorphic signature passes no dictionary), loud if it ever is.
+#guard (stripClassConstraints ["Convert"]
+         (.tyFun (.tyCon "Convert" [.tyCon "Int" [], .tyVar "b"]) (.tyVar "b"))).1 == []
+-- THE BYTE-IDENTITY CASES, i.e. everything that now also reaches the new arm and
+-- must still be declined by it: an ordinary value argument whose head is a
+-- zero-argument tycon…
+#guard (stripClassConstraints ["Convert"]
+         (.tyFun (.tyCon "Int" []) (.tyCon "Int" []))).1 == ([] : List String)
+#guard emitType (stripClassConstraints ["Convert"]
+           (.tyFun (.tyCon "Int" []) (.tyCon "Int" []))).2
+         == emitType (.tyFun (.tyCon "Int" []) (.tyCon "Int" []))
+-- …and a one-argument non-variable head (`Eq [a] => …`), unchanged from Task 3.
+#guard (stripClassConstraints []
+         (.tyFun (.tyCon "Eq" [.tyCon "[]" [.tyVar "a"]]) (.tyVar "a"))).1
+         == ([] : List String)
+#guard emitType (stripClassConstraints []
+           (.tyFun (.tyCon "Eq" [.tyCon "[]" [.tyVar "a"]]) (.tyVar "a"))).2
+         == emitType (.tyFun (.tyCon "Eq" [.tyCon "[]" [.tyVar "a"]]) (.tyVar "a"))
+-- The single-parameter arm still fires FIRST and unchanged, builtin and user.
+#guard (stripClassConstraints ["Sized"]
+         (.tyFun (.tyCon "Sized" [.tyVar "a"]) (.tyFun (.tyVar "a") (.tyCon "Int" [])))).1
+         == ["[Sized a]"]
+#guard (stripClassConstraints [] (.tyFun (.tyCon "Eq" [.tyVar "a"]) (.tyVar "a"))).1
+         == ["[BEq a]"]
+-- THE REMEDY `multiParamSuperWarning` PRESCRIBES, checked rather than asserted:
+-- `(Sized a, Convert a b) => b` mixes a one-argument and a two-argument
+-- constraint, so the two arms have to compose in one peel — the first fires on
+-- `Sized a`, recurses, and the new one fires on `Convert a b`. Guarded here
+-- because a message that tells the user to write a shape no test covers is the
+-- kind of claim this file does not let stand.
+#guard (stripClassConstraints ["Sized", "Convert"]
+         (.tyFun (.tyCon "Sized" [.tyVar "a"])
+           (.tyFun (.tyCon "Convert" [.tyVar "a", .tyVar "b"]) (.tyVar "b")))).1
+         == ["[Sized a]", "[Convert a b]"]
+#guard emitType (stripClassConstraints ["Sized", "Convert"]
+           (.tyFun (.tyCon "Sized" [.tyVar "a"])
+             (.tyFun (.tyCon "Convert" [.tyVar "a", .tyVar "b"]) (.tyVar "b")))).2
+         == emitType (.tyVar "b")
+-- The other order, and with a BUILTIN constraint in the mix (`Eq a`), since the
+-- one-argument arm's `classConMap` branch and the new arm have to compose too.
+#guard (stripClassConstraints ["Convert"]
+         (.tyFun (.tyCon "Convert" [.tyVar "a", .tyVar "b"])
+           (.tyFun (.tyCon "Eq" [.tyVar "b"]) (.tyVar "b")))).1
+         == ["[Convert a b]", "[BEq b]"]
+-- THREE or more parameters: the arm is n-ary by construction. No fixture produces
+-- this (GHC needs the extra parameters determined at every use site), so it is
+-- pinned as a consequence of the code, not as a supported shape.
+#guard (stripClassConstraints ["C"]
+         (.tyFun (.tyCon "C" [.tyVar "a", .tyVar "b", .tyVar "c"]) (.tyVar "a"))).1
+         == ["[C a b c]"]
+
+/-! ### The attribution, on the observed two-parameter spines
+
+    Uniques are the fixture's (`/tmp/transpile-MultiParam.json`, observation 2). -/
+
+def m3t7ConvV : Var :=
+  {name := "$cconv", unique := 9456,
+   ty := .tyFun (.tyCon "Celsius" []) (.tyCon "Fahrenheit" []), role := .id}
+def m3t7ConvBackV : Var :=
+  {name := "$cconvBack", unique := 9469,
+   ty := .tyFun (.tyCon "Fahrenheit" []) (.tyCon "Celsius" []), role := .id}
+-- The MIRROR instance's pair: same names, different uniques, swapped types.
+def m3t7ConvV2 : Var :=
+  {name := "$cconv", unique := 9397,
+   ty := .tyFun (.tyCon "Fahrenheit" []) (.tyCon "Celsius" []), role := .id}
+def m3t7ConvBackV2 : Var :=
+  {name := "$cconvBack", unique := 9437,
+   ty := .tyFun (.tyCon "Celsius" []) (.tyCon "Fahrenheit" []), role := .id}
+def m3t7SizedDictV : Var :=
+  {name := "$fSizedCelsius", unique := 9203, ty := .tyCon "_Unknown" [], role := .dict}
+def m3t7SizedDictV2 : Var :=
+  {name := "$fSizedFahrenheit", unique := 9223, ty := .tyCon "_Unknown" [], role := .dict}
+def m3t7DictCon : Var :=
+  {name := "C:Convert", unique := 9139, ty := .tyCon "_Unknown" [], role := .id}
+
+/-- `$fConvertCelsiusFahrenheit = C:Convert @Celsius @Fahrenheit $fSizedCelsius
+    $cconv $cconvBack` — two type arguments, one superclass dictionary, two
+    methods. -/
+def m3t7DfunCF : Bind :=
+  .nonRec {name := "$fConvertCelsiusFahrenheit", unique := 9221,
+           ty := .tyCon "Convert" [.tyCon "Celsius" [], .tyCon "Fahrenheit" []], role := .dict}
+    (.app (.app (.app (.app (.app (.var m3t7DictCon)
+      (.type_ (.tyCon "Celsius" [])))
+      (.type_ (.tyCon "Fahrenheit" [])))
+      (.var m3t7SizedDictV))
+      (.var m3t7ConvV))
+      (.var m3t7ConvBackV))
+def m3t7DfunFC : Bind :=
+  .nonRec {name := "$fConvertFahrenheitCelsius", unique := 9217,
+           ty := .tyCon "Convert" [.tyCon "Fahrenheit" [], .tyCon "Celsius" []], role := .dict}
+    (.app (.app (.app (.app (.app (.var m3t7DictCon)
+      (.type_ (.tyCon "Fahrenheit" [])))
+      (.type_ (.tyCon "Celsius" [])))
+      (.var m3t7SizedDictV2))
+      (.var m3t7ConvV2))
+      (.var m3t7ConvBackV2))
+def m3t7Binds : CoreProgram :=
+  [.nonRec m3t7ConvV (.lit (.litInt 0)), .nonRec m3t7ConvBackV (.lit (.litInt 0)),
+   .nonRec m3t7ConvV2 (.lit (.litInt 0)), .nonRec m3t7ConvBackV2 (.lit (.litInt 0)),
+   m3t7DfunCF, m3t7DfunFC]
+def m3t7InstCF : Instance :=
+  {className := "Convert", headTypes := [.tyCon "Celsius" [], .tyCon "Fahrenheit" []],
+   dfunName := "$fConvertCelsiusFahrenheit", dfunUnique := 8214565720323793925}
+def m3t7InstFC : Instance :=
+  {className := "Convert", headTypes := [.tyCon "Fahrenheit" [], .tyCon "Celsius" []],
+   dfunName := "$fConvertFahrenheitCelsius", dfunUnique := 8214565720323793921}
+/-- The space-joined head string, which is the FALLBACK matcher's whole key. -/
+def m3t7HeadCF : String := m3t7InstCF.headTypes.map emitType |> String.intercalate " "
+
+-- The packed-key reconciliation, at two parameters (observation 2's arithmetic).
+#guard dfunDumpUnique m3t7InstCF.dfunUnique == 9221
+#guard dfunDumpUnique m3t7InstFC.dfunUnique == 9217
+-- Both methods attributed, both type arguments and the superclass dict dropped —
+-- and the two instances get DIFFERENT binds despite identical names.
+#guard (dfunMethodBinds m3t7Binds m3t7Convert m3t7InstCF).map (fun (m, v, _) => (m, v.unique))
+         == [("conv", 9456), ("convBack", 9469)]
+#guard (dfunMethodBinds m3t7Binds m3t7Convert m3t7InstFC).map (fun (m, v, _) => (m, v.unique))
+         == [("conv", 9397), ("convBack", 9437)]
+-- THE FALLBACK CANNOT DO THIS, which is why it was left alone. Its key is a
+-- two-token string; a method's first value-argument type is one token, so with an
+-- EMPTY spine both methods are unresolved and the instance would drop LOUDLY.
+#guard classifyInstanceMethod [] m3t7Binds "Convert" m3t7HeadCF
+         (m3t7Convert.methods.head!) == .unresolved
+#guard classifyInstanceMethod [] m3t7Binds "Convert" m3t7HeadCF
+         (m3t7Convert.methods.getLast!) == .unresolved
+-- …and with the dictionary attribution, both are fields, with the right uniques.
+#guard classifyInstanceMethod [] m3t7Binds "Convert" m3t7HeadCF
+         (m3t7Convert.methods.head!) (dfunMethodBinds m3t7Binds m3t7Convert m3t7InstCF)
+         == .field "_dollar_cconv_9456"
+#guard classifyInstanceMethod [] m3t7Binds "Convert" m3t7HeadCF
+         (m3t7Convert.methods.getLast!) (dfunMethodBinds m3t7Binds m3t7Convert m3t7InstFC)
+         == .field "_dollar_cconvBack_9437"
+-- End to end, both instances — the two-argument head, and the pairing that the
+-- fixture's properties check semantically.
+#guard emitInstanceUser [] [m3t7Convert] m3t7Binds m3t7InstCF
+         == some ("instance : Convert (GHCCore.tyConOpaque \"Celsius\") " ++
+                    "(GHCCore.tyConOpaque \"Fahrenheit\") where\n" ++
+                  "  conv := _dollar_cconv_9456\n  convBack := _dollar_cconvBack_9469")
+#guard emitInstanceUser [] [m3t7Convert] m3t7Binds m3t7InstFC
+         == some ("instance : Convert (GHCCore.tyConOpaque \"Fahrenheit\") " ++
+                    "(GHCCore.tyConOpaque \"Celsius\") where\n" ++
+                  "  conv := _dollar_cconv_9397\n  convBack := _dollar_cconvBack_9437")
+-- Neither is reported as dropped.
+#guard unresolvedInstanceMethods
+         { binds := m3t7Binds, typeDecls := [], instances := [m3t7InstCF, m3t7InstFC],
+           classDecls := [m3t7Convert] }
+         == ([] : List (Name × String × Name))
+
+/-! ### The superclass drop, and the diagnostic that was missing -/
+
+-- ALL supers of a multi-parameter class, whatever their Lean image would be…
+#guard multiParamSupers m3t7Convert == ["Sized"]
+#guard multiParamSupers { m3t7Convert with supers := ["Ord"] } == ["Ord"]
+#guard multiParamSupers { m3t7Convert with supers := ["Show"] } == ["Show"]
+#guard multiParamSupers { m3t7Convert with supers := [] } == ([] : List Name)
+-- …and NONE from a single-parameter one, whose supers are Task 5's business.
+#guard multiParamSupers m3t7Sized == ([] : List Name)
+#guard multiParamSupers { m3t7Sized with supers := ["Ord", "Show"] } == ([] : List Name)
+-- THE SILENT GAP, pinned from both sides. `unmappedSupers` reported nothing for a
+-- multi-param class with a USER parent (it has an image, so it looked fine)…
+#guard unmappedSupers ["Sized", "Convert"] m3t7Convert == ([] : List Name)
+-- …and it no longer reports the unmapped-builtin case either, because
+-- `multiParamSupers` covers that with the accurate reason. THE ONE BEHAVIOUR
+-- CHANGE here: pre-Task-7 this returned `["Show"]`.
+#guard unmappedSupers ["Convert"] { m3t7Convert with supers := ["Show"] } == ([] : List Name)
+-- Single-parameter classes keep Task 5's behaviour exactly.
+#guard unmappedSupers ["Sized"] { m3t7Sized with supers := ["Show"] } == ["Show"]
+#guard unmappedSupers ["Sized", "Named"] { m3t7Sized with supers := ["Named"] }
+         == ([] : List Name)
+-- The two diagnostics are DISJOINT on every class, so nothing is warned twice.
+#guard (m3t7Convert :: m3t7Sized ::
+        [{ m3t7Convert with supers := ["Show"] }, { m3t7Sized with supers := ["Show"] }]).all
+         (fun c => (unmappedSupers ["Sized", "Convert"] c).isEmpty ||
+                   (multiParamSupers c).isEmpty)
+-- No constraint-site recipe is built for a multi-parameter class, so the `{t}`
+-- fill has nothing to be wrong about (the `stripClassConstraints` guard above is
+-- the other half of this).
+#guard classSuperBinders [{ m3t7Convert with supers := ["Ord"] }]
+         == ([] : List (Name × List String))
+-- The single-parameter parent of the same module still gets its own entry.
+#guard (classSuperBinders [{ m3t7Sized with supers := ["Ord"] }]).map (·.1) == ["Sized"]
+-- Program level: the fixture's shape, reported with the parameter count.
+#guard droppedMultiParamSupers
+         { binds := m3t7Binds, typeDecls := [], instances := [m3t7InstCF],
+           classDecls := [m3t7Convert, m3t7Sized] }
+         == [("Convert", "Sized", 2)]
+#guard droppedSupers
+         { binds := m3t7Binds, typeDecls := [], instances := [m3t7InstCF],
+           classDecls := [m3t7Convert, m3t7Sized] }
+         == ([] : List (Name × Name))
+-- The message names the class, the parent and the arity (a smoke test on the
+-- string, like `unmappedSuperWarning`'s).
+#guard ((multiParamSuperWarning "Convert" "Sized" 2).splitOn
+          "class `Convert` takes 2 type parameters and has the superclass `Sized`").length == 2
 
 end GhcCoreToLean.Tests
