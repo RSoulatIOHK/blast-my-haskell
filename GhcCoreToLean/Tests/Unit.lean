@@ -5863,10 +5863,36 @@ def m3t7ConvIdTy : GHCType :=
            (.tyFun (.tyCon "Eq" [.tyVar "a", .tyVar "b"]) (.tyVar "a"))).2
          == emitType (.tyFun (.tyCon "Eq" [.tyVar "a", .tyVar "b"]) (.tyVar "a"))
 -- Only BARE type variables peel. A partially-applied head stops the peel rather
--- than emitting `[Convert Int b]`-ish nonsense; unreachable from a dump (a
--- monomorphic signature passes no dictionary), loud if it ever is.
+-- than emitting `[Convert Int b]`-ish nonsense.
+--
+-- CORRECTED REASON (a review measured it): this is NOT unreachable because "a
+-- monomorphic signature passes no dictionary" — GHC passes one. GHC rejects such
+-- a signature without `FlexibleContexts`, and WITH the extension it reaches a
+-- dump: `convToF :: Convert a Fahrenheit => a -> Int` emitted
+-- `def convToF {t_v9102 : Type} (x_9111 : ((GHCCore.tyConOpaque "Convert")
+-- (t_v9102) (Fahrenheit.Fahrenheit))) : …`, and `GHCCore.tyConOpaque` is not a
+-- definition, so the file fails with `error: Unknown identifier
+-- `GHCCore.tyConOpaque`` (measured directly on that binder). LOUDNESS is why
+-- declining is sound. All three declined shapes are pinned below, because the
+-- reachability correction is what makes them worth having.
 #guard (stripClassConstraints ["Convert"]
          (.tyFun (.tyCon "Convert" [.tyCon "Int" [], .tyVar "b"]) (.tyVar "b"))).1 == []
+-- SECOND position (the shape actually measured: `Convert a Fahrenheit`).
+#guard (stripClassConstraints ["Convert"]
+         (.tyFun (.tyCon "Convert" [.tyVar "a", .tyCon "Int" []]) (.tyCon "Int" []))).1
+         == ([] : List String)
+#guard emitType (stripClassConstraints ["Convert"]
+           (.tyFun (.tyCon "Convert" [.tyVar "a", .tyCon "Int" []]) (.tyCon "Int" []))).2
+         == emitType (.tyFun (.tyCon "Convert" [.tyVar "a", .tyCon "Int" []]) (.tyCon "Int" []))
+-- A COMPOUND first argument (`Convert [a] b`): a type application, not a bare
+-- variable, so `tvs.length == args.length` fails and the arrow stays.
+#guard (stripClassConstraints ["Convert"]
+         (.tyFun (.tyCon "Convert" [.tyCon "[]" [.tyVar "a"], .tyVar "b"]) (.tyVar "b"))).1
+         == ([] : List String)
+#guard emitType (stripClassConstraints ["Convert"]
+           (.tyFun (.tyCon "Convert" [.tyCon "[]" [.tyVar "a"], .tyVar "b"]) (.tyVar "b"))).2
+         == emitType (.tyFun (.tyCon "Convert" [.tyCon "[]" [.tyVar "a"], .tyVar "b"])
+                        (.tyVar "b"))
 -- THE BYTE-IDENTITY CASES, i.e. everything that now also reaches the new arm and
 -- must still be declined by it: an ordinary value argument whose head is a
 -- zero-argument tycon…
@@ -6058,5 +6084,170 @@ def m3t7HeadCF : String := m3t7InstCF.headTypes.map emitType |> String.intercala
 -- string, like `unmappedSuperWarning`'s).
 #guard ((multiParamSuperWarning "Convert" "Sized" 2).splitOn
           "class `Convert` takes 2 type parameters and has the superclass `Sized`").length == 2
+-- At ZERO parameters the count reads as English rather than `takes 0 type
+-- parameters`, which read as a bug in the transpiler. Cosmetic and unreachable
+-- from the plugin channel; the `n ≥ 2` rendering above is UNCHANGED, which is what
+-- keeps `MultiParam.hs`'s stderr byte-identical.
+#guard ((multiParamSuperWarning "C" "S" 0).splitOn
+          "class `C` takes no type parameters and has the superclass `S`").length == 2
+
+/-! ### The OTHER arity direction: a MULTI-PARAMETER class as the PARENT
+
+    `classSuperBinders`' docstring used to call this shape "not expressible in
+    Haskell". A review MEASURED otherwise with the pinned compiler:
+    `class Convert a b => C a` is indeed rejected (`Not in scope: type variable
+    ‘b’`), but a superclass constraint may mention the child's own class variable
+    more than once, and GHC 9.2.7 ACCEPTS
+
+        class Convert a b where conv :: a -> b
+        class Convert a a => C a where selfy :: a -> Int
+
+    (`SelfSuperProbe.hs`, transpiled through the real pipeline). The transpiler
+    then exited `rc=0` with ZERO bytes of stderr and emitted
+
+        class C (a : Type) extends Convert a where
+          selfy : (a → Int)
+
+    — a two-parameter class applied to one argument. Both existing diagnostics are
+    silent there BY CONSTRUCTION: `multiParamSupers` asks about the CHILD's arity
+    (one, so nothing), `unmappedSupers` asks whether the parent has a Lean image
+    (`Convert` has one). Lean does fail — `error: type expected, got (Convert a :
+    Type → Type)`, measured on the emitted class verbatim — so nothing was
+    silently WRONG, but the diagnostic gap was structurally the same one Task 7
+    closed in the other direction. -/
+
+def m3t7SelfSuperC : ClassDecl :=
+  { name := "C", tyVars := ["a"], supers := ["Convert"],
+    methods := [ { name := "selfy", ty := .tyFun (.tyVar "a") (.tyCon "Int" []) } ] }
+-- The three classes of the probe, and the arity list `emitProgram` derives from
+-- them (`classArities userClasses`) — ONE class set feeding both the emitter and
+-- the diagnostic, which is what makes them complements.
+def m3t7SelfClasses : List ClassDecl := [m3t7Convert, m3t7Sized, m3t7SelfSuperC]
+#guard classArities m3t7SelfClasses == [("Convert", 2), ("Sized", 1), ("C", 1)]
+
+-- PRE-FIX, still reachable as the arity-less call: no arity fact, bogus `extends`.
+-- Every `#guard` in this file that predates the parameter therefore still means
+-- what it meant.
+#guard emitClassDecl [] m3t7SelfSuperC ["Convert", "Sized", "C"]
+         == "class C (a : Type) extends Convert a where\n  selfy : (a → Int)"
+-- POST-FIX: the parent is dropped, and — THE TRAP — the clause goes with it. A
+-- filter applied after the `isEmpty` test would have emitted `extends  where`.
+#guard emitClassDecl [] m3t7SelfSuperC ["Convert", "Sized", "C"]
+         (classArities m3t7SelfClasses)
+         == "class C (a : Type) where\n  selfy : (a → Int)"
+-- A SINGLE-parameter parent alongside it still emits, so the drop is per parent
+-- and not per class.
+#guard emitClassDecl [] { m3t7SelfSuperC with supers := ["Convert", "Sized"] }
+         ["Convert", "Sized", "C"] (classArities m3t7SelfClasses)
+         == "class C (a : Type) extends Sized a where\n  selfy : (a → Int)"
+-- The order of `supers` is preserved when the multi-param one is second.
+#guard emitClassDecl [] { m3t7SelfSuperC with supers := ["Sized", "Convert"] }
+         ["Convert", "Sized", "C"] (classArities m3t7SelfClasses)
+         == "class C (a : Type) extends Sized a where\n  selfy : (a → Int)"
+-- A parent ABSENT from the arity list is assumed to take one parameter — the
+-- convention that makes the `[]` default reproduce the pre-fix output.
+#guard emitClassDecl [] m3t7SelfSuperC ["Convert", "Sized", "C"] [("C", 1)]
+         == "class C (a : Type) extends Convert a where\n  selfy : (a → Int)"
+-- A MULTI-parameter CHILD is unaffected: it never had an `extends` to filter.
+#guard emitClassDecl [] m3t7Convert ["Sized", "Convert"] (classArities m3t7SelfClasses)
+         == "class Convert (a : Type) (b : Type) where\n" ++
+            "  conv : (a → b)\n  convBack : (b → a)"
+
+-- THE DIAGNOSTIC. Reported with the PARENT's arity, not the child's.
+#guard multiParamParentSupers m3t7SelfClasses m3t7SelfSuperC == [("Convert", 2)]
+-- A single-parameter parent is not reported (it is in `extends`).
+#guard multiParamParentSupers m3t7SelfClasses { m3t7SelfSuperC with supers := ["Sized"] }
+         == ([] : List (Name × Nat))
+-- A parent that is not a local class at all stays `unmappedSupers`' business,
+-- whatever its arity elsewhere would be — `emitClassDecl` leaves it out for the
+-- OTHER reason (no Lean image), so reporting it here would double-report.
+#guard multiParamParentSupers m3t7SelfClasses { m3t7SelfSuperC with supers := ["Show"] }
+         == ([] : List (Name × Nat))
+#guard unmappedSupers ["Convert", "Sized", "C"] { m3t7SelfSuperC with supers := ["Show"] }
+         == ["Show"]
+-- A MULTI-parameter child is `multiParamSupers`' business, parent arity or not —
+-- including the case where BOTH are multi-parameter, which is the one a
+-- child-side-only or parent-side-only guard would miss.
+#guard multiParamParentSupers m3t7SelfClasses { m3t7Convert with supers := ["Convert"] }
+         == ([] : List (Name × Nat))
+#guard multiParamSupers { m3t7Convert with supers := ["Convert"] } == ["Convert"]
+
+/-! #### Program level, and the three-way disjointness -/
+
+def m3t7SelfProg : Program :=
+  { binds := [], typeDecls := [], instances := [], classDecls := m3t7SelfClasses }
+-- The probe's shape: `Convert`'s own parent by the child-arity reason, `C`'s by
+-- the parent-arity one, and nothing by the no-Lean-image one.
+#guard droppedMultiParamParents m3t7SelfProg == [("C", "Convert", 2)]
+#guard droppedMultiParamSupers m3t7SelfProg == [("Convert", "Sized", 2)]
+#guard droppedSupers m3t7SelfProg == ([] : List (Name × Name))
+-- DISJOINT as `(class, superclass)` pairs, program-wide: no parent is warned
+-- twice. Checked on the pairs rather than per class, because that is the property
+-- `Main.lean`'s three loops actually need.
+def m3t7ParentPairs : List (Name × Name) :=
+  (droppedMultiParamParents m3t7SelfProg).map fun (c, s, _) => (c, s)
+def m3t7ChildPairs : List (Name × Name) :=
+  (droppedMultiParamSupers m3t7SelfProg).map fun (c, s, _) => (c, s)
+#guard m3t7ParentPairs.all fun p =>
+         !(droppedSupers m3t7SelfProg).contains p && !m3t7ChildPairs.contains p
+#guard m3t7ChildPairs.all fun p => !(droppedSupers m3t7SelfProg).contains p
+-- Non-vacuous: each of the two views does report something here.
+#guard m3t7ParentPairs == [("C", "Convert")] && m3t7ChildPairs == [("Convert", "Sized")]
+-- BOTH multi-parameter, at program level: `multiParamSupers` owns both entries and
+-- the parent-arity view stays silent.
+def m3t7BothMultiProg : Program :=
+  { binds := [], typeDecls := [], instances := [],
+    classDecls := [m3t7Convert, { m3t7Convert with name := "D", supers := ["Convert"] }] }
+#guard droppedMultiParamSupers m3t7BothMultiProg
+         == [("Convert", "Sized", 2), ("D", "Convert", 2)]
+#guard droppedMultiParamParents m3t7BothMultiProg == ([] : List (Name × Name × Nat))
+#guard droppedSupers m3t7BothMultiProg == ([] : List (Name × Name))
+-- A module with no multi-parameter class anywhere reports nothing new, which is
+-- the corpus's case (and why every fixture stays byte-identical).
+#guard droppedMultiParamParents
+         { binds := [], typeDecls := [], instances := [],
+           classDecls := [m3t5Sized, m3t5Container, m3t5Capped] }
+         == ([] : List (Name × Name × Nat))
+
+/-! #### The warning string, and the remedy it prescribes -/
+
+#guard ((multiParamParentWarning "C" "Convert" 2).splitOn
+          "class `C` takes one type parameter and has the superclass `Convert`").length == 2
+#guard ((multiParamParentWarning "C" "Convert" 2).splitOn "takes 2 type parameters").length == 2
+#guard ((multiParamParentWarning "C" "Convert" 3).splitOn "takes 3 type parameters").length == 2
+-- Fix E's phrasing reaches this message too.
+#guard ((multiParamParentWarning "C" "Convert" 0).splitOn "takes no type parameters").length == 2
+-- The parent is shown APPLIED, with one `a` per parameter, so the remedy is right
+-- at three parameters as well as two.
+#guard ((multiParamParentWarning "C" "Convert" 2).splitOn "(Convert a a, C a) => …").length == 2
+#guard ((multiParamParentWarning "C" "Convert" 3).splitOn "(Convert a a a, C a) => …").length == 2
+-- THE REMEDY, checked rather than asserted (as at `multiParamSuperWarning`'s):
+-- `(Convert a a, C a) => …` has to PEEL, or the message prescribes a shape that
+-- fails. The multi-argument arm fires on `Convert a a` (two arguments, both bare
+-- variables — repetition is not a problem for it), the one-argument arm on `C a`.
+#guard (stripClassConstraints ["Convert", "C"]
+         (.tyFun (.tyCon "Convert" [.tyVar "a", .tyVar "a"])
+           (.tyFun (.tyCon "C" [.tyVar "a"]) (.tyCon "Int" [])))).1
+         == ["[Convert a a]", "[C a]"]
+
+/-! #### `classSuperBinders` was already safe here — pinned, now that the shape
+    is known to be reachable
+
+    `go` re-tests the arity of every class it DESCENDS into, not only the one it
+    starts at, so a single-parameter child whose parent takes two gets no entry
+    and no `{t}` fill from a parameter it cannot see. -/
+
+#guard classSuperBinders m3t7SelfClasses == ([] : List (Name × List String))
+-- The load-bearing case: the multi-parameter parent's OWN parent has a recipe, so
+-- a recursion that did not re-test arity would inject `Ord`'s eight binders into
+-- `C` — filled with `C`'s `a`, about a parameter of `Convert` nobody can name.
+#guard classSuperBinders [{ m3t7Convert with supers := ["Ord"] }, m3t7SelfSuperC]
+         == ([] : List (Name × List String))
+-- A single-parameter parent in the same position DOES pass its recipe down, which
+-- is what makes the guard above about arity rather than about recursion depth.
+#guard (classSuperBinders
+          [{ m3t7Sized with name := "P", supers := ["Ord"] },
+           { m3t7SelfSuperC with supers := ["P"] }]).map (·.1)
+         == ["P", "C"]
 
 end GhcCoreToLean.Tests

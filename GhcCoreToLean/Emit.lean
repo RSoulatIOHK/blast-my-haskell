@@ -563,8 +563,20 @@ partial def stripClassConstraintsGo (classNames : List Name)
   --   head bearing one of those names is not that class and must not pick up its
   --   recipe.
   -- Only BARE type variables are peeled, as above: a partially-applied head like
-  -- `Convert Int b` passes no dictionary in a monomorphic signature and stays
-  -- loud rather than being peeled into a binder mentioning a type constructor.
+  -- `Convert Int b` / `Convert a Int` stays loud rather than being peeled into a
+  -- binder mentioning a type constructor.
+  --
+  -- NOT because the shape cannot arrive — an earlier version of this comment
+  -- claimed "a monomorphic signature passes no dictionary", which is false; GHC
+  -- does pass one. What GHC does is reject the signature without
+  -- `FlexibleContexts`, and WITH the extension the shape reaches a dump:
+  -- `convToF :: Convert a Fahrenheit => a -> Int` (MEASURED) emits the header
+  -- `def convToF {t_v9102 : Type} (x_9111 : ((GHCCore.tyConOpaque "Convert")
+  -- (t_v9102) (Fahrenheit.Fahrenheit))) : …`, i.e. the unpeeled constraint as the
+  -- first value binder — and `GHCCore.tyConOpaque` is not a definition, so that
+  -- file fails with `error: Unknown identifier `GHCCore.tyConOpaque`` (measured
+  -- directly). LOUDNESS is the soundness argument for declining, not
+  -- unreachability; the guards pin all three declined shapes.
   | .tyFun (.tyCon c args) r =>
     let tvs := args.filterMap fun a => match a with
       | .tyVar t => some (tyVarId t)
@@ -864,6 +876,29 @@ def emitDataDecl (derivedEq derivedOrd : Bool) (d : DataDecl)
     tolerated — `MultiParam.hs` pins `class Convert (a : Type) (b : Type) where
     conv : (a → b); convBack : (b → a)` end to end.
 
+    THE REVERSE DIRECTION — a multi-parameter class as the PARENT of a
+    single-parameter one — is dropped for the same reason, and `arities` is the
+    fact that lets it be. `class Convert a b => C a` is indeed rejected by GHC
+    (`Not in scope: type variable ‘b’`), but a superclass may mention the child's
+    own class variable more than once, and GHC 9.2.7 ACCEPTS
+    `class Convert a a => C a` — MEASURED, transcript in the `M3 Task 7` block of
+    `Tests/Unit.lean`. `extends` can apply a parent to the child's ONE variable
+    and no more, so with no arity check this emitted
+    `class C (a : Type) extends Convert a where …` — a two-parameter class
+    applied to one argument, which Lean rejects with `error: type expected, got
+    (Convert a : Type → Type)`. Loud, but at `lake build` and about the generated
+    file, with `rc=0` and ZERO bytes of stderr at the transpiler: the same
+    silent-diagnostic gap Task 7 closed in the other direction.
+
+    So `arities` — `(class name, type-parameter count)` for the classes of this
+    module — filters `extends` down to parents that take exactly ONE parameter,
+    and `multiParamParentSupers` reports the rest. A parent ABSENT from `arities`
+    is assumed to take one, which is what makes the parameter's `[]` default
+    reproduce the pre-fix output exactly (and keeps every `#guard` that predates
+    it meaning what it meant). The two tests compose into ONE filter, so a class
+    whose only user parent is multi-parameter drops the clause entirely rather
+    than emitting `extends  where`.
+
     `defaults` maps a METHOD NAME to the Lean term for its class-body `:=`
     default, translated from GHC's `$dm<method>` bind by `classDefaultBody` (M3
     Task 4). A method absent from the list emits without a default, exactly as
@@ -887,9 +922,10 @@ def emitDataDecl (derivedEq derivedOrd : Bool) (d : DataDecl)
       later: loud, not silent.
 
     `classNames` is TRAILING and defaults to `[]`, which reproduces the
-    pre-Task-5 output exactly (no super is a "user class" ⇒ no `extends`). -/
+    pre-Task-5 output exactly (no super is a "user class" ⇒ no `extends`), and so
+    is `arities` (see above). -/
 def emitClassDecl (defaults : List (Name × String)) (c : ClassDecl)
-    (classNames : List Name := []) : String :=
+    (classNames : List Name := []) (arities : List (Name × Nat) := []) : String :=
   let methodLines := c.methods.map fun m =>
     let decl := s!"  {sanitize m.name} : {emitType m.ty}"
     match defaults.find? (·.1 == m.name) with
@@ -899,13 +935,30 @@ def emitClassDecl (defaults : List (Name × String)) (c : ClassDecl)
   let extends? :=
     match c.tyVars with
     | [tv] =>
-      let userSupers := c.supers.filter classNames.contains
+      -- A parent absent from `arities` is assumed to take ONE parameter, which is
+      -- what makes the `[]` default reproduce the pre-fix output exactly.
+      let arityOf (p : Name) : Nat :=
+        match arities.find? (fun (a : Name × Nat) => a.1 == p) with
+        | some (_, k) => k
+        | none        => 1
+      -- ONE filter, both tests: a user class whose own arity is 1 (or unknown).
+      -- Splitting them would let a class whose only user parent is
+      -- multi-parameter reach the `else` branch and emit `extends  where`.
+      let userSupers := c.supers.filter fun p => classNames.contains p && arityOf p == 1
       if userSupers.isEmpty then ""
       else " extends " ++ String.intercalate ", "
              (userSupers.map fun p => s!"{sanitize p} {tyVarId tv}")
     | _ => ""
   s!"class {sanitize c.name} {params}{extends?} where\n" ++
     String.intercalate "\n" methodLines
+
+/-- `(class name, type-parameter count)` for a class set — `emitClassDecl`'s
+    `arities` argument, and the same list `multiParamParentSupers` reads through
+    its `classes`. Both derive from ONE class set at the call site (`emitProgram`'s
+    `userClasses`), which is what makes the emitted `extends` and the diagnostic
+    exact complements: a user parent is in the clause iff it is not reported. -/
+def classArities (classes : List ClassDecl) : List (Name × Nat) :=
+  classes.map fun c => (c.name, c.tyVars.length)
 
 /-- Superclass NAMES of `c` that emission drops on the floor: neither a user
     class in `classNames` (→ `extends`) nor a builtin with a `Maps.classConMap`
@@ -952,9 +1005,53 @@ def unmappedSupers (classNames : List Name) (c : ClassDecl) : List Name :=
 def multiParamSupers (c : ClassDecl) : List Name :=
   if c.tyVars.length == 1 then [] else c.supers
 
+/-- Superclasses of a SINGLE-parameter class `c` dropped because the PARENT takes
+    more than one type parameter — `(parent name, parent's parameter count)`.
+
+    The other direction of `multiParamSupers`, and it took a review to notice it
+    exists: `classSuperBinders`' docstring used to call this shape "not
+    expressible in Haskell". `class Convert a b => C a` is rejected by GHC, but a
+    superclass may mention the child's own class variable more than once and GHC
+    9.2.7 ACCEPTS `class Convert a a => C a` (MEASURED — see `emitClassDecl` for
+    the transcript and the emitted string it used to produce with `rc=0` and no
+    stderr).
+
+    `classes` is the module's class set, so `classes.find?` succeeding is exactly
+    `classNames.contains` at `emitClassDecl`'s filter, and the arity test is the
+    same one — the two are complements on one class set, never two.
+
+    DISJOINT from both other superclass diagnostics by construction:
+    `multiParamSupers` needs the CHILD to be multi-parameter (this one returns `[]`
+    there), and `unmappedSupers` needs the parent to have no Lean image (this one
+    only reports parents that ARE local classes, which have one). A WARNING, not a
+    refusal, on the same argument as those two: what is lost is reaching the
+    parent's methods through the child's constraint, which is `failed to
+    synthesize` at `lake build`, and every other part of both classes still
+    emits. -/
+def multiParamParentSupers (classes : List ClassDecl) (c : ClassDecl)
+    : List (Name × Nat) :=
+  if c.tyVars.length != 1 then [] else
+  c.supers.filterMap fun s =>
+    match classes.find? (·.name == s) with
+    | some parent => if parent.tyVars.length == 1 then none
+                     else some (s, parent.tyVars.length)
+    | none        => none
+
+/-- A type-parameter count as English, for the two superclass warnings below.
+    Neither LIVE call site can reach 1 — `multiParamSupers` fires only when the
+    CHILD's arity is ≠ 1 and `multiParamParentSupers` only when the PARENT's is —
+    so there is no singular case to render. (Both warnings are public `def`s, so a
+    caller may pass anything; that is a `#guard`'s business, not this function's.)
+    `0` is the whole point — `takes 0 type parameters`
+    read as a bug in the transpiler rather than a fact about the class. Cosmetic
+    only: the plugin channel dumps a class's real `classTyVars`, which is never
+    empty, so a `0` here can come only from a hand-built `ClassDecl`. -/
+private def paramCountPhrase (n : Nat) : String :=
+  if n == 0 then "no type parameters" else s!"{n} type parameters"
+
 /-- The warning for one `multiParamSupers` entry. -/
 def multiParamSuperWarning (cls super : Name) (nparams : Nat) : String :=
-  s!"class `{cls}` takes {nparams} type parameters and has the superclass `{super}`,\n" ++
+  s!"class `{cls}` takes {paramCountPhrase nparams} and has the superclass `{super}`,\n" ++
   s!"  which is DROPPED from the emitted Lean class. The class-shape dump records a\n" ++
   s!"  superclass by NAME only, so with more than one parameter there is no fact\n" ++
   s!"  saying which parameter `{super}` constrains — `extends {super} ?` would be a\n" ++
@@ -966,6 +1063,28 @@ def multiParamSuperWarning (cls super : Name) (nparams : Nat) : String :=
   s!"  Remedy: constrain the parent explicitly at each use site (`({super} a, {cls} a b) => …`),\n" ++
   s!"  or extend the decl plugin's `ppSuperPred` to dump each superclass's argument\n" ++
   s!"  types so the parameter can be identified."
+
+/-- The warning for one `multiParamParentSupers` entry. Here the PARENT is the
+    multi-parameter one and `nparams` is ITS count, so the remedy has to spell the
+    parent's arguments out — `a` repeated `nparams` times, which is the shape GHC
+    accepted in the first place. -/
+def multiParamParentWarning (cls parent : Name) (nparams : Nat) : String :=
+  let selfApp := String.intercalate " " (List.replicate nparams "a")
+  s!"class `{cls}` takes one type parameter and has the superclass `{parent}`, which\n" ++
+  s!"  takes {paramCountPhrase nparams} — so `{parent}` is DROPPED from the emitted Lean\n" ++
+  s!"  class. Lean's `extends` applies a parent to the child's own type variable, i.e.\n" ++
+  s!"  to ONE argument, and the class-shape dump records a superclass by NAME only\n" ++
+  s!"  (`GhcDeclDump.ppSuperPred`). GHC accepts the declaration because the superclass\n" ++
+  s!"  context's type variables are all `{cls}`'s own (`class {parent} {selfApp} => {cls} a`\n" ++
+  s!"  is the simplest such shape), and which type each of `{parent}`'s parameters gets\n" ++
+  s!"  is exactly what the dump drops. Emitting `extends {parent} a` anyway would leave\n" ++
+  s!"  `{parent}` partially applied, which Lean rejects with `type expected, got\n" ++
+  s!"  ({parent} a : Type → …)`. `{cls}` itself, its methods and its instances are\n" ++
+  s!"  emitted normally; what is lost is reaching `{parent}`'s methods THROUGH a `{cls}`\n" ++
+  s!"  constraint, which fails with `failed to synthesize {parent} …` at `lake build`.\n" ++
+  s!"  Remedy: constrain the parent explicitly at each use site (`({parent} {selfApp}, {cls} a) => …`),\n" ++
+  s!"  or extend the decl plugin's `ppSuperPred` to dump each superclass's argument\n" ++
+  s!"  types so `extends {parent} {selfApp}` can be emitted."
 
 /-- The warning for one `unmappedSupers` entry. -/
 def unmappedSuperWarning (cls super : Name) : String :=
@@ -1001,11 +1120,21 @@ def unmappedSuperWarning (cls super : Name) : String :=
     constraint site, and with two parameters there is no fact saying which of
     them the parent constrains (`supers` is names only), so any fill would be a
     guess about the wrong variable. Belt-and-braces: `stripClassConstraints`'
-    multi-parameter arm does not read `superBinders` either, and the reverse
-    direction — a multi-parameter class as the PARENT of a single-parameter one —
-    is not expressible in Haskell (a superclass constraint may mention only the
-    child's own class variables, so `class Convert a b => C a` does not compile).
-    The drop is reported by `multiParamSupers`. -/
+    multi-parameter arm does not read `superBinders` either. The drop is reported
+    by `multiParamSupers`.
+
+    The REVERSE direction — a multi-parameter class as the PARENT of a
+    single-parameter one — IS expressible in Haskell, contrary to what this
+    docstring claimed until a review measured it. `class Convert a b => C a` is
+    rejected (`Not in scope: type variable ‘b’`), but a superclass may mention
+    the child's own class variable more than once and GHC 9.2.7 accepts
+    `class Convert a a => C a`. This function is safe there because `go` re-tests
+    the arity of every class it DESCENDS into, not only the one it starts at: a
+    single-parameter child whose parent takes two gets `[]` from the recursive
+    call, so no `{t}` is ever filled from a parameter the child cannot see — even
+    when that parent's own super has a recipe (`class Ord a => Convert a b`).
+    `emitClassDecl` drops such a parent from `extends` on the same fact, and
+    `multiParamParentSupers` reports it. -/
 def classSuperBinders (classes : List ClassDecl) : List (Name × List String) :=
   let rec go (fuel : Nat) (c : ClassDecl) : List String :=
     match fuel with
@@ -2265,9 +2394,13 @@ def droppedSupers (p : Program) : List (Name × Name) :=
 
 /-- Every `(class, superclass, parameter count)` dropped for the multi-parameter
     reason, program-wide — the Program-level view of `multiParamSupers`, wired to
-    an `eprintln` in `Main.lean`. Disjoint from `droppedSupers` by construction
-    (each of the two per-class functions is empty exactly where the other can be
-    non-empty), so no superclass is reported twice. Computed on the MERGED class
+    an `eprintln` in `Main.lean`. Disjoint from `droppedSupers` and from
+    `droppedMultiParamParents` by construction (each of the three per-class
+    functions is empty wherever another can be non-empty: this one needs the CHILD
+    to take ≠ 1 parameters, `droppedMultiParamParents` needs it to take exactly
+    one, and `droppedSupers` needs the parent to have no Lean image while
+    `droppedMultiParamParents` only reports parents that are local classes), so no
+    superclass is reported twice. Computed on the MERGED class
     set like every other diagnostic here — and note that only the PLUGIN channel
     can produce a multi-parameter shape at all: `reconstructClasses` invents a
     single type variable, so a run with no decls sidecar reports nothing here and
@@ -2279,6 +2412,20 @@ def droppedMultiParamSupers (p : Program) : List (Name × Name × Nat) :=
   let classes := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
   classes.flatMap fun c =>
     (multiParamSupers c).map fun s => (c.name, s, c.tyVars.length)
+
+/-- Every `(class, superclass, SUPERCLASS's parameter count)` dropped because the
+    PARENT takes more than one type parameter — the Program-level view of
+    `multiParamParentSupers`, wired to an `eprintln` in `Main.lean`. Computed on
+    the MERGED class set, and from THAT set's arities, so it reports exactly the
+    parents `emitProgram`'s `emitClassDecl` call leaves out of `extends`.
+
+    Like `droppedMultiParamSupers` this is reachable only through the PLUGIN
+    channel: `reconstructClasses` invents one type variable per class, so with no
+    decls sidecar no class is multi-parameter and this list is empty. -/
+def droppedMultiParamParents (p : Program) : List (Name × Name × Nat) :=
+  let classes := mergeClassDecls p.classDecls (reconstructClasses p.binds p.instances).1
+  classes.flatMap fun c =>
+    (multiParamParentSupers classes c).map fun (s, n) => (c.name, s, n)
 
 /-- The warning for one `unresolvedInstanceMethods` entry. -/
 def unresolvedInstanceMethodWarning (cls head mname : Name) : String :=
@@ -3781,10 +3928,13 @@ def emitFullProgram (extTypes : List (String × String)) (p : Program)
   -- methods (bare, via `MethodRef.bare`), builtins and locals are safe there.
   let defaults   := translatedDefaults p.binds userClasses
   let defaultTop := ctorNames ++ collectTopNames keptBinds
+  -- The arities of the SAME class set `classNames` comes from, so a parent is in
+  -- `extends` iff `multiParamParentSupers` does not report it (`classArities`).
+  let arities := classArities userClasses
   let classDecls := userClasses.map fun c =>
     let ds := (defaults.filter (·.1 == c.name)).filterMap fun (_, m) =>
       (classDefaultBody methodMap defaultTop p.binds c m).map (fun body => (m, body))
-    emitClassDecl ds c classNames
+    emitClassDecl ds c classNames arities
   -- Partition kept binds for forward-visibility-safe ordering. Drop instance
   -- dict-builders (`$f…`) and Typeable junk; `$c…` method defs precede the
   -- instances (which reference them) which precede user binds (which use the

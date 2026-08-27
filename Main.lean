@@ -280,6 +280,16 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- `lake build`.
     for (cls, super, n) in Emit.droppedMultiParamSupers userProg do
       IO.eprintln s!"warning: {Emit.multiParamSuperWarning cls super n}"
+    -- The SAME drop with the arities the other way round: a single-parameter class
+    -- whose PARENT is multi-parameter (`class Convert a a => C a`, which GHC 9.2.7
+    -- accepts — MEASURED). Neither loop above sees it: the child takes one
+    -- parameter and the parent is a local class with a Lean image, so until this
+    -- loop existed the transpiler emitted `extends Convert a` — a two-parameter
+    -- class applied to one argument — with `rc=0` and empty stderr, leaving Lean
+    -- to report it as `type expected` against the generated file. Warning, not
+    -- refusal, on the same argument as the two above.
+    for (cls, parent, n) in Emit.droppedMultiParamParents userProg do
+      IO.eprintln s!"warning: {Emit.multiParamParentWarning cls parent n}"
     -- Name every `Ord` instance that gets no Lean image (M3 Task 6): a minimal
     -- `<=`-only definition, whose `compare` is GHC's dictionary-dependent class
     -- default. Warning, not refusal, for the same reason as the two above — and

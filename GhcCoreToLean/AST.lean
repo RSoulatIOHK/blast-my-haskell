@@ -126,14 +126,27 @@ deriving Repr, Inhabited
     sidecar; see `Emit.mergeClassDecls` for the precedence rule. -/
 structure ClassDecl where
   name    : Name
-  /-- The class's type parameters, e.g. `["a"]`. Multi-parameter classes are not
-      supported end-to-end yet (M3 Task 7); the list shape is here so the plugin
-      channel can carry the truth rather than truncate it. -/
+  /-- The class's type parameters, e.g. `["a"]`. MULTI-parameter classes are
+      supported end to end since M3 Task 7 — `examples/haskell/MultiParam.hs` pins
+      `class Convert a b`, two instances of it, and a `Convert a b =>` constraint.
+      What such a class does not get is its SUPERCLASSES (see `supers`). The
+      Core-reconstruction fallback always invents exactly one parameter, so only
+      the plugin channel can produce a longer list. -/
   tyVars  : List Name
   /-- Superclass *names*, e.g. `["Sized"]` for `class Sized a => Container a`.
-      NOT yet consumed by emission (M3 Task 5) — a class with a superclass
-      therefore emits without it, which fails loud at the use site (`failed to
-      synthesize Sized …`) rather than silently. -/
+      Consumed by emission since M3 Task 5: a parent this module declares becomes
+      `extends Sized a`, a builtin with a `Maps.classConMap` recipe becomes
+      instance-implicit binders at every constraint site
+      (`Emit.classSuperBinders`), and anything else is dropped with a warning
+      (`Emit.unmappedSupers`).
+
+      NAMES only is the channel's limit (`GhcDeclDump.ppSuperPred` discards each
+      superclass's ARGUMENTS), and that is what the two arity-related drops are
+      about: a superclass of a multi-parameter class cannot be applied to one of
+      several variables (`Emit.multiParamSupers`), and a multi-parameter parent of
+      a single-parameter class cannot be applied to the child's one variable
+      (`Emit.multiParamParentSupers`). Both are dropped and WARNED rather than
+      guessed; a guess would be silently wrong. -/
   supers  : List Name
   methods : List ClassMethod
 deriving Repr, Inhabited
