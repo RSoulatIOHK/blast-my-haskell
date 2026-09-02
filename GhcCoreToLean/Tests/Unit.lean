@@ -6250,4 +6250,212 @@ def m3t7BothMultiProg : Program :=
            { m3t7SelfSuperC with supers := ["P"] }]).map (·.1)
          == ["P", "C"]
 
+/-! ## Two `$c<method>` binds at one head — the ambiguous-attribution refusal
+
+    THE SILENT-WRONG THIS CLOSES, measured on
+    `examples/haskell/UserClassEqWithEq.hs` (plain `import Prelude`,
+    `class MyEq a where (==)`, `data R = R Int Int deriving Prelude.Eq`,
+    `structEq x y = x Prelude.== y`). GHC emitted TWO binds named `$c==`, both
+    typed `R -> R -> Bool`, and `findClassMethodBind`'s `(method name, first
+    value-argument type)` key does not mention the declaring class, so
+    `findSome?` handed the `Eq` route the USER class's body:
+
+        def _dollar_c_eq__eq__2948 …   -- MyEq's `a > c`
+        def _dollar_c_eq__eq__2931 …   -- derived, structural
+
+        instance : BEq R where
+          beq := _dollar_c_eq__eq__2948
+
+    with `2931` emitted and never referenced. `#eval structEq (R 2 0) (R 1 0)`
+    answered `true` where Haskell says `False`, `#eval structEq (R 1 5) (R 1 5)`
+    answered `false` where Haskell says `True`, and both
+    `theorem … := by decide` reported "Tactic `decide` proved that the
+    proposition … is false" — while the transpiler exited 0 with empty stderr.
+
+    NEITHER EXISTING GUARD REACHED IT, and both misses are structural rather than
+    accidental: `sameMethodAmbiguities` builds its class set from USER classes
+    only, so the builtin `Eq` is invisible to it and `==` reads as
+    singly-declared; `unmappedOperatorMethods` fires only when the method is
+    ABSENT from the method map, and here `MyEq` has a local instance so it is
+    present. See the "Two `$c<method>` binds at one head" section header in
+    Emit.lean for why this refuses rather than attributing through the
+    dictionaries.
+
+    The literals below are the fixture dump's
+    (`/tmp/transpile-UserClassEqWithEq.json`): uniques `2948`/`2931` for the two
+    `$c==` binds, `2940` for `$c/=`, `2897`/`2904` for the two dfuns, and the
+    instance channel's PACKED dfun keys, so `dfunDumpUnique`'s mask is exercised
+    here too rather than assumed. -/
+
+def ambR : GHCType := .tyCon "R" []
+def ambEqTy : GHCType := .tyFun ambR (.tyFun ambR (.tyCon "Bool" []))
+-- `$c==` of `instance MyEq R` — the user class's `a > c`.
+def ambCeqUser : Var := {name := "$c==", unique := 2948, ty := ambEqTy, role := .id}
+-- `$c==` of the DERIVED `instance Eq R` — structural. Same name, same first
+-- value-argument type; only the unique differs.
+def ambCeqDerived : Var := {name := "$c==", unique := 2931, ty := ambEqTy, role := .id}
+def ambCneq : Var := {name := "$c/=", unique := 2940, ty := ambEqTy, role := .id}
+-- `$fMyEqR = $c==` — the SINGLE-METHOD newtype dictionary.
+def ambMyEqDfun : Bind :=
+  .nonRec {name := "$fMyEqR", unique := 2897, ty := .tyCon "MyEq" [ambR], role := .dict}
+    (.var ambCeqUser)
+-- `$fEqR = GHC.Classes.C:Eq @R $c== $c/=` — the MULTI-FIELD dictionary, and note
+-- the dict constructor is MODULE-QUALIFIED. `dfunMethodBinds`' `startsWith "C:"`
+-- test is `false` here, which is why `dictMethodRefs` has its own.
+def ambEqDfun : Bind :=
+  .rec_ [({name := "$fEqR", unique := 2904, ty := .tyCon "Eq" [ambR], role := .dict},
+          (.app (.app (.app
+            (.var {name := "GHC.Classes.C:Eq", unique := 2850, ty := .tyCon "_Unknown" [],
+                   role := .id})
+            (.type_ ambR))
+            (.var ambCeqDerived))
+            (.var ambCneq)))]
+def ambBinds : CoreProgram :=
+  [.nonRec ambCeqUser (.lit (.litInt 0)), ambMyEqDfun,
+   .nonRec ambCeqDerived (.lit (.litInt 0)), ambEqDfun]
+def ambEqInst : Instance :=
+  {className := "Eq", headTypes := [ambR], dfunName := "$fEqR",
+   dfunUnique := 8214565720323787608}
+def ambMyEqInst : Instance :=
+  {className := "MyEq", headTypes := [ambR], dfunName := "$fMyEqR",
+   dfunUnique := 8214565720323787601}
+def ambRDecl : DataDecl :=
+  {name := "R", kind := "data",
+   ctors := [ {name := "R", fields := [ {name := "", ty := .tyCon "Int" []},
+                                        {name := "", ty := .tyCon "Int" []} ]} ]}
+def ambMyEqClass : ClassDecl :=
+  {name := "MyEq", tyVars := ["a"], supers := [],
+   methods := [{name := "==", ty := .tyFun (.tyVar "a") (.tyFun (.tyVar "a") (.tyCon "Bool" []))}]}
+def ambProg : Program :=
+  {binds := ambBinds, typeDecls := [ambRDecl], instances := [ambEqInst, ambMyEqInst],
+   classDecls := [ambMyEqClass]}
+
+-- THE DETECTION. Both classes named, each with the def the bind would have
+-- become, and the head SOURCE-spelled (`R`, not the `(GHCCore.tyConOpaque "R")`
+-- needle the key is actually matched on).
+#guard ambiguousMethodBinds ambProg
+         == [("$c==", "R", [("MyEq", "_dollar_c_eq__eq__2948"),
+                            ("Eq",   "_dollar_c_eq__eq__2931")])]
+-- The message names the method, the head, both classes, and a remedy.
+#guard ((ambiguousMethodBindError "$c==" "R"
+           [("MyEq", "_dollar_c_eq__eq__2948"), ("Eq", "_dollar_c_eq__eq__2931")]).splitOn
+         "the method `==` at instance head `R` has 2 `$c==` bindings").length == 2
+#guard ((ambiguousMethodBindError "$c==" "R"
+           [("MyEq", "_dollar_c_eq__eq__2948"), ("Eq", "_dollar_c_eq__eq__2931")]).splitOn
+         "declared by class `MyEq`, would emit as `_dollar_c_eq__eq__2948`").length == 2
+#guard ((ambiguousMethodBindError "$c==" "R"
+           [("MyEq", "_dollar_c_eq__eq__2948"), ("Eq", "_dollar_c_eq__eq__2931")]).splitOn
+         "declared by class `Eq`, would emit as `_dollar_c_eq__eq__2931`").length == 2
+#guard ((ambiguousMethodBindError "$c==" "R" []).splitOn "Remedy: rename the class method").length == 2
+
+/-! ### What it must NOT refuse
+
+    The check has to stay off every shape the head-disambiguation exists FOR, or
+    it takes away modules that transpile correctly today. -/
+
+-- ONE bind at the key: the ordinary case, and the overwhelming majority.
+#guard ambiguousMethodBinds { ambProg with binds := [.nonRec ambCeqUser (.lit (.litInt 0)),
+                                                     ambMyEqDfun] }
+         == ([] : List (Name × Name × List (Name × String)))
+-- TWO INSTANCES OF ONE CLASS AT DIFFERENT HEADS — precisely the case
+-- `findClassMethodBind`'s head match exists to resolve. Two `$c==` binds, but
+-- their first value-argument types differ, so they are not one key.
+def ambCeqOtherHead : Var :=
+  {name := "$c==", unique := 3001,
+   ty := .tyFun (.tyCon "S" []) (.tyFun (.tyCon "S" []) (.tyCon "Bool" [])), role := .id}
+#guard ambiguousMethodBinds
+         { ambProg with
+           binds := [.nonRec ambCeqUser (.lit (.litInt 0)), ambMyEqDfun,
+                     .nonRec ambCeqOtherHead (.lit (.litInt 0))] }
+         == ([] : List (Name × Name × List (Name × String)))
+-- TWO INSTANCES OF ONE MULTI-PARAMETER CLASS SHARING A FIRST HEAD TYPE
+-- (`instance Convert R Bar` + `instance Convert R Baz`): one key, two binds, and
+-- NOT refused — the dictionaries attribute both to `Convert`, and
+-- `dfunMethodBinds` reads them positionally. This is the exemption arm.
+def ambConvA : Var :=
+  {name := "$cconv", unique := 4001, ty := .tyFun ambR (.tyCon "Bar" []), role := .id}
+def ambConvB : Var :=
+  {name := "$cconv", unique := 4002, ty := .tyFun ambR (.tyCon "Baz" []), role := .id}
+def ambConvDfunA : Bind :=
+  .nonRec {name := "$fConvertRBar", unique := 4100, ty := .tyCon "_Unknown" [], role := .dict}
+    (.var ambConvA)
+def ambConvDfunB : Bind :=
+  .nonRec {name := "$fConvertRBaz", unique := 4101, ty := .tyCon "_Unknown" [], role := .dict}
+    (.var ambConvB)
+#guard ambiguousMethodBinds
+         { binds := [.nonRec ambConvA (.lit (.litInt 0)), .nonRec ambConvB (.lit (.litInt 0)),
+                     ambConvDfunA, ambConvDfunB],
+           typeDecls := [ambRDecl],
+           instances := [{className := "Convert", headTypes := [ambR, .tyCon "Bar" []],
+                          dfunName := "$fConvertRBar", dfunUnique := 4100},
+                         {className := "Convert", headTypes := [ambR, .tyCon "Baz" []],
+                          dfunName := "$fConvertRBaz", dfunUnique := 4101}] }
+         == ([] : List (Name × Name × List (Name × String)))
+-- A method with NO value argument (`$cempty : Bag`) is not keyed at all, however
+-- many binds share the name: `findClassMethodBind`'s `matchesHead` is `false` for
+-- it too, so it can never be the bind that function confuses.
+#guard ambiguousMethodBinds
+         { ambProg with
+           binds := [.nonRec {name := "$cempty", unique := 5001, ty := .tyCon "Bag" [],
+                              role := .id} (.lit (.litInt 0)),
+                     .nonRec {name := "$cempty", unique := 5002, ty := .tyCon "Bag" [],
+                              role := .id} (.lit (.litInt 0))] }
+         == ([] : List (Name × Name × List (Name × String)))
+-- A non-`$c` binder pair is out of scope entirely (two user binds can collide by
+-- name only if GHC accepted them, which it does not — but the key is `$c`-only by
+-- construction, not by luck).
+#guard ambiguousMethodBinds
+         { ambProg with
+           binds := [.nonRec {name := "eqR", unique := 6001, ty := ambEqTy, role := .id}
+                       (.lit (.litInt 0)),
+                     .nonRec {name := "eqR", unique := 6002, ty := ambEqTy, role := .id}
+                       (.lit (.litInt 0))] }
+         == ([] : List (Name × Name × List (Name × String)))
+
+/-! ### UNATTRIBUTED is refused, not exempted
+
+    The exemption needs EVERY colliding bind attributed to one class. A dfun the
+    binds do not contain — or a dictionary body of a shape `dictMethodRefs` does
+    not recognize — leaves an unknown owner, and the safe direction there is to
+    refuse: "we could not tell" must never read as "same class". Shown by `?` in
+    the message. -/
+
+#guard ambiguousMethodBinds
+         { ambProg with binds := [.nonRec ambCeqUser (.lit (.litInt 0)),
+                                  .nonRec ambCeqDerived (.lit (.litInt 0))] }
+         == [("$c==", "R", [("?", "_dollar_c_eq__eq__2948"), ("?", "_dollar_c_eq__eq__2931")])]
+-- Half-attributed is still refused — the `Eq` dictionary alone leaves `MyEq`'s
+-- bind unowned, and one known owner is not "all one class".
+#guard ambiguousMethodBinds
+         { ambProg with binds := [.nonRec ambCeqUser (.lit (.litInt 0)),
+                                  .nonRec ambCeqDerived (.lit (.litInt 0)), ambEqDfun] }
+         == [("$c==", "R", [("?", "_dollar_c_eq__eq__2948"), ("Eq", "_dollar_c_eq__eq__2931")])]
+
+/-! ### The point of the wrong decision, and what the USER side still gets right
+
+    `findClassMethodBind` is `private`; `classifyInstanceMethod` is the public
+    face of it. With an empty spine it IS that lookup, and on the collision it now
+    answers `.unresolved` — "no UNIQUE such bind" — instead of the first match.
+    That `none` is DEFENSE IN DEPTH, not the diagnostic: `Main.lean` refuses the
+    program before emission. It matters because the user-class side is otherwise
+    unchanged and CORRECT, which is the asymmetry that made the defect silent —
+    `instance : MyEq R` was wired to `2948` all along; only the `Eq` route, which
+    has no dictionary fallback, took a first match. -/
+
+#guard classifyInstanceMethod [] ambBinds "MyEq" (emitType ambR) (ambMyEqClass.methods.head!)
+         == .unresolved
+-- With the dictionary attribution the user's instance resolves, and to the RIGHT
+-- one of the two binds.
+#guard (dfunMethodBinds ambBinds ambMyEqClass ambMyEqInst).map (fun (m, v, _) => (m, v.unique))
+         == [("==", 2948)]
+#guard classifyInstanceMethod [] ambBinds "MyEq" (emitType ambR) (ambMyEqClass.methods.head!)
+         (dfunMethodBinds ambBinds ambMyEqClass ambMyEqInst)
+         == .field "_dollar_c_eq__eq__2948"
+-- Remove the rival bind and the head match is exactly what it always was: one
+-- match, same answer. This is the guard that the multi-match arm did not change
+-- the single-match behaviour every corpus module depends on.
+#guard classifyInstanceMethod [] [.nonRec ambCeqUser (.lit (.litInt 0)), ambMyEqDfun]
+         "MyEq" (emitType ambR) (ambMyEqClass.methods.head!)
+         == .field "_dollar_c_eq__eq__2948"
+
 end GhcCoreToLean.Tests

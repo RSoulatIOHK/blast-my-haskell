@@ -1625,7 +1625,34 @@ def unmappedOperatorMethodError (cls mname : Name) : String :=
     are invisible to it and their instance was dropped whole. `dfunMethodBinds`
     reads the attribution out of the instance's own dictionary instead and is
     tried first; this stays for the shapes that one declines (a dfun whose body is
-    not a recognizable dictionary, a class the plugin channel has no shape for). -/
+    not a recognizable dictionary, a class the plugin channel has no shape for).
+
+    NEVER THE FIRST OF SEVERAL, and that is the fix for a MEASURED silent-wrong.
+    The key `(method, first-value-arg type)` does NOT mention the declaring CLASS,
+    so a user class declaring an operator method whose instance head also carries
+    the builtin instance of the class that declares the same operator gives TWO
+    binds at one key, distinguishable only by unique. OBSERVED on
+    `examples/haskell/UserClassEqWithEq.hs` (`class MyEq a where (==)` +
+    `data R = R Int Int deriving Prelude.Eq`, needing NO `import Prelude hiding` —
+    `/tmp/transpile-UserClassEqWithEq.json` has `$c==` at unique 2948 for `MyEq R`
+    and 2931 for `Eq R`, both typed `R -> R -> Bool`), where `findSome?`'s first
+    match handed the USER class's body (`a > c`) to `hwEqBindAt` and emitted
+
+        instance : BEq R where
+          beq := _dollar_c_eq__eq__2948        -- the USER class's body
+
+    with the derived structural `_dollar_c_eq__eq__2931` emitted and never
+    referenced. `structEq x y = x Prelude.== y` then computed the user's operator:
+    `#eval` said `true` where Haskell says `False`, and
+    `theorem … = false := by decide` reported "proved that the proposition … is
+    false" — with `rc=0` and empty stderr from the transpiler.
+
+    `none` HERE IS DEFENSE IN DEPTH, NOT THE DIAGNOSTIC. `Main.lean` refuses such
+    a program before any emission (`ambiguousMethodBinds`), so this arm is
+    unreachable in a run that emits; it exists so that no future caller — one
+    reached on a path the Program-level check does not cover — can silently take a
+    first match again. A reader must NOT read `none` as "no such bind": it means
+    "no UNIQUE such bind". -/
 private def findClassMethodBind (binds : CoreProgram) (method : Name) (headTyStr : String)
     : Option (Var × Expr) :=
   let matchesHead (v : Var) : Bool :=
@@ -1633,9 +1660,12 @@ private def findClassMethodBind (binds : CoreProgram) (method : Name) (headTyStr
       (match firstValArgTy v.ty with
        | some t => emitType t == headTyStr
        | none   => false)
-  binds.findSome? fun b => match b with
-    | .nonRec v e => if matchesHead v then some (v, e) else none
-    | .rec_ pairs => pairs.find? (fun (v, _) => matchesHead v)
+  let hits : List (Var × Expr) := binds.flatMap fun b => match b with
+    | .nonRec v e => if matchesHead v then [(v, e)] else []
+    | .rec_ pairs => pairs.filter (fun (v, _) => matchesHead v)
+  match hits with
+  | [hit] => some hit
+  | _     => none
 
 /-- Unwind an application spine into its head and its arguments, left to right.
     `f @T d x` ⇒ `(f, [Type T, Var d, Var x])`. -/
@@ -1726,6 +1756,195 @@ def dfunMethodBinds (binds : CoreProgram) (cd : ClassDecl) (i : Instance)
       if paired.all (fun (m, v) => v.name == "$c" ++ m.name) then
         paired.filterMap fun (m, v) => (byNameUnique v).map (fun (w, e) => (m.name, w, e))
       else []
+
+/-! ### Two `$c<method>` binds at one head (the ambiguous-attribution refusal)
+
+Every bind lookup keyed on `(method name, first value-argument type)` —
+`findClassMethodBind` and its `$ccompare` twin `findCompareBind` — is ambiguous
+exactly when TWO classes declare a method of the same name and both have an
+instance at one head. GHC does not suffix `$c<method>` names per instance, so the
+two binds differ only by unique, and the key does not mention the class.
+
+WHY THE TWO EXISTING GUARDS MISS IT, both measured. `sameMethodAmbiguities`
+builds its class set from the plugin-dumped ∪ Core-reconstructed USER classes, so
+a builtin `Eq`/`Ord` is not in it and the operator looks singly-declared.
+`unmappedOperatorMethods` requires the method to be ABSENT from the method map,
+and here it is present — the user class does have a surviving `$c` bind, it is
+just not the one the `Eq` route picks up.
+
+WHY THIS REFUSES RATHER THAN ATTRIBUTING CORRECTLY, which is the honest part.
+The attribution IS available: an instance's own dictionary names its methods'
+binds by unique (`dictMethodRefs`; `$fEqR = GHC.Classes.C:Eq @R $c==(2931)
+$c/=(2940)` and `$fMyEqR = $c==(2948)` in the fixture dump), and the USER-class
+side already uses it (`dfunMethodBinds`, tried before the head match, wires
+`instance : MyEq R` correctly today). What is NOT available is correct EMISSION,
+because the emitter reaches this key from FOUR independent head-only decision
+points:
+
+  * `findClassMethodBind` — the `Eq`/`Ord`/fallback bind lookup;
+  * `findCompareBind` — a second, separate copy of the same first-value-argument
+    match, feeding `ordRoute`'s derived-vs-hand-written decision;
+  * `emitFullProgram`'s `isSuppressedMethod` — `headMatches` is name+head with no
+    unique, so it suppresses or keeps BOTH colliding binds as a pair;
+  * `derivedEqTypes` — a name+tag-primop scan, so a user-class `$c==` over an enum
+    would put the head in `derivedEq` and take the real `Eq` out.
+
+Threading uniques through some of those and not the rest does not remove the
+wrong answer, it MOVES it to the un-threaded point — with no diagnostic, which is
+the one failure mode this project forbids. `UserClassNeqWithEq.hs`'s header
+already scoped that refactor as a follow-up needing `isSuppressedMethod` to stop
+being name+head keyed. So the program is refused, loudly and by name, and the
+refactor stays a separate change.
+
+THE ONE EXEMPTION is a collision whose binds all belong to the SAME class: two
+instances of one MULTI-PARAMETER class sharing a first head type (`instance
+Convert Foo Bar` + `instance Convert Foo Baz` both give `$cconv` at `Foo`). That
+is the shape `dfunMethodBinds` was built for and it attributes them positionally,
+so nothing is guessed; the head match returns `none` and, if the dictionary ever
+declines too, the instance drops LOUDLY through `unresolvedInstanceMethods`.
+`MultiParam.hs` does not reach the exemption — its two instances are mirrored
+(`Convert Celsius Fahrenheit`/`Convert Fahrenheit Celsius`), so the first
+value-argument types already differ. -/
+
+/-- Every `$c<method>` bind reference in instance `i`'s OWN dictionary, as
+    `(bind name, unique)` — the channel that says which INSTANCE, and so which
+    CLASS, a `$c` bind belongs to.
+
+    Deliberately WEAKER than `dfunMethodBinds`, and for the case that one cannot
+    serve: no `ClassDecl` is needed, nothing is paired positionally and no arity
+    is checked, because the classes this has to attribute include the BUILTIN
+    `Eq`/`Ord` — for which `reconstructClasses` and `mergeClassDecls` build no
+    `ClassDecl` at all (both filter `builtinClasses`). It answers only "which
+    `$c` names and uniques does this dictionary mention", which is all the
+    ambiguity check needs.
+
+    BOTH observed dfun shapes, same two as `dfunMethodBinds`: the multi-field
+    dictionary constructor spine and the single-method newtype dictionary whose
+    body IS the method reference. The dict-constructor test is NOT that function's
+    `startsWith "C:"` — a locally declared class's constructor is bare
+    (`C:Container`) but an IMPORTED one is module-qualified, and the dumps spell
+    `Eq`'s `GHC.Classes.C:Eq`, i.e. exactly the case this function exists for.
+    Reusing the bare-prefix test would have attributed nothing on the `Eq` side
+    and made the check unable to tell a two-class collision from a one-class one.
+
+    Declines with `[]` on an unrecognized shape or a missing dfun bind; the caller
+    treats "not attributed" as "refuse", never as "same class". -/
+private def dictMethodRefs (binds : CoreProgram) (i : Instance) : List (Name × Unique) :=
+  let isDictCon (n : Name) : Bool := n.startsWith "C:" || (n.splitOn ".C:").length > 1
+  -- Name AND masked unique, with the same name-only `orElse` degradation as
+  -- `dfunMethodBinds` — see `dfunDumpUnique` for why the mask is load-bearing.
+  match (findBind binds i.dfunName (some (dfunDumpUnique i.dfunUnique))).orElse
+          (fun _ => findBind binds i.dfunName) with
+  | none          => []
+  | some (_, rhs) =>
+    let (head, args) := spineOf rhs
+    match head with
+    | .var hv =>
+      if args.isEmpty then
+        (if hv.name.startsWith "$c" then [(hv.name, hv.unique)] else [])
+      else if isDictCon hv.name then
+        args.filterMap fun a => match a with
+          | .var av => if av.name.startsWith "$c" then some (av.name, av.unique) else none
+          | _       => none
+      else []
+    | _ => []
+
+/-- Every `(bind name, source-spelled head, candidates)` where more than one
+    `$c<method>` bind carries one instance head and they are not all one class's —
+    the Program-level refusal wired to an `eprintln` in `Main.lean`. Each candidate
+    is `(declaring class or "?" when the dictionary did not attribute it, emitted
+    def name)`.
+
+    KEYED EXACTLY LIKE THE LOOKUPS IT PROTECTS: `$c`-prefixed binder names, and
+    `firstValArgTy`'s first value-argument type rendered by `emitType`. A method
+    with no value argument at all (`$cempty : Bag`) has no key here and needs
+    none — `findClassMethodBind`'s `matchesHead` is `false` for it too, so it can
+    never be the bind that function confuses.
+
+    ON `p.binds`, the post-filter post-`Lower` list, because that is the list
+    `emitInstance`, `derivedEqTypes`, `ordRoute` and `dfunMethodBinds` all search;
+    `p.rawBinds` carries the same binders (same filtering, only the erasure
+    differs) and `emitFullProgram`'s `keptBinds` is a subset, so a refusal computed
+    here covers every consumer. Being computed on the SUPERSET makes it
+    conservative in the safe direction: a collision one of whose binds
+    `isSuppressedMethod` would have dropped is refused here, where the message can
+    name both classes, rather than emitted and left to `lake build` to report as an
+    `unknown identifier` on a mangled `$c` def name.
+
+    Post-`Main.lean`-filter is also what keeps `Ratio` out: its dump has
+    `$cshowsPrec` twice at `Int` and `$cshowList` twice at `[]`, and
+    `isDerivedShowMethod` drops all three `$cshow…` names before `userProg` exists
+    (verified — `Ratio` is byte-identical across this change).
+
+    Disjoint from `unmappedOperatorMethods` in both directions, which is why the
+    two refusals can be ordered freely: that one fires when NO `$c` bind for the
+    method survives, this one when TWO do. `UserClassNeqWithEq.hs` is the first
+    case (`isEqNeqBind` drops both `$c/=` binds, so no key here has two
+    candidates) and is still refused by that check, with its message unchanged. -/
+def ambiguousMethodBinds (p : Program) : List (Name × Name × List (Name × String)) :=
+  let cands : List (Var × String) := p.binds.flatMap fun b =>
+    let one (v : Var) : List (Var × String) :=
+      if !v.name.startsWith "$c" then [] else
+      match firstValArgTy v.ty with
+      | some t => [(v, emitType t)]
+      | none   => []
+    match b with
+    | .nonRec v _ => one v
+    | .rec_ ps    => ps.flatMap (fun (v, _) => one v)
+  let owners : List ((Name × Unique) × Name) := p.instances.flatMap fun i =>
+    (dictMethodRefs p.binds i).map fun r => (r, i.className)
+  let ownerOf (v : Var) : Option Name :=
+    (owners.find? (·.1 == (v.name, v.unique))).map (·.2)
+  -- Source spelling for the message: `emitType`'s key is the pre-resolution
+  -- `(GHCCore.tyConOpaque "R")` needle — the right thing to match binds with and
+  -- the wrong thing to show a user. Same idiom as `ordForwardRefs`.
+  let nameOfHead (h : String) : Name :=
+    match p.typeDecls.find? (fun d => emitType (.tyCon d.name []) == h) with
+    | some d => d.name
+    | none   => h
+  let keys := (cands.map (fun (v, h) => (v.name, h))).eraseDups
+  keys.filterMap fun (nm, h) =>
+    -- Deduplicated by UNIQUE, so a bind listed twice cannot fake a collision.
+    let group := (cands.filterMap fun (v, hh) =>
+        if v.name == nm && hh == h then some v else none).foldl (init := []) fun acc v =>
+      if acc.any (·.unique == v.unique) then acc else acc ++ [v]
+    if group.length < 2 then none else
+    let shown := group.map fun v => ((ownerOf v).getD "?", localId v)
+    match group.map ownerOf with
+    -- Every bind attributed AND all to one class ⇒ the multi-parameter exemption.
+    -- "Not attributed" is NOT "same class": an unrecognized dictionary shape falls
+    -- through to the refusal, which is the safe direction.
+    | (some c) :: rest => if rest.all (· == some c) then none else some (nm, nameOfHead h, shown)
+    | _                => some (nm, nameOfHead h, shown)
+
+/-- The refusal message for one `ambiguousMethodBinds` entry. Names the method,
+    the head type, and every candidate class with the def it would have become. -/
+def ambiguousMethodBindError (bindName : Name) (head : Name)
+    (cands : List (Name × String)) : String :=
+  let mname := if bindName.startsWith "$c" then bindName.drop 2 else bindName
+  let lines := String.intercalate "\n" (cands.map fun (cls, dn) =>
+    s!"    - declared by class `{cls}`, would emit as `{dn}`")
+  s!"the method `{mname}` at instance head `{head}` has {cands.length} `{bindName}` bindings,\n" ++
+  s!"  and they do not all belong to one class:\n" ++
+  lines ++ "\n" ++
+  s!"  GHC does not suffix `$c<method>` names per instance, so those bindings differ\n" ++
+  s!"  only by unique, and every bind lookup in the emitter keys on\n" ++
+  s!"  (method name, first value-argument type) — NOT on the declaring class. It\n" ++
+  s!"  would therefore take whichever binding the dump lists first.\n" ++
+  s!"  MEASURED on the `==` cell of this shape (`examples/haskell/UserClassEqWithEq.hs`):\n" ++
+  s!"  `instance : BEq R` was wired to the USER class's body while the derived\n" ++
+  s!"  structural body was emitted and never referenced, so `x == y` computed the\n" ++
+  s!"  user's operator — `#eval` disagreed with Haskell and `decide` PROVED the\n" ++
+  s!"  Haskell truth false, with rc=0 and empty stderr. That is the one failure mode\n" ++
+  s!"  this transpiler forbids, so the program is refused. The same key decides the\n" ++
+  s!"  `Ord` route too (`ordRoute` reads it to choose between `deriving Ord` and the\n" ++
+  s!"  user's `compare`), where a first-match picks the ORDER the module computes.\n" ++
+  s!"  The instance dictionaries above DO say which binding is whose, but the emitter\n" ++
+  s!"  decides on this key in four independent places (`findClassMethodBind`,\n" ++
+  s!"  `findCompareBind`, `isSuppressedMethod`, `derivedEqTypes`); attributing at some\n" ++
+  s!"  of them and not the rest would move the wrong answer, not remove it.\n" ++
+  s!"  Remedy: rename the class method to a name no other class in scope at `{head}`\n" ++
+  s!"  declares, or drop one of the two instances on `{head}`."
 
 /-- The emitted (unique-suffixed) def name of that binding. -/
 private def findClassMethod (binds : CoreProgram) (method : Name) (headTyStr : String) : Option String :=
@@ -1912,7 +2131,17 @@ deriving DecidableEq, Repr
     the instance's own dictionary, i.e. a class default rather than the user's
     code. Head matching is `findClassMethodBind`'s (`$ccompare`'s first value
     argument is the instance head), duplicated here only to also report the Rec
-    group, which that function's return type cannot carry. -/
+    group, which that function's return type cannot carry.
+
+    AND IT INHERITS THAT FUNCTION'S AMBIGUITY, which is why the multi-match arm is
+    duplicated too: a user class declaring a method named `compare` at a head that
+    also has an `Ord` instance produces two `$ccompare` binds with one first
+    value-argument type (`/tmp/transpile-ProbeCmpCollide.json`: `$ccompare` twice
+    at `T`). `ordRoute` reads this function's answer to pick between `deriving Ord`
+    and the user's body, so a first-match here decides the ORDER a module computes.
+    `none` on a multi-match is defense in depth — `Main.lean`'s
+    `ambiguousMethodBinds` refuses the program first — and again means "no UNIQUE
+    such bind", not "none". -/
 private def findCompareBind (binds : CoreProgram) (headTyStr : String)
     : Option (Var × Expr × Bool) :=
   let matchesHead (v : Var) : Bool :=
@@ -1920,11 +2149,14 @@ private def findCompareBind (binds : CoreProgram) (headTyStr : String)
       (match firstValArgTy v.ty with
        | some t => emitType t == headTyStr
        | none   => false)
-  binds.findSome? fun b => match b with
-    | .nonRec v e => if matchesHead v then some (v, e, false) else none
+  let hits : List (Var × Expr × Bool) := binds.flatMap fun b => match b with
+    | .nonRec v e => if matchesHead v then [(v, e, false)] else []
     | .rec_ pairs =>
-      (pairs.find? (fun (v, _) => matchesHead v)).map fun (v, e) =>
-        (v, e, pairs.any (fun (w, _) => w.name.startsWith "$f"))
+      let inDictRec := pairs.any (fun (w, _) => w.name.startsWith "$f")
+      (pairs.filter (fun (v, _) => matchesHead v)).map fun (v, e) => (v, e, inDictRec)
+  match hits with
+  | [hit] => some hit
+  | _     => none
 
 /-- The emitted type of an application's FIRST `Var` argument — a POST-`Lower`
     approximation of the type a class op is instantiated at, which works only

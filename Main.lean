@@ -240,6 +240,29 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for (m, cs) in ambiguities do
         IO.eprintln s!"error: {Emit.sameMethodAmbiguityError m cs}"
       return 1
+    -- Refuse a `(method name, instance head)` key that more than one `$c<method>`
+    -- bind answers to, unless every one of them belongs to the SAME class. GHC does
+    -- not suffix `$c` names per instance, so the binds differ only by unique, and
+    -- every bind lookup in the emitter keys on the head type alone — it would take
+    -- whichever the dump lists first. MEASURED on
+    -- `examples/haskell/UserClassEqWithEq.hs`: `instance : BEq R` was wired to the
+    -- USER class's `==` body, the derived structural body was emitted and never
+    -- referenced, and `decide` PROVED the Haskell truth false with rc=0 and empty
+    -- stderr. See Emit's "Two `$c<method>` binds at one head" section for why this
+    -- refuses rather than attributing through the dictionaries (four independent
+    -- head-only decision points, and a partial threading would move the wrong
+    -- answer rather than remove it).
+    --
+    -- AFTER `sameMethodAmbiguities`, which is the more specific message for the
+    -- two-USER-classes case, and BEFORE `unmappedOperatorMethods`, which is the
+    -- opposite defect (NO surviving `$c` bind, not two) and cannot co-occur: a
+    -- collision needs both binds present, which is exactly when that check's
+    -- "no map entry" premise is false.
+    let ambigBinds := Emit.ambiguousMethodBinds userProg
+    if !ambigBinds.isEmpty then
+      for (m, h, cs) in ambigBinds do
+        IO.eprintln s!"error: {Emit.ambiguousMethodBindError m h cs}"
+      return 1
     -- Refuse a declared class method that would fall through to `Maps.valueMap`'s
     -- builtin of the same name (an operator method with no surviving `$c` bind).
     -- `emitVar`'s precedence puts `methodMap` first, which settles the case where

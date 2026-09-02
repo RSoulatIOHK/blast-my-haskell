@@ -324,6 +324,25 @@ Development Host.)
     If such a class's instance head **also** has an `Eq` instance, both `$c/=`
     binds carry that head type and both are dropped — that is now a **loud
     refusal** rather than silently emitting the builtin `!(a == b)`.
+  - The `==` cell of that same family is **also refused**, and it is *not* the
+    same mechanism — do not read the `/=` bullet as covering the operator-method
+    family as a whole. A user class declaring `(==)` needs **no `hiding`
+    pragma** at all (declaring the name is legal with `Prelude` in scope; only
+    unqualified *uses* are ambiguous), and here **nothing is dropped**: GHC emits
+    two `$c==` binds with the same name *and* the same first value-argument type,
+    differing only by unique. The bind lookup keys on `(method, head type)` and
+    not on the declaring class, so it took the first — measured, it wired
+    `instance : BEq R` to the **user class's** body, emitted the derived
+    structural body as dead code, and made `x == y` compute the user's operator:
+    `decide` proved a Haskell falsehood with `rc=0` and empty stderr. The same
+    collision reaches `compare` at an `Ord` head. Both are now refused by name,
+    listing the method, the head, and **both** candidate classes
+    (`examples/haskell/UserClassEqWithEq.hs`). This is a refusal rather than
+    correct emission even though the instance *dictionaries* do carry the
+    attribution: the emitter decides on that key in four independent head-only
+    places, and threading uniques through some of them would move the wrong
+    answer rather than remove it. Two instances of **one** class are unaffected —
+    that is the case the head disambiguation exists for.
   - An instance method that resolves to nothing costs the **whole** instance
     (Lean cannot omit a field with no default). That skip is warned rather than
     refused, since every use site is already loud at `lake build`.
