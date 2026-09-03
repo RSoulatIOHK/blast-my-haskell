@@ -214,15 +214,138 @@ Development Host.)
   non-structural equality like Ratio's cross-multiply is preserved); derived
   `Eq`/`Ord` are reconstructed via Lean `deriving DecidableEq, Ord` plus
   `LE`/`LT`/`Min`/`Max`, so user types with `deriving (Eq, Ord)` support
-  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` would be
-  modeled structurally (a known limitation). `Show`/`Read` are skipped
-  (derived `Repr` prints counterexamples).
-- User-defined single-parameter type classes transpile: `class C a where …`
-  → Lean `class`, instances → Lean `instance`, `C a =>` constraints →
-  instance-implicit `[C a]`, and method calls → `C.method` — all reconstructed
-  from Core (no GHC-plugin changes). Not yet: superclasses, multi-parameter
-  classes, default methods, methods whose signature doesn't mention the class
-  parameter, and same-named methods across classes.
+  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` is now
+  **preserved** — the old limitation ("would be modeled structurally") is
+  closed. The route is chosen per instance by whether the `$ccompare` body
+  contains a constructor-tag primop (`dataToTag#`/`tagToEnum#`): GHC emits one
+  only in a *derived* `compare`, and only for a type with ≥3 nullary
+  constructors, so those take Lean's `deriving Ord` while every other shape —
+  hand-written, and derived on a type with ≤2 nullary constructors — is emitted
+  from its own body, with `<`/`<=`/`min`/`max` derived from that `compare`. An
+  instance defining both `compare` and a *disagreeing* `<` keeps the `compare`
+  one: Lean resolves `Decidable (a < b)` only through `ltOfOrd`, so there is
+  nowhere to wire a separate `<`. `Show`/`Read` are skipped (derived `Repr`
+  prints counterexamples).
+- **User-defined type classes** transpile, single- **and** multi-parameter:
+  `class C a where …` / `class Convert a b where …` → Lean `class` with one
+  `(v : Type)` binder per parameter; instances → Lean `instance`, including two
+  *mirrored* instances of the same class (`Convert Celsius Fahrenheit` and
+  `Convert Fahrenheit Celsius`, whose four `$c` binds collide by name in pairs
+  and are attributed by unique); `C a =>` / `C a b =>` constraints →
+  instance-implicit `[C a]` / `[C a b]`; and method calls → `C.method`. A
+  multi-parameter call site works when the extra parameter is pinned by the
+  signature (`aToB : A → B := Convert.conv`) or by the caller
+  (`valB (Convert.conv x)`). The class *shape* (type parameters, superclasses,
+  which methods carry defaults) comes from the decl plugin; the bodies are
+  reconstructed from Core.
+  - **Superclasses.** A *user*-class parent of a single-parameter class emits as
+    Lean `extends`, and class decls are emitted in superclass-dependency order,
+    so an instance of the child may omit the parent's fields entirely. A
+    *builtin* parent (`Ord a => C a`) is injected at every **constraint site**
+    instead of the class header, because `Ord`'s binder recipe contains
+    `DecidableLT`/`DecidableLE` — plain `def`s, which `extends` rejects
+    outright.
+  - **Default methods.** A class default becomes a `:=` default in the Lean
+    class body (translated from GHC's `$dm<method>` bind), and an instance that
+    relies on it omits the field. An instance whose every method is defaulted
+    emits as a fieldless `instance : C T where`.
+  - **Builtin class constraints in signatures** are mapped (this closes the old
+    "not yet supported" entry): `Eq a =>` → `[BEq t]`; `Ord a =>` → the
+    eight-binder set `[Ord t] [LT t] [LE t] [DecidableLT t] [DecidableLE t]
+    [Min t] [Max t] [BEq t]`, whose *order* is load-bearing (`DecidableLT t` is
+    `DecidableRel (LT.lt …)` and only elaborates once `LT t` is bound; `BEq t`
+    is in the set because Haskell's `Ord a` implies `Eq a`); and `Num a =>` →
+    `[Add t] [Sub t] [Mul t] [Neg t]`. Only a constraint whose argument is a
+    bare type *variable* is peeled — `Eq [a]` / `Eq Int` stays loud, and GHC
+    passes no dictionary for a monomorphic signature anyway.
+
+  What the class support does **not** cover — every item loud (warned at the
+  transpiler, or failing at `lake build`, or both) except the one `dataToTag#`
+  residual explicitly flagged as silent:
+  - `Num a =>` reaches only the `+ - * negate` fragment. Any numeric
+    **literal** under a `Num`-polymorphic def is loud, because `emitLiteral`
+    ascribes literals to `Int`: `incr x = x + 1` fails with
+    `failed to synthesize HAdd t Int t`, and an `OfNat` binder would not help —
+    the ascription is the blocker. `abs`/`signum` are loud there too (their
+    images test `a < 0`, which needs the `Ord` binder set a `Num` constraint
+    does not supply). `Fractional`/`Integral`/`Real`/`Show`/`Enum` constraints
+    are deliberately **unmapped** rather than approximated: the constraint arrow
+    stays in the signature, the first value binder gets the dictionary's type,
+    and the generated file does not elaborate — which is the signal that a new
+    entry is wanted.
+  - **Superclass drops, both warned.** A *multi-parameter* class loses **every**
+    parent, and a *single-parameter* class whose parent is multi-parameter loses
+    that parent. The plugin's `supers` channel records parent *names* without
+    saying which parameter each one constrains, so `extends P ?` would be a
+    guess. (`class Convert a b => C a` is rejected by GHC — `b` is not in scope
+    — but `class Convert a a => C a` compiles in GHC 9.2.7, and that is the
+    shape which reaches this.) Builtin-parent injection has its own consequence:
+    the emitted class does **not** record the parent, so a class-body *default*
+    using a parent operator is loud, and the emitted instance no longer
+    re-checks the parent obligation Haskell imposed — weaker than Haskell, not
+    wrong, since GHC already accepted the program.
+  - **`Ord`.** A minimal instance defining only `<=` (or only `<`) is **refused
+    with a warning** and gets no Lean `Ord` at all: its `compare` is GHC's
+    dictionary-dependent class default, which needs `==` and `<=` from the very
+    instance being defined. Nothing structural is substituted, so every
+    `compare`/`<`/`min` at that type is loud. Same for a hand-written `compare`
+    that recurses *and* calls another method of its own `Ord` (self-recursion
+    **alone** is fine and is emitted). Mutually recursive types
+    (`data A = ANil | A B; data B = B A deriving Ord`) would need one Lean
+    `mutual` block, which this emitter does not produce: both instances are
+    dropped with a warning and every use is loud (measured). A `compare` body
+    calling a user top-level bind is a **forward reference** — the `Ord` block is
+    spliced into the data block, ahead of every user bind — loud and warned. A
+    `/=` at the instance's own head inside a spliced `$c==` body is warned (it
+    resolves against the structural `BEq` the data block already carries). One
+    residual is still **silently** structural: a literal `dataToTag#` written in
+    a user `compare` under `MagicHash` reads as derived. That is measured, not
+    hypothetical; closing it needs instance *origin* from the decl plugin, and a
+    shape test on the derived body was rejected as fragile.
+  - **Methods.** An instance that *overrides* a method with a body calling a
+    **sibling** method of the same class is loud (`failed to synthesize C ?m`):
+    GHC's `$c` body needs the instance's own dictionary, and the emitted def
+    precedes the instance, which Lean does not see forward — a `mutual` block
+    does not rescue it either. Superclass method calls inside an override hit
+    the same wall; the fix is self-dispatch rewriting, which needs the
+    dictionary argument `Lower` has already erased. Same-named methods across
+    two classes are rejected by GHC itself within a module. Cross-module user
+    classes remain unsupported: an imported class's method reference arrives
+    module-qualified and misses the method map entirely, loud at `lake build`.
+  - **Multi-parameter.** Functional dependencies and overlapping instances are
+    unsupported, and the loudness is *upstream* of the transpiler: both need a
+    `LANGUAGE` extension GHC will not assume, so a module using either is
+    rejected before any dump exists. A call site where the extra parameter is
+    determined by nothing (`f2 x = Convert.conv x`) is loud in Lean
+    (`typeclass instance problem is stuck`) and rejected by GHC too, which wants
+    `AllowAmbiguousTypes`.
+  - The `$c/=` drop is now scoped to `Eq` instance heads, so a user class
+    declaring `/=` (legal with `import Prelude hiding ((/=))`) keeps its method.
+    If such a class's instance head **also** has an `Eq` instance, both `$c/=`
+    binds carry that head type and both are dropped — that is now a **loud
+    refusal** rather than silently emitting the builtin `!(a == b)`.
+  - The `==` cell of that same family is **also refused**, and it is *not* the
+    same mechanism — do not read the `/=` bullet as covering the operator-method
+    family as a whole. A user class declaring `(==)` needs **no `hiding`
+    pragma** at all (declaring the name is legal with `Prelude` in scope; only
+    unqualified *uses* are ambiguous), and here **nothing is dropped**: GHC emits
+    two `$c==` binds with the same name *and* the same first value-argument type,
+    differing only by unique. The bind lookup keys on `(method, head type)` and
+    not on the declaring class, so it took the first — measured, it wired
+    `instance : BEq R` to the **user class's** body, emitted the derived
+    structural body as dead code, and made `x == y` compute the user's operator:
+    `decide` proved a Haskell falsehood with `rc=0` and empty stderr. The same
+    collision reaches `compare` at an `Ord` head. Both are now refused by name,
+    listing the method, the head, and **both** candidate classes
+    (`examples/haskell/UserClassEqWithEq.hs`). This is a refusal rather than
+    correct emission even though the instance *dictionaries* do carry the
+    attribution: the emitter decides on that key in four independent head-only
+    places, and threading uniques through some of them would move the wrong
+    answer rather than remove it. Two instances of **one** class are unaffected —
+    that is the case the head disambiguation exists for.
+  - An instance method that resolves to nothing costs the **whole** instance
+    (Lean cannot omit a field with no default). That skip is warned rather than
+    refused, since every use site is already loud at `lake build`.
 - **Records** transpile. A `data T = T { f :: … }` declaration emits a
   Lean `inductive` plus one selector `def` per field, and these record shapes
   desugar to Core the transpiler already handles: labeled construction
@@ -294,14 +417,14 @@ Development Host.)
   `inductive Box where | Box : (GHCCore.tyConOpaque "_Unknown") → Box` fails
   loudly at `lake build` (transpilation itself exits 0). Data and `newtype`
   declarations must be monomorphic today.
-- Not yet supported: 5+-tuple construction; the infinite list producers
+- Not yet supported: 5+-tuple construction; and the infinite list producers
   (`iterate`, `repeat`, `cycle`, `enumFrom`, `enumFromThen`) — all loud compile
-  errors by design; and builtin type-class constraints in signatures
-  (`Eq a => …`, `Ord a => …`, `Num a => …`). A polymorphic function carrying
-  such a constraint fails loudly (the dictionary surfaces as an unresolved
-  `GHCCore.tyConOpaque` binder); monomorphic code — e.g. the same function at
-  `Int` — is unaffected. (User-defined classes *are* supported; see the bullet
-  above.)
+  errors by design. Builtin type-class constraints in signatures
+  (`Eq a => …`, `Ord a => …`, `Num a => …`) **are** supported now, with the
+  `Num` gaps noted in the type-class bullet above; an *unmapped* constraint
+  (`Fractional`, `Integral`, `Real`, `Show`, `Enum`) still fails loudly, with
+  the dictionary surfacing as an unresolved `GHCCore.tyConOpaque` binder, and
+  monomorphic code — e.g. the same function at `Int` — is unaffected either way.
   Goals that genuinely require induction over an unbounded list need a
   user-written `induction` proof. Bare `by blaster` (SMT) discharges
   quantifier-free arithmetic plus fixed-shape list/Bool goals — including ones

@@ -13,33 +13,40 @@ private def isGhcRuntimePlumbing (name : Name) : Bool :=
   -- call-stack primitives with no Lean image, so drop it. (Lower already
   -- erases the same dict when it stays a local let.)
   name.startsWith "$dIP"    ||
-  -- Auto-derived Show methods and instance dicts:
+  -- Auto-derived Show methods and instance dicts. The `$c` half is matched by
+  -- EXACT name (`Emit.isDerivedShowMethod` — `Show`'s three methods) rather than
+  -- by the prefix `$cshow`, which also ate a user class's `showIt`/`showAll`; see
+  -- that docstring for the residual. The other two stay prefixes and are not
+  -- method binds at all: `$fShow…` is a dict-builder (`$f` + the class name
+  -- `Show` + the type), `$sshow…` a specialization of `show` itself.
   name.startsWith "$fShow"  ||
-  name.startsWith "$cshow"  ||
+  Emit.isDerivedShowMethod name ||
   name.startsWith "$sshow"
-
-/-- Default-method bindings GHC auto-derives. `$c/=` is `not ∘ (==)` — we
-    don't need it (BEq supplies bne automatically) and emitting it creates a
-    circular dependency on the BEq instance we're about to define. -/
-private def isAutoDerivedDefault (name : Name) : Bool :=
-  name == "$c/="
 
 /-- NOTE: `$f<Class><Type>` instance dict-builders are NOT dropped here — they
     reach `emitFullProgram`, which reads their bodies to reconstruct user-class
     declarations and then suppresses them from emission (they have no Lean
-    image). `$fShow*` is still dropped above via `isGhcRuntimePlumbing`. -/
-private def shouldDrop (n : Name) : Bool :=
-  isGhcRuntimePlumbing n || isAutoDerivedDefault n
+    image). `$fShow*` is still dropped above via `isGhcRuntimePlumbing`.
+
+    The second rule is `Emit.isEqNeqBind`: GHC's auto-derived `/=` for an `Eq`
+    instance (Lean's `BEq`/`DecidableEq` supplies `bne`, and the body would not
+    elaborate anyway — see that docstring). It is deliberately keyed on the `Eq`
+    instance HEADS, not on the name `$c/=` alone: the name-only test also ate the
+    `/=` of a USER class declaring that operator, which then lost the whole
+    instance. Bind-level (a `Var`, not a `Name`) because the head type comes from
+    the bind's own type. -/
+private def shouldDrop (insts : List Instance) (v : Var) : Bool :=
+  isGhcRuntimePlumbing v.name || Emit.isEqNeqBind insts v
 
 /-- Filter bindings, including splitting `Rec` groups: if a Rec lumps
     together a dict literal and a method, drop the dict half and keep the
     rest. Returns `none` when the whole bind should be dropped. -/
-private def keepBinding (b : Bind) : Option Bind :=
+private def keepBinding (insts : List Instance) (b : Bind) : Option Bind :=
   match b with
   | .nonRec v _ =>
-    if shouldDrop v.name then none else some b
+    if shouldDrop insts v then none else some b
   | .rec_ pairs =>
-    let kept := pairs.filter (fun (v, _) => !shouldDrop v.name)
+    let kept := pairs.filter (fun (v, _) => !shouldDrop insts v)
     if kept.isEmpty then none else some (.rec_ kept)
 
 /-- Top-level binder names from the (filtered) program. -/
@@ -210,9 +217,148 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- guard: a refused module aborts the whole pipeline (`transpile.sh` runs under
     -- `set -e`), so no dependent can read the file this run either way.
     writeNewtypeExports prog.typeDecls
-    let userBinds := prog.binds.filterMap keepBinding
+    let userBinds := prog.binds.filterMap (keepBinding prog.instances)
     let lowered   := Lower.lowerProgram userBinds
-    let userProg  : Program := { prog with binds := lowered }
+    -- `rawBinds` is the SAME bind list pre-`Lower`, set explicitly rather than
+    -- left to the field's default so the invariant is "same filtering, only the
+    -- erasure differs". `Emit` needs it because `Lower` erases the type
+    -- application (`== @T $fEqT a b` ⇒ `== a b`) that is the only exact record of
+    -- the type a class op is instantiated at — see `Program.rawBinds` and
+    -- `Emit.classOpHeadTy`. Emission still runs off `binds`.
+    let userProg  : Program := { prog with binds := lowered, rawBinds := userBinds }
+    -- Refuse a method name declared by two classes: Core references a class
+    -- method by its BARE name, so every call site would be qualified with
+    -- whichever class the instance dump listed first — typechecks, dispatches to
+    -- the wrong class. See Emit's "Same-named methods across classes" section for
+    -- what is reachable (not the single-module shape: GHC rejects that itself).
+    --
+    -- Computed on `userProg` — post-filter, post-`Lower` — so the class set
+    -- checked here is exactly the one `emitFullProgram` merges below. Still
+    -- before any emission: nothing is written until the very end.
+    let ambiguities := Emit.sameMethodAmbiguities userProg
+    if !ambiguities.isEmpty then
+      for (m, cs) in ambiguities do
+        IO.eprintln s!"error: {Emit.sameMethodAmbiguityError m cs}"
+      return 1
+    -- Refuse a `(method name, instance head)` key that more than one `$c<method>`
+    -- bind answers to, unless every one of them belongs to the SAME class. GHC does
+    -- not suffix `$c` names per instance, so the binds differ only by unique, and
+    -- every bind lookup in the emitter keys on the head type alone — it would take
+    -- whichever the dump lists first. MEASURED on
+    -- `examples/haskell/UserClassEqWithEq.hs`: `instance : BEq R` was wired to the
+    -- USER class's `==` body, the derived structural body was emitted and never
+    -- referenced, and `decide` PROVED the Haskell truth false with rc=0 and empty
+    -- stderr. See Emit's "Two `$c<method>` binds at one head" section for why this
+    -- refuses rather than attributing through the dictionaries (four independent
+    -- head-only decision points, and a partial threading would move the wrong
+    -- answer rather than remove it).
+    --
+    -- AFTER `sameMethodAmbiguities`, which is the more specific message for the
+    -- two-USER-classes case, and BEFORE `unmappedOperatorMethods`, which is the
+    -- opposite defect (NO surviving `$c` bind, not two) and cannot co-occur: a
+    -- collision needs both binds present, which is exactly when that check's
+    -- "no map entry" premise is false.
+    let ambigBinds := Emit.ambiguousMethodBinds userProg
+    if !ambigBinds.isEmpty then
+      for (m, h, cs) in ambigBinds do
+        IO.eprintln s!"error: {Emit.ambiguousMethodBindError m h cs}"
+      return 1
+    -- Refuse a declared class method that would fall through to `Maps.valueMap`'s
+    -- builtin of the same name (an operator method with no surviving `$c` bind).
+    -- `emitVar`'s precedence puts `methodMap` first, which settles the case where
+    -- the map HAS the entry; this settles the case where it does not. AFTER the
+    -- ambiguity check: under an ambiguity the map's entries are unreliable, so
+    -- reporting "no entry" first would name the wrong cause.
+    let unmapped := Emit.unmappedOperatorMethods userProg
+    if !unmapped.isEmpty then
+      for (c, m) in unmapped do
+        IO.eprintln s!"error: {Emit.unmappedOperatorMethodError c m}"
+      return 1
+    -- Name every instance `emitInstanceUser` is about to SKIP, and the method
+    -- that costs it. Not a refusal (the skip is already loud at `lake build`, as
+    -- `failed to synthesize`, and refusing would newly reject modules whose
+    -- unusable instance is unused) — but no longer silent at the transpiler,
+    -- which was the last silent half of that path. Same decision procedure the
+    -- emission uses (`Emit.classifyInstanceMethod`), so the two cannot disagree.
+    for (cls, head, m) in Emit.unresolvedInstanceMethods userProg do
+      IO.eprintln s!"warning: {Emit.unresolvedInstanceMethodWarning cls head m}"
+    -- Name every SUPERCLASS the emitted `class` block drops (M3 Task 5): one that
+    -- is neither a locally-declared class (→ `extends`) nor a builtin with a
+    -- `Maps.classConMap` recipe (→ constraint-site binders). Warning, not refusal,
+    -- for the same reason as the instance skip above: a dropped parent whose
+    -- methods are never called through the child costs nothing, and one whose
+    -- methods ARE called is already loud at `lake build`. Without this the drop
+    -- would be entirely silent at the transpiler — which is what the plugin's
+    -- `ppSuperPred` comment had assumed Task 5 would prevent by other means.
+    for (cls, super) in Emit.droppedSupers userProg do
+      IO.eprintln s!"warning: {Emit.unmappedSuperWarning cls super}"
+    -- The other half of the same drop (M3 Task 7): on a MULTI-PARAMETER class
+    -- every superclass is dropped regardless of its Lean image, because the dump
+    -- does not say which parameter the parent constrains. The loop above cannot
+    -- see those — it asks only whether a parent has an image — so a
+    -- locally-declared parent of a two-parameter class used to vanish with
+    -- `rc=0` and empty stderr (measured on `MultiParam.hs`). Warning, not
+    -- refusal, on the same argument: the fixture is correct as emitted, and a
+    -- module that does need the parent through the child's constraint fails at
+    -- `lake build`.
+    for (cls, super, n) in Emit.droppedMultiParamSupers userProg do
+      IO.eprintln s!"warning: {Emit.multiParamSuperWarning cls super n}"
+    -- The SAME drop with the arities the other way round: a single-parameter class
+    -- whose PARENT is multi-parameter (`class Convert a a => C a`, which GHC 9.2.7
+    -- accepts — MEASURED). Neither loop above sees it: the child takes one
+    -- parameter and the parent is a local class with a Lean image, so until this
+    -- loop existed the transpiler emitted `extends Convert a` — a two-parameter
+    -- class applied to one argument — with `rc=0` and empty stderr, leaving Lean
+    -- to report it as `type expected` against the generated file. Warning, not
+    -- refusal, on the same argument as the two above.
+    for (cls, parent, n) in Emit.droppedMultiParamParents userProg do
+      IO.eprintln s!"warning: {Emit.multiParamParentWarning cls parent n}"
+    -- Name every `Ord` instance that gets no Lean image (M3 Task 6): a minimal
+    -- `<=`-only definition, whose `compare` is GHC's dictionary-dependent class
+    -- default. Warning, not refusal, for the same reason as the two above — and
+    -- the alternative it replaced was worse than either: until Task 6 such a type
+    -- silently got Lean's STRUCTURAL order via `deriving Ord`.
+    for head in Emit.unsupportedOrdInstances userProg do
+      IO.eprintln s!"warning: {Emit.unsupportedOrdWarning head}"
+    -- Name every top-level function a hand-written `compare` body calls. The
+    -- `Ord` blocks are spliced into the data block (so a type deriving `Ord` from
+    -- such a head, and a class-body default ordering one, can see the instance),
+    -- which puts them ahead of every user bind — so the call is a forward
+    -- reference and `lake build` fails on it. Warning rather than refusal, for the
+    -- same reason as the three above: the emitted reference carries the real name,
+    -- so the build failure already names the cause; this says it at the transpiler
+    -- too, where the layout that causes it is decided.
+    for (head, fn) in Emit.ordForwardRefs userProg do
+      IO.eprintln s!"warning: {Emit.ordForwardRefWarning head fn}"
+    -- Name every `==`/`/=` a SPLICED hand-written `==` body still applies at its
+    -- own head. A self-recursive `==` is redirected to the def being emitted
+    -- (`retargetSelfEq`) precisely because it cannot be left alone — the
+    -- `instance : BEq` follows the def, so the only `BEq` in scope inside it is
+    -- core's structural `instBEqOfDecidableEq`. What the redirect does NOT cover
+    -- (`/=`, and any `==` whose head type the dump does not carry) would compute
+    -- structural equality with no diagnostic at all, which is the one failure mode
+    -- this project forbids; so it is said out loud here. Warning rather than
+    -- refusal, like the four above: the shapes are absent from every corpus module
+    -- and refusing would newly reject a module whose residual is unreachable.
+    for (head, op) in Emit.hoistedEqSelfResiduals userProg do
+      IO.eprintln s!"warning: {Emit.hoistedEqSelfResidualWarning head op}"
+    -- Tripwire for the shim's role heuristic. A `$dm<method>` Var is a
+    -- default-method BODY; the shim used to classify it as a dictionary (any
+    -- `$d`-prefixed name), and `Lower` erases dict-role Vars in ARGUMENT
+    -- position and at lambda/`let` binders — so a regression here would silently
+    -- delete a default-method occurrence rather than fail. `$dm` is unambiguous
+    -- (a dict is `$d` + a CLASS name, always upper-case), which is why the shim
+    -- exempts it in both places it writes that rule (`binderRole` and
+    -- `convertExternalName`); this says so out loud if a dump produced by some
+    -- other/older shim arrives. The scan covers references, not just binders:
+    -- the two shim copies can disagree, and one of them did.
+    --
+    -- Runs on `prog.binds` — the RAW dump, not `userProg` — and must: `Lower` has
+    -- already deleted a dict-role occurrence in argument position, so a scan of
+    -- the lowered program would find nothing to report about the very case that
+    -- matters.
+    for n in Emit.dmVarsMislabelledAsDicts prog.binds do
+      IO.eprintln s!"warning: {Emit.dmDictRoleWarning n}"
     let body      := Emit.emitFullProgram ext.datas userProg extNts
     let crib      := emitNamesCrib ext.datas extNts userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that

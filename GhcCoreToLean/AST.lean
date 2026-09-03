@@ -104,12 +104,50 @@ deriving Repr, Inhabited
 
 structure ClassMethod where
   name : Name
-  ty   : GHCType   -- the *generalized* method type, e.g. `a → Int`
+  ty   : GHCType   -- the method type with the class parameter(s) free, e.g. `a → Int`
+  /-- Does the class declare a default body for this method? Only the
+      decl-plugin channel can know this (`ClassOpItem`'s `DefMethInfo`); the
+      Core-reconstruction fallback always says `false` — a `$dm<method>` bind is
+      indistinguishable from an ordinary top-level bind there. Consumed by M3
+      Task 4. -/
+  hasDefault : Bool := false
 deriving Repr, Inhabited
 
+/-- A user type class's *shape*.
+
+    v2 (M3 Task 1) widened this from a single `tyVar` to a `tyVars` list and
+    added `supers`, because the shape now has a second, authoritative source: the
+    decl-plugin's `classDecls` channel (`GhcDeclDump.ppClass`), which reads the
+    real `Class` out of GHC's `TcGblEnv`. The older source —
+    `Emit.reconstructClasses`, which infers a class from its instances' `$c`
+    method binds — cannot see superclasses or defaults at all (class-op and `$p`
+    superclass-selector Ids are not top-level binds) and always produced a
+    single type parameter. It is kept as the fallback for a run with no plugin
+    sidecar; see `Emit.mergeClassDecls` for the precedence rule. -/
 structure ClassDecl where
   name    : Name
-  tyVar   : Name           -- the class's type parameter, e.g. "a"
+  /-- The class's type parameters, e.g. `["a"]`. MULTI-parameter classes are
+      supported end to end since M3 Task 7 — `examples/haskell/MultiParam.hs` pins
+      `class Convert a b`, two instances of it, and a `Convert a b =>` constraint.
+      What such a class does not get is its SUPERCLASSES (see `supers`). The
+      Core-reconstruction fallback always invents exactly one parameter, so only
+      the plugin channel can produce a longer list. -/
+  tyVars  : List Name
+  /-- Superclass *names*, e.g. `["Sized"]` for `class Sized a => Container a`.
+      Consumed by emission since M3 Task 5: a parent this module declares becomes
+      `extends Sized a`, a builtin with a `Maps.classConMap` recipe becomes
+      instance-implicit binders at every constraint site
+      (`Emit.classSuperBinders`), and anything else is dropped with a warning
+      (`Emit.unmappedSupers`).
+
+      NAMES only is the channel's limit (`GhcDeclDump.ppSuperPred` discards each
+      superclass's ARGUMENTS), and that is what the two arity-related drops are
+      about: a superclass of a multi-parameter class cannot be applied to one of
+      several variables (`Emit.multiParamSupers`), and a multi-parameter parent of
+      a single-parameter class cannot be applied to the child's one variable
+      (`Emit.multiParamParentSupers`). Both are dropped and WARNED rather than
+      guessed; a guess would be silently wrong. -/
+  supers  : List Name
   methods : List ClassMethod
 deriving Repr, Inhabited
 
@@ -117,6 +155,30 @@ structure Program where
   binds     : CoreProgram
   typeDecls : List DataDecl
   instances : List Instance
+  /-- Class shapes from the decl-plugin sidecar. Defaulted to `[]` so a Program
+      built from a pre-`classDecls` JSON (or a hand-written test literal) still
+      elaborates; `Emit` then falls back to Core reconstruction. -/
+  classDecls : List ClassDecl := []
+  /-- THE SAME binds as `binds`, but PRE-`Lower`: same filtering, only the
+      erasure has not happened. `Main.lean` sets it to the list it hands to
+      `Lower.lowerProgram`, so the two differ in exactly one way.
+
+      Why the emitter needs both. `Lower` erases a class-method application's
+      TYPE argument (`== @T $fEqT a b` ⇒ `== a b`), and that argument is the only
+      exact record of the type a class op is instantiated at: post-`Lower` the
+      dispatch type has to be guessed from a value argument's type, which fails
+      outright when no argument is a bare `Var` (`G a b == G c d`). That guess is
+      what `Emit.eqHoistHeads` used to decide which hand-written `BEq` must
+      precede a spliced `Ord` block, and a miss there is SILENT-WRONG: the `==`
+      inside the block falls back to `instBEqOfDecidableEq`, i.e. structural
+      equality. `Emit.classOpHeadTy` reads the type application out of THIS list
+      instead. Emission still uses `binds` — a lowered body is what has a Lean
+      image — so this field is read only by the analyses that need the type.
+
+      Defaulted to `binds` so a hand-written test literal (or any caller that has
+      only the lowered program) keeps the pre-existing post-`Lower` behaviour
+      rather than silently analysing an empty list. -/
+  rawBinds  : CoreProgram := binds
 deriving Inhabited
 
 end GHCCore

@@ -229,8 +229,38 @@ def parseInstance (j : Lean.Json) : Except String Instance := do
   let dfunUnique ← j.getObjValAs? Nat    "dfunUnique"
   .ok { className, headTypes, dfunName, dfunUnique }
 
+/-- Parse one class method: `{name, type, hasDefault}`. `hasDefault` is
+    tolerated as absent (⇒ `false`) so a decls.json written by a pre-M3 plugin
+    still parses; a present-but-non-boolean value is a hard error, never a
+    silent `false`. -/
+def parseClassMethod (j : Lean.Json) : Except String ClassMethod := do
+  let name ← j.getObjValAs? String "name"
+  let ty   ← parseGHCType (← getField j "type")
+  let hasDefault ← match j.getObjVal? "hasDefault" with
+    | .ok v    => v.getBool?
+    | .error _ => .ok false
+  .ok { name, ty, hasDefault }
+
+/-- Parse one class shape from the decl-plugin's `classDecls` channel:
+    `{name, tyVars, supers, methods}`. All four keys are required — this channel
+    is written by `GhcDeclDump.ppClass`, which always emits them, so a missing key
+    means a plugin/transpiler version skew and must fail loud rather than
+    default to "no type parameters" or "no superclasses". -/
+def parseClassDecl (j : Lean.Json) : Except String ClassDecl := do
+  let name     ← j.getObjValAs? String "name"
+  let tyVarsA  ← (← getField j "tyVars").getArr?
+  let tyVars   ← tyVarsA.toList.mapM (·.getStr?)
+  let supersA  ← (← getField j "supers").getArr?
+  let supers   ← supersA.toList.mapM (·.getStr?)
+  let methodsA ← (← getField j "methods").getArr?
+  let methods  ← methodsA.toList.mapM parseClassMethod
+  .ok { name, tyVars, supers, methods }
+
 /-- Parse either the legacy `{ binds: ... }` or the extended
-    `{ binds, typeDecls, instances }` shape. -/
+    `{ binds, typeDecls, instances, classDecls }` shape. Each decl channel is
+    optional in the same two ways — key absent, or key present as `null` (which
+    is what the shim's `mergeDecls` writes for a channel the plugin did not
+    produce) — and both mean the empty list. -/
 def parseProgram (j : Lean.Json) : Except String Program := do
   let binds      ← parseCoreProgram j
   let typeDecls  ← match j.getObjVal? "typeDecls" with
@@ -247,7 +277,14 @@ def parseProgram (j : Lean.Json) : Except String Program := do
         let arr ← ins.getArr?
         arr.toList.mapM parseInstance
     | .error _ => .ok []
-  .ok { binds, typeDecls, instances }
+  let classDecls ← match j.getObjVal? "classDecls" with
+    | .ok cds => match cds with
+      | .null => .ok []
+      | _ => do
+        let arr ← cds.getArr?
+        arr.toList.mapM parseClassDecl
+    | .error _ => .ok []
+  .ok { binds, typeDecls, instances, classDecls }
 
 def parseProgramFromString (s : String) : Except String Program := do
   let j ← Lean.Json.parse s

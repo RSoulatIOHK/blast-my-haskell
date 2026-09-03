@@ -295,6 +295,56 @@ def dataConMap : String → Option String
   | "GT" | "GHC.Types.GT" => some "Ordering.gt"
   | _         => none
 
+/-- Haskell BUILTIN class → the Lean instance-implicit binder templates that a
+    signature constraint on that class becomes (`Eq a => …` ⇒ `[BEq t]`). The
+    literal `{t}` in each template is substituted with the constrained type
+    variable's emitted name by `Emit.stripClassConstraints`.
+
+    Only BUILTIN classes belong here. A USER class `C` keeps emitting `[C t]` —
+    its Lean image is the `class C` the transpiler emits — and is matched first,
+    so this map cannot hijack it.
+
+    An unmapped builtin (`Fractional`, `Integral`, `Real`, `Show`, `Enum`, …) is
+    deliberately ABSENT rather than approximated: its constraint arrow then stays
+    in the signature, the def's first value binder is typed as the (already
+    value-erased) dictionary, and the generated file fails to elaborate. That is
+    LOUD — the project's fail mode of choice — and it is the signal that a new
+    entry is wanted here.
+
+    ORDER INSIDE EACH LIST IS LOAD-BEARING, not cosmetic. `DecidableLT t` is
+    `DecidableRel (LT.lt : t → t → Prop)` (`Init/Prelude.lean:1250`), so it only
+    elaborates once `LT t` is already bound; likewise `DecidableLE`/`LE`.
+    `Tests/Unit.lean` pins the whole sequence, not just membership, so a reorder
+    cannot pass silently.
+
+    Why `Ord` needs EIGHT binders rather than `[Ord t]`: the transpiler's images
+    of the Haskell `Ord` methods are `decide (a < b)` / `decide (a ≤ b)` (Lean's
+    `<`/`≤` are `Prop`-valued), `Min.min` / `Max.max`, and `compare` — and Lean
+    core deliberately leaves `ltOfOrd`/`leOfOrd`/`minOfLe`/`maxOfLe` as plain
+    defs, NOT instances. `[BEq t]` is in the set because Haskell's `Ord a`
+    implies `Eq a` (`$p1Ord`), so an `Ord`-constrained body may legitimately use
+    `==`. Measured: `[Ord t]` alone fails on `LT`/`LE`/`Min`; adding
+    `[LT t] [LE t] [Min t] [Max t] [BEq t]` still fails on `Decidable (a < b)`.
+    See the `M3 Task 3` block in `Tests/Unit.lean` for the probe transcript and
+    for why the coherence-preserving alternative (`[Ord t]` only, deriving
+    LT/LE/Min/Max inside the body) was rejected.
+
+    Why `Num` is only FOUR: numeric literals emit Int-ascribed (`emitLiteral`
+    gives `(1 : Int)`), so `OfNat t n` binders would be dead weight — a literal
+    in a `Num a`-polymorphic body is a hard type error (loud) either way. `abs`
+    and `signum` likewise stay loud there: their images test `a < 0`, which needs
+    the `Ord` binder set that a `Num a` constraint does not supply. -/
+def classConMap : String → Option (List String)
+  -- Bare names are what the shim delivers for constraint heads (observed in
+  -- /tmp/transpile-BuiltinConstraints.json: `{"name": "Eq", "tag": "TyCon"}`);
+  -- the qualified forms are a forward hedge, as in `dataConMap`.
+  | "Eq"  | "GHC.Classes.Eq"  => some ["[BEq {t}]"]
+  | "Ord" | "GHC.Classes.Ord" =>
+    some ["[Ord {t}]", "[LT {t}]", "[LE {t}]", "[DecidableLT {t}]", "[DecidableLE {t}]",
+          "[Min {t}]", "[Max {t}]", "[BEq {t}]"]
+  | "Num" | "GHC.Num.Num" => some ["[Add {t}]", "[Sub {t}]", "[Mul {t}]", "[Neg {t}]"]
+  | _ => none
+
 /-- Transparent unwrapping data constructors: I#, W#, C# (and module-qualified variants).
     Boxing GHC's unboxed primitives. Treated as identity by Lower. -/
 def isUnwrappingDataCon : String → Bool

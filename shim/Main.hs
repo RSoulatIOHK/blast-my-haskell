@@ -50,15 +50,19 @@ emit cborPath mDeclsPath = do
   let merged = mergeDecls coreVal decls
   BSLC.putStrLn (AP.encodePretty merged)
 
--- | Splice `typeDecls` and `instances` from the decl-plugin's JSON into the
--- core-side JSON. If decls is Null (no plugin output), pass core through.
+-- | Splice `typeDecls`, `instances` and `classDecls` from the decl-plugin's JSON
+-- into the core-side JSON. If decls is Null (no plugin output), pass core
+-- through. A key the plugin did not write becomes `A.Null`, which the Lean
+-- parser reads as the empty list — so an OLD decls.json (pre-`classDecls`
+-- plugin) still parses.
 mergeDecls :: A.Value -> A.Value -> A.Value
 mergeDecls core decls =
   case (core, decls) of
     (A.Object cobj, A.Object dobj) ->
       let pick k = maybe A.Null id (AKM.lookup k dobj)
-          coreWith = AKM.insert "typeDecls" (pick "typeDecls")
-                   $ AKM.insert "instances" (pick "instances")
+          coreWith = AKM.insert "typeDecls"  (pick "typeDecls")
+                   $ AKM.insert "instances"  (pick "instances")
+                   $ AKM.insert "classDecls" (pick "classDecls")
                    $ cobj
       in A.Object coreWith
     _ -> core
@@ -154,7 +158,15 @@ binderRole b@(Binder {}) =
     DFunId -> "dict"
     _      ->
       let n = T.unpack (binderName b)
-      in if take 2 n `elem` ["$d", "$f"] then "dict" else "id"
+      -- `$dm<method>` is a class DEFAULT-METHOD body, not a dictionary. The
+      -- consumer erases dict-role Vars in argument position (Lower.lean), so
+      -- classifying `$dmgreet` as a dict would silently delete the default's
+      -- body wherever it is passed as an argument. The exemption is exact, not a
+      -- guess: a dictionary's name is `$d` + a CLASS name, which is always
+      -- upper-case (`$dGreet`, `$dIP`), while `$dm` is followed by a METHOD
+      -- name, always lower-case or symbolic — the two prefixes cannot collide.
+      in if take 3 n == "$dm" then "id"
+         else if take 2 n `elem` ["$d", "$f"] then "dict" else "id"
 
 ------------------------------------------------------------------------
 -- Expr
@@ -252,7 +264,22 @@ convertExternalName modName (ExternalName mn nm (Unique _ u)) =
              else other <> "." <> nm
       -- Heuristic for dict instances exported from GHC libraries: names
       -- start with `$f` (instance methods) or `$d` (instance dicts).
-      role = if T.take 2 nm `elem` ["$d", "$f"] then "dict" else "id"
+      --
+      -- `$dm` is exempted here for the same reason as in `binderRole` (see the
+      -- argument there), and the exemption is needed in BOTH places because this
+      -- is an INDEPENDENT copy of the rule — and the one that classifies a
+      -- *reference*. GHC reaches a top-level name through `EVarGlobal` even
+      -- inside the defining module, so every `$dm<method>` USE lands in this
+      -- function while only its binder goes through `binderRole`. With the
+      -- exemption in one place only, a bind said `id` and its own reference said
+      -- `dict` (observed in the DefaultMethods dump: binder at `/binds/4`,
+      -- reference at `/binds/26/pairs/1/rhs/fun/fun`) — and a dict-role
+      -- reference in argument position is ERASED by the consumer's `Lower`.
+      --
+      -- Tested on `nm`, the BARE name, not on `name`: a cross-module reference
+      -- is prefixed (`GHC.Show.$dmshowList`), which a `take 3` would miss.
+      role = if T.take 3 nm == "$dm" then "id"
+             else if T.take 2 nm `elem` ["$d", "$f"] then "dict" else "id"
   in object [ "name"   .= name
             , "unique" .= u
             , "type"   .= unknownType
