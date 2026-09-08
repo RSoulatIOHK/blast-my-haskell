@@ -11,6 +11,8 @@ import qualified Data.Aeson.KeyMap           as AKM
 import qualified Data.Map.Strict             as Map
 import           Data.Map.Strict             (Map)
 import qualified Data.Text                   as T
+import           Data.Text.Encoding          (decodeUtf8With)
+import           Data.Text.Encoding.Error    (lenientDecode)
 import           System.Environment          (getArgs)
 import           System.Exit                 (die)
 import qualified Codec.Serialise             as Ser
@@ -321,7 +323,26 @@ unknownType = object [ "tag"  .= ("TyCon" :: T.Text)
 convertLit :: Lit -> Value
 convertLit = \case
   MachChar c    -> object [ "tag" .= ("LitChar"   :: T.Text), "value" .= T.singleton c ]
-  MachStr _     -> object [ "tag" .= ("LitString" :: T.Text), "value" .= ("<bs>" :: T.Text) ]
+  -- `Ast.MachStr` carries the literal's real bytes (strict `BS.ByteString`,
+  -- lossless from `GhcDump.Convert`); this arm used to throw them away and emit
+  -- the placeholder `"<bs>"`, so EVERY Haskell string literal reached Lean as
+  -- the same four characters.
+  --
+  -- Decoded with a *replacement* decoder, not `decodeUtf8`, because GHC's
+  -- payload is MODIFIED UTF-8: measured, `"a\0b"` arrives as `0xC0 0x80` for the
+  -- NUL and `"x\55296y"` as a 3-byte CESU sequence for the surrogate, neither of
+  -- which standard UTF-8 accepts. `decodeUtf8` throws on those, which inside
+  -- `transpile.sh` is a crashed transpile of an otherwise fine module; lenient
+  -- decoding yields U+FFFD instead.
+  --
+  -- That replacement is LOSSY (`"a\0b"`, 3 chars, decodes to 4 code points), and
+  -- it is inert only for as long as no literal reaches emission — see the "M4
+  -- Task 1" block in `GhcCoreToLean/Tests/Unit.lean`. Whoever maps
+  -- `unpackCString#`/`unpackCStringUtf8#` on the Lean side owns making the lossy
+  -- case fail loud; the test is `encodeUtf8 (decodeUtf8With lenientDecode bs)
+  -- /= bs`.
+  MachStr bs    -> object [ "tag" .= ("LitString" :: T.Text)
+                          , "value" .= decodeUtf8With lenientDecode bs ]
   MachNullAddr  -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= (0 :: Integer) ]
   MachInt n     -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]
   MachInt64 n   -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]

@@ -6458,4 +6458,241 @@ def ambConvDfunB : Bind :=
          "MyEq" (emitType ambR) (ambMyEqClass.methods.head!)
          == .field "_dollar_c_eq__eq__2948"
 
+/-! ## M4 Task 1 — the shim's `MachStr` arm emits the literal's real bytes
+
+    THE FIX. `shim/Main.hs`'s `convertLit` had exactly one lossy arm; every
+    Haskell string literal in the program reached Lean as the same four
+    characters:
+    ```haskell
+      MachStr _     -> object [ "tag" .= ("LitString" :: T.Text), "value" .= ("<bs>" :: T.Text) ]
+    ```
+    It is now `MachStr bs -> … "value" .= decodeUtf8With lenientDecode bs`.
+    Upstream was never the problem: `GhcDump.Ast` declares `MachStr
+    BS.ByteString` (strict, verified in the 0.2.1.0 tarball at `Ast.hs:120`) and
+    `Convert.hs:266` passes the bytes through, so the payload always arrived and
+    the shim threw it away.
+
+    WHY THE LENIENT DECODER and not `decodeUtf8`: GHC's payload is *modified*
+    UTF-8, which standard UTF-8 rejects, so the partial decoder THROWS — inside a
+    shim invoked from `transpile.sh` that is a crashed transpile of an otherwise
+    fine module. Measured, not defensive, on the SHIM'S OWN toolchain (GHC 9.2.7,
+    `text-1.2.5.0`) over the bytes lifted out of a real `pass-0000.cbor`
+    (`"a\0b"` sits at offset 94 under a CBOR `bstr(4)` header as `61 c0 80 62`;
+    `"x\55296y"` at 277 under `bstr(5)` as `78 ed a0 80 79`):
+    ```
+      bytes [97,192,128,98]      strict decodeUtf8 = THROWS: Cannot decode byte '\xc0'
+                                 lenient           = "a\65533\65533b"  (len 4)
+                                 encodeUtf8 . decode == bs  =  False
+      bytes [120,237,160,128,121] strict decodeUtf8 = THROWS: Cannot decode byte '\xed'
+                                 lenient           = "x\65533\65533\65533y" (len 5)
+                                 encodeUtf8 . decode == bs  =  False
+      bytes [99,97,102,195,169]  strict decodeUtf8 = 4       (`"caf\233"`, fine)
+                                 encodeUtf8 . decode == bs  =  True
+    ```
+    So the crash is real, and the round-trip predicate prescribed to Task 2 below
+    is confirmed to fire on exactly the lossy inputs and not on valid UTF-8.
+    **No cabal change** — `text` and
+    `bytestring` were already `shim.cabal` deps; the two added imports are
+    `Data.Text.Encoding (decodeUtf8With)` and `Data.Text.Encoding.Error
+    (lenientDecode)`. A strict-`Data.ByteString` import turned out NOT to be
+    needed (the argument type is fixed by `Ast.MachStr`), and adding one would be
+    an unused import under the package's `-Wall`.
+
+    RESTAGE PROOF (a stale shim silently producing old JSON is this project's
+    classic false-green; `transpile.sh:127` resolves the binary by
+    `find shim/dist-newstyle -name ghc-core-shim | head -1`):
+    * that `find` returns exactly ONE candidate — no second binary to pick;
+    * `shim/Main.hs` mtime `Sep 8 15:16:42` < binary mtime `Sep 8 15:16:50`
+      (re-checked after the last comment-only edit; the rebuilt binary reproduces
+      the measured JSON byte-for-byte on the saved `Fib`/`Ratio` dumps);
+    * `strings <binary> | grep -c '^<bs>$'` is **1 before / 0 after** — the
+      positive control matters: the placeholder is verifiably in the old binary
+      and verifiably gone from the new one;
+    * and the JSON below settles it independently.
+
+    OBSERVATION FIXTURE `examples/haskell/StringBasics.hs` — two defs, the second
+    HAZARDOUS (`"say \"hi\"\n"` = a quote, an escape, a newline). No `@lean`
+    properties: this task's deliverable is the observation, and the emitted Lean
+    does NOT compile until Task 2 maps `unpackCString#` (quoted below).
+
+    BOTH LITERALS, verbatim from `/tmp/transpile-StringBasics.json` (aeson-pretty
+    output; the shim ran over the same `StringBasics.pass-0000.cbor` both times):
+    ```json
+      // PRE-fix — both defs, indistinguishable:
+                    "lit": { "tag": "LitString", "value": "<bs>" },
+      // POST-fix, `greeting`:
+                    "lit": {
+                        "tag": "LitString",
+                        "value": "hi"
+                    },
+      // POST-fix, `quoted`:
+                    "lit": {
+                        "tag": "LitString",
+                        "value": "say \"hi\"\n"
+                    },
+    ```
+    THE SPINE (unchanged by this task; recorded for Task 2's `valueMap` key —
+    GHC applies it directly to the literal, with no intervening helper bind):
+    ```json
+                "fun": { "tag": "Var", "var": { "name": "GHC.CString.unpackCString#",
+                                                "role": "id", "unique": 20, … } },
+                "tag": "App"
+    ```
+    So the key Task 2 needs is `"GHC.CString.unpackCString#"` (fully qualified;
+    the bare `"unpackCString#"` was NOT observed).
+
+    HAZARDOUS CHARACTERS SURVIVE THE ROUND TRIP — checked on the DECODED value,
+    not the bytes on disk, because a JSON encoder escapes exactly these:
+    `json.load` gives `greeting = 'hi'` (len 2, codepoints `0x68 0x69`) and
+    `quoted = 'say "hi"\n'` (len 9, codepoints
+    `0x73 0x61 0x79 0x20 0x22 0x68 0x69 0x22 0x0a`). The `"` is a real U+0022 and
+    the newline a real U+000A after decoding — aeson escaped them on the way out
+    and the reader restored them. **NO trailing NUL**: `greeting` is 2 code
+    points, so GHC's `LitString` payload does not carry the C terminator and Task
+    2 must not strip one (a `"hi ".toList` would have been a silent
+    off-by-one in every string's `length`).
+
+    THE EXPECTED LOUD FAILURE, verbatim from `lake build
+    GhcCoreToLean.Generated.StringBasics` — this is the point of the fixture:
+    ```
+      error: GhcCoreToLean/Generated/StringBasics.lean:12:16: Unknown identifier `GHCCore.tyConOpaque`
+      error: GhcCoreToLean/Generated/StringBasics.lean:13:3: Unknown identifier `GHC.CString.unpackCString_hash_`
+      error: GhcCoreToLean/Generated/StringBasics.lean:16:43: unexpected identifier; expected ')', ',' or ':'
+      error: GhcCoreToLean/Generated/StringBasics.lean:15:14: Unknown identifier `GHCCore.tyConOpaque`
+    ```
+    from
+    ```lean
+      def greeting : (GHCCore.tyConOpaque "String") :=
+        (GHC.CString.unpackCString_hash_) ("hi")
+
+      def quoted : (GHCCore.tyConOpaque "String") :=
+        (GHC.CString.unpackCString_hash_) ("say "hi"
+      ")
+    ```
+    Three distinct Task 2 items, and note the ORDER: at `quoted` the raw `"`
+    makes it a *syntax* error at 16:43, which fires INSTEAD of the
+    unknown-identifier error `greeting` gets at 13:3 — the mapping is not even
+    observable at a hazardous literal until the escaping lands. That is why Task
+    2's Steps 1 and 2 must ship together, and it also means the shim fix alone
+    could not have been "finished" by adding the mapping first: per the plan's
+    ordering constraint, mapping `unpackCString#` before this commit would have
+    made every literal emit a type-correct, compiling, silently wrong
+    `"<bs>".toList`.
+
+    CENSUS — the exploration claim was "`LitString` appears in all dumps but
+    EXCLUSIVELY inside `$tr`/`$tc` Typeable binds that `isJunkName` drops". That
+    claim is **too strong**; measured structurally (walk every top-level bind,
+    collect the owner of every `LitString` node) over 7 corpus dumps:
+    | dump | `LitString` | owners |
+    |---|---|---|
+    | `Fib`, `TupleBasics`, `ListLiterals` | 2 | `$trModule` only |
+    | `RecordOps` | 6 | `$trModule`, `$tcPoint`, `$tc'Point`, `$tcRect`, `$tc'Rect` |
+    | `UserClass` | 6 | `$trModule`, `$tcSized`, `$tc'C:Sized`, `$tcBox`, `$tc'Box` |
+    | `OrdHandwritten` | 16 | `$trModule` + 14 `$tc…` |
+    | `Ratio` | 54 | `$trModule`, 4 `$tc…`, **`$cshowsPrec` ×8, `$dIP` ×12, and 7 REAL USER BINDS ×9** |
+    `Ratio`'s non-Typeable owners are `tryMkRatio`, `fromRatioSOPSafe`,
+    `safeRatioMatch`, `recipC`, `integerRecipMulRatioC`, `safeRecipRatio`,
+    `recipMulRatio` — i.e. `error "…"` messages (`'recipC: division by zero'`)
+    plus the `HasCallStack` strings GHC inlines beside them (`'Ratio.hs'`,
+    `'Ratio'`, `'transpile-sandbox-0.1.0.0-inplace'`, `'error'`) — and
+    `$cshowsPrec`'s derived record syntax (`'CustomRatio {'`,
+    `'numerator = '`, `'}'`). They are dropped by THREE different mechanisms,
+    only one of which is `isJunkName`: `$dIP` by prefix and `$cshowsPrec` by
+    `Emit.isDerivedShowMethod` (both `Main.lean`'s `isGhcRuntimePlumbing`), and
+    the user binds' literals by the `error`→`default` collapse, which discards
+    the whole application including its message. Verified: no `<bs>` occurs in
+    ANY pre-fix emitted `.lean`, and no error message occurs in the post-fix one.
+
+    BYTE-IDENTITY — two-binary method over 7 fixtures (`Fib`, `ListLiterals`,
+    `RecordOps`, `UserClass`, `OrdHandwritten`, `TupleBasics`, `Ratio`). Result:
+    **JSON DIFFERS for all 7 / emitted `.lean` byte-identical for all 7**, with
+    identical (byte-equal) transpiler stderr. (All 7 JSONs re-confirmed
+    byte-identical under the finally-committed binary, after the comment-only
+    edits that followed the measurement.) Both halves are load-bearing: the
+    JSON diff proves the new shim is the one that ran, and without it a
+    byte-identical `.lean` would be equally consistent with "the change did
+    nothing".
+
+    WHAT WAS COMPARED, precisely. The shim is a POST-dump translator (CBOR →
+    JSON) and `shim/cabal.project` is `packages: .`; the `.pass-0000.cbor` comes
+    from `ghc-dump-core`'s `GhcDump.Plugin` during the sandbox `cabal build`,
+    which this change cannot reach. So the DUMP WAS HELD FIXED and both binaries
+    were run over the same saved `dump.cbor` (+ the same `decls.json`,
+    `.leanspecs`, and a per-run COPY of the pre-append `transpile-ext-types.tsv`,
+    since `emit_module` appends to that file and a shared copy would fake a
+    diff), then the transpiler was run on each JSON with byte-equal environment.
+    Re-dumping per shim would have been WRONG here, and measurably so: two
+    consecutive `transpile.sh` runs on an unchanged `StringBasics.hs` produced
+    CBORs differing in exactly 6 bytes — GHC's uniques (`greeting` was 1153, then
+    2129) — and emitted Lean names embed those uniques, so a re-dump manufactures
+    `.lean` diffs that have nothing to do with `MachStr`. A `post` vs `post2`
+    control (same binary, twice, through the same harness) was byte-identical for
+    all 7, so the harness itself contributes no noise.
+
+    ENCODING PROBE (scratch modules, not committed — the fixture stays the two
+    plain defs the plan asks for). Each def is `<name> = <literal>`; the table is
+    the observed spine head and the DECODED payload:
+    | literal | spine | decoded | code points |
+    |---|---|---|---|
+    | `"plain"` | `unpackCString#` | `plain` | ASCII |
+    | `"caf\233"` | **`unpackCStringUtf8#`** | `café` | `0x63 0x61 0x66 0xe9` |
+    | `"\255"` | **`unpackCStringUtf8#`** | `ÿ` | `0xff` |
+    | `"\128169"` | **`unpackCStringUtf8#`** | `💩` | `0x1f4a9` |
+    | `"a\0b"` | **`unpackCStringUtf8#`** | `a??b` | `0x61 0xfffd 0xfffd 0x62` |
+    | `"x\55296y"` | **`unpackCStringUtf8#`** | `x???y` | `0x78 0xfffd 0xfffd 0xfffd 0x79` |
+
+    TWO CONSEQUENCES, both for Task 2, both bigger than the plan assumed:
+
+    1. `unpackCStringUtf8#` is NOT a hedge — it is REQUIRED. GHC picks
+       `unpackCString#` only for a pure-ASCII literal and
+       `GHC.CString.unpackCStringUtf8#` for *every* non-ASCII one. Map both or
+       every accented string in the corpus fails loud.
+    2. THE DECODE IS LOSSY ON ORDINARY HASKELL, and Task 2 must make that loud.
+       `"a\0b"` and `"x\55296y"` are ordinary Haskell; GHC encodes them in
+       *modified* UTF-8 (NUL as `0xC0 0x80`, surrogates as 3-byte CESU
+       sequences), both invalid standard UTF-8, so lenient decoding replaces them
+       — `"a\0b"` (3 chars) arrives as 4 code points with two U+FFFD. Today that
+       is INERT: byte-identity below proves no literal reaches emission at all.
+       The moment Task 2 maps the unpackers it becomes SILENT-WRONG — wrong
+       `length`, wrong content, compiles fine. The shim cannot fix it by
+       decoding harder (Lean's `Char` cannot hold a surrogate at all —
+       plan correction 3), so the safe design is detection: the decode is lossy
+       exactly when `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs`, which
+       the shim can test in one line, and such a literal must FAIL LOUD rather
+       than emit a plausible-looking string. Not done here: it needs a JSON
+       schema field and a Lean-side refusal, i.e. Task 2's commit, not this one.
+
+    HANDOFFS.
+    * Both items above (`unpackCStringUtf8#`, and the lossy-decode loud-fail).
+    * Task 2 needs a `typeConMap "String"` arm too: GHC Core keeps the SYNONYM in
+      the binder type (`"type": {"tag":"TyCon","name":"String","args":[]}`), so
+      `greeting` emits `(GHCCore.tyConOpaque "String")`, not `List Char`. The
+      plan's correction 1 ("`typeConMap` already sends `[] [Char]` → `List
+      Char`") is true but does not cover this spelling — pinned below.
+    * Task 2's escaping must handle U+FFFD arriving from a non-UTF-8 literal; the
+      decoder guarantees a valid `Text`, not an ASCII one.
+    * Task 3's hedge now has observed ammunition rather than a hypothetical:
+      `Ratio`'s `$cshowsPrec` literals contain `'CustomRatio {'` — a real
+      constructor name inside a real string literal, in the corpus, today. It is
+      invisible only because that bind is dropped; the `error`-message literals in
+      the 7 user binds are one emitter change away from the same exposure. -/
+
+-- Task-2 tripwires: the three things the loud failure above is made of, pinned
+-- as they stand TODAY. Task 2 MUST flip the first two and re-point the third;
+-- they are here so that work starts from a measurement instead of a guess.
+#guard valueMap "GHC.CString.unpackCString#" == none
+#guard valueMap "GHC.CString.unpackCStringUtf8#" == none
+#guard typeConMap "String" [] == none
+-- `[Char]` DOES map (correction 1) — the gap is the `String` spelling above.
+#guard typeConMap "[]" ["Char"] == some "List Char"
+-- No escaping anywhere in `emitLiteral`: the payload is interpolated raw, which
+-- is exactly the 16:43 syntax error. Written as an explicit `"\"" ++ s ++ "\""`
+-- so the guard cannot be read as asserting any escaping happened.
+#guard emitLiteral (.litString "hi") == "\"hi\""
+#guard emitLiteral (.litString "say \"hi\"\n") == "\"" ++ "say \"hi\"\n" ++ "\""
+#guard emitLiteralPattern (.litString "say \"hi\"\n") == "\"" ++ "say \"hi\"\n" ++ "\""
+-- The `<bs>` era is over on the Lean side too: nothing special-cases it, so it
+-- was never distinguishable from a user literal spelled `<bs>`.
+#guard emitLiteral (.litString "<bs>") == "\"<bs>\""
+
 end GhcCoreToLean.Tests
