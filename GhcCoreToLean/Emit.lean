@@ -206,9 +206,14 @@ def emitLiteral : Literal → String
     Haskell: GHC's `tidyLitPat` expands a SHORT `HsString` pattern into a
     cons-chain of `Char` patterns and routes a long one through `eqString`, so
     `case s of "hi" -> …` never becomes a literal alternative. But `hsLitKey` maps
-    `HsStringPrim` (an `Addr#` literal pattern, `"hi"#` under `MagicHash`) to
-    `LitString`, and `matchLiterals` builds `LitAlt` from `hsLitKey` — so it
-    cannot be RULED OUT, only called exotic. Measured negatively: `LitChar` ×0 and
+    `HsStringPrim` (an `Addr#` literal pattern) to `LitString`, and `matchLiterals`
+    builds `LitAlt` from `hsLitKey`. REVIEW CORRECTION: the `MagicHash` route
+    this comment used to name is NOT reachable — GHC 9.2.7 rejects both
+    `f "hi"# = 1` and `case a of "hi"# -> 1` in the front end, before Core
+    (`error: Illegal unboxed string literal in pattern: "hi"#`, measured). The
+    `hsLitKey` mapping still exists and TH-generated patterns / other front ends
+    were not probed, so the arm is dead-but-unproven rather than ruled out.
+    Measured negatively: `LitChar` ×0 and
     zero value-position `LitString` in any of 35 dumps, i.e. the arm is entirely
     unobserved either way. Under "cannot rule it out ⇒ fail loud" it emits an
     undefined pattern head, which Lean rejects with "Invalid pattern: Expected a

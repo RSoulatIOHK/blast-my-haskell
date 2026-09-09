@@ -90,11 +90,19 @@ def parseLiteral (j : Lean.Json) : Except String Literal := do
     -- bytes — exactly when its modified-UTF-8 payload has no faithful Lean image
     -- (a lone surrogate, or bytes that are not valid UTF-8 even after the
     -- overlong-NUL repair). ABSENT is the normal case and means `value` is
-    -- faithful, NUL included. The field is read as a String, so its presence is
-    -- the flag and its content is the evidence the refusal names.
-    match j.getObjValAs? String "unrepresentable" with
-    | .ok hex   => .ok (.litStringUnrepresentable hex)
-    | .error _  => .ok (.litString s)
+    -- faithful, NUL included. PRESENCE is the flag and the content is the
+    -- evidence the refusal names. Presence is tested on the FIELD, not on a
+    -- successful String read: a type-coupled read (`getObjValAs? String`
+    -- alone) silently absorbs a present-but-non-String payload into
+    -- `.litString`, whose `value` still carries the U+FFFD replacement — i.e.
+    -- exactly the silent-wrong this channel exists to prevent. Unreachable
+    -- from today's shim (`hexBytes :: T.Text` is always a string), so this is
+    -- hardening against a future schema slip, not a live bug.
+    match j.getObjVal? "unrepresentable" with
+    | .error _ => .ok (.litString s)            -- field absent: faithful
+    | .ok v    => match v.getStr? with
+      | .ok hex  => .ok (.litStringUnrepresentable hex)
+      | .error _ => .error s!"LitString `unrepresentable` must be a hex String, got: {v}"
   | "LitChar"   => do
     let s ← j.getObjValAs? String "value"
     match s.data with

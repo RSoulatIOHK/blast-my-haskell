@@ -6852,7 +6852,7 @@ def ambConvDfunB : Bind :=
     and rc=0 below.
 
     E2E. `StringBasics` transpiles and `lake build
-    GhcCoreToLean.Generated.StringBasics` is GREEN with all 11 properties,
+    GhcCoreToLean.Generated.StringBasics` is GREEN with all 10 properties,
     including `withNul_val : withNul = ['a', '\x00', 'b']` and `withNul_len :
     nameLen withNul = 3` (the NUL-faithful half, proved by `rfl` in the kernel)
     and `shout_len : ∀ (cs : List Char), nameLen (shout cs) = nameLen cs + 1` by
