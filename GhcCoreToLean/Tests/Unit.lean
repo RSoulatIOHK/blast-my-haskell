@@ -6601,7 +6601,10 @@ def ambConvDfunB : Bind :=
     `Emit.isDerivedShowMethod` (both `Main.lean`'s `isGhcRuntimePlumbing`), and
     the user binds' literals by the `error`→`default` collapse, which discards
     the whole application including its message. Verified: no `<bs>` occurs in
-    ANY pre-fix emitted `.lean`, and no error message occurs in the post-fix one.
+    any pre-fix emitted `.lean` OF THE 7 CORPUS FIXTURES, and no error message
+    occurs in the post-fix ones. Scope matters — the pre-fix binary DOES emit
+    `(GHC.CString.unpackCString_hash_) ("<bs>")` for both `StringBasics` defs,
+    since that fixture is this commit's own literal-bearing addition.
 
     BYTE-IDENTITY — two-binary method over 7 fixtures (`Fib`, `ListLiterals`,
     `RecordOps`, `UserClass`, `OrdHandwritten`, `TupleBasics`, `Ratio`). Result:
@@ -6621,13 +6624,22 @@ def ambConvDfunB : Bind :=
     `.leanspecs`, and a per-run COPY of the pre-append `transpile-ext-types.tsv`,
     since `emit_module` appends to that file and a shared copy would fake a
     diff), then the transpiler was run on each JSON with byte-equal environment.
-    Re-dumping per shim would have been WRONG here, and measurably so: two
-    consecutive `transpile.sh` runs on an unchanged `StringBasics.hs` produced
-    CBORs differing in exactly 6 bytes — GHC's uniques (`greeting` was 1153, then
-    2129) — and emitted Lean names embed those uniques, so a re-dump manufactures
-    `.lean` diffs that have nothing to do with `MachStr`. A `post` vs `post2`
-    control (same binary, twice, through the same harness) was byte-identical for
-    all 7, so the harness itself contributes no noise.
+    Holding the dump fixed is what the plan's byte-identity rule already
+    prescribes ("run BOTH binaries over the SAME saved dumps"), and it is the
+    right method here for a structural reason: the shim is a post-dump
+    CBOR→JSON translator (`shim/cabal.project` is `packages: .`), so it cannot
+    influence the CBOR — re-dumping would vary an input the change cannot
+    affect. CORRECTION (review, re-measured): an earlier draft of this comment
+    claimed re-dumping was *measurably* unsafe, citing two consecutive
+    `transpile.sh` runs producing CBORs differing in 6 bytes (`greeting` unique
+    1153 then 2129). That does NOT reproduce — repeated runs give byte-identical
+    CBORs (749 B, 0 differing bytes), including across a 6-hour gap with many
+    intervening runs. Uniques here are CONFIGURATION-sensitive, not
+    run-sensitive: a direct `ghc-9.2.7 -fplugin GhcDump.Plugin` gives 2113 while
+    `transpile.sh` (two extra plugins) gives 2129. So re-dumping would have
+    worked; the held-fixed method is preferred as strictly more robust, not as a
+    rescue. A `post` vs `post2` control (same binary, twice, through the same
+    harness) was byte-identical for all 7, so the harness contributes no noise.
 
     ENCODING PROBE (scratch modules, not committed — the fixture stays the two
     plain defs the plan asks for). Each def is `<name> = <literal>`; the table is
@@ -6649,18 +6661,49 @@ def ambConvDfunB : Bind :=
        every accented string in the corpus fails loud.
     2. THE DECODE IS LOSSY ON ORDINARY HASKELL, and Task 2 must make that loud.
        `"a\0b"` and `"x\55296y"` are ordinary Haskell; GHC encodes them in
-       *modified* UTF-8 (NUL as `0xC0 0x80`, surrogates as 3-byte CESU
-       sequences), both invalid standard UTF-8, so lenient decoding replaces them
-       — `"a\0b"` (3 chars) arrives as 4 code points with two U+FFFD. Today that
-       is INERT: byte-identity below proves no literal reaches emission at all.
-       The moment Task 2 maps the unpackers it becomes SILENT-WRONG — wrong
-       `length`, wrong content, compiles fine. The shim cannot fix it by
+       *modified* UTF-8 — standard UTF-8 EXCEPT an overlong NUL (`0xC0 0x80`)
+       and 3-byte encodings of LONE surrogates. It is NOT CESU-8: supplementary
+       characters get standard 4-byte UTF-8 (measured: `"\128169"` → `💩`
+       decodes correctly), so a refusal must not reject non-BMP literals. Both
+       exceptional forms are invalid standard UTF-8, so lenient decoding replaces them
+       — `"a\0b"` (3 chars) arrives as 4 code points with two U+FFFD. Today the
+       lossy value is not silently believed, because the unpackers are UNMAPPED:
+       any literal that reaches emission fails loud (`StringBasics` emits
+       `("hi")` and an unknown `unpackCString_hash_` — literals DO reach
+       emission in this very commit; what byte-identity shows is that no
+       literal reaches it in the 7 corpus fixtures). The moment Task 2 maps the
+       unpackers, the loud failure is REPLACED by a silently-wrong value —
+       wrong `length`, wrong content, compiles fine. Task 2 therefore replaces
+       a loud failure, it does not add a check where nothing arrived. The shim cannot fix it by
        decoding harder (Lean's `Char` cannot hold a surrogate at all —
        plan correction 3), so the safe design is detection: the decode is lossy
        exactly when `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs`, which
        the shim can test in one line, and such a literal must FAIL LOUD rather
        than emit a plausible-looking string. Not done here: it needs a JSON
        schema field and a Lean-side refusal, i.e. Task 2's commit, not this one.
+
+       PREDICATE AUDIT (review). Sound as a LOSSINESS test, in both directions:
+       no false negatives — replacement output is always whole `EF BF BD`
+       triples and `EF BF BD` is itself valid UTF-8, so it is never the invalid
+       input, hence any replacement forces a byte/length mismatch; and success
+       implies `bs` is valid standard UTF-8, which (GHC's encoder being
+       standard and injective off NUL/lone-surrogates) implies the decode
+       recovered exactly GHC's Chars, all legal Lean `Char`s. No false
+       positives either: a GENUINE U+FFFD literal round-trips `True`
+       (measured on `[239,191,189]` and `[97,239,191,189,98]`).
+       BUT COARSE AS A REFUSAL CRITERION, and Task 2 must split it: the two
+       failing forms have different correct remedies. U+0000 is a perfectly
+       legal Lean `Char`, so refusing it declines Haskell a modified-UTF-8-aware
+       decoder would transpile faithfully; only U+D800–DFFF is genuinely
+       unrepresentable (plan correction 3). One blanket refusal loses NUL
+       support permanently.
+       ALSO: the predicate is computable ONLY in the shim — the bytes are gone
+       after JSON — so Task 2's Lean-side refusal REQUIRES a shim-emitted flag
+       field and cannot recompute it. Deferring to Lean (rather than dying in
+       the shim) is right for a reason worth recording: the shim cannot know
+       whether a literal reaches emission, so a shim-level `die` would crash
+       modules whose only lossy literal sits in a dropped `$tr`/`$cshowsPrec`/
+       error-collapsed bind — modules that transpile fine today.
 
     HANDOFFS.
     * Both items above (`unpackCStringUtf8#`, and the lossy-decode loud-fail).
@@ -6669,6 +6712,12 @@ def ambConvDfunB : Bind :=
       `greeting` emits `(GHCCore.tyConOpaque "String")`, not `List Char`. The
       plan's correction 1 ("`typeConMap` already sends `[] [Char]` → `List
       Char`") is true but does not cover this spelling — pinned below.
+    * TASK 4 (review finding): `MachChar` has the SAME silent surrogate loss,
+      so the plan's correction 1 ("the shim's `LitChar` arm is already complete
+      and lossless") is measurably FALSE. `text-1.2.5.0`'s `T.singleton`
+      applies `safe`: `T.singleton '\55296'` and `'\57343'` both yield U+FFFD
+      (measured under GHC 9.2.7). Latent only because every dump so far has
+      zero `LitChar`; Task 4 is where a real `Char` literal first appears.
     * Task 2's escaping must handle U+FFFD arriving from a non-UTF-8 literal; the
       decoder guarantees a valid `Text`, not an ASCII one.
     * Task 3's hedge now has observed ammunition rather than a hypothetical:
