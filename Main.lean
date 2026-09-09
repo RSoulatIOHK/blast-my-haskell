@@ -293,6 +293,23 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for (owner, hex) in unrepLits do
         IO.eprintln s!"error: {Emit.unrepresentableStringLiteralError owner hex}"
       return 1
+    -- Same refusal for a `Char` literal with no Lean image: a lone surrogate
+    -- U+D800–DFFF, which Haskell's `Char` has and Lean's does not. M4 Task 4
+    -- made this necessary — not by mapping anything (a bare `Char` literal needs
+    -- no mapping at all), but by producing the FIRST dump in the project's life
+    -- to contain a `LitChar`, which is what took the shim's `T.singleton` loss
+    -- from latent to live. Measured pre-fix on `CharSurrogate.hs`:
+    -- `def lone : Char := '\65533'`, rc=0, green `lake build`.
+    --
+    -- Reported SEPARATELY from the string case, and after it rather than merged
+    -- into it, because the two carry different evidence (bytes vs a code point)
+    -- and different remedies — see `Emit.unrepresentableCharLiteralError`. Both
+    -- read the SAME traversal (`Emit.unrepLitsInExpr`), so neither can drift.
+    let unrepChars := Emit.unrepresentableCharLiterals userProg
+    if !unrepChars.isEmpty then
+      for (owner, cp) in unrepChars do
+        IO.eprintln s!"error: {Emit.unrepresentableCharLiteralError owner cp}"
+      return 1
     -- Name every instance `emitInstanceUser` is about to SKIP, and the method
     -- that costs it. Not a refusal (the skip is already loud at `lake build`, as
     -- `failed to synthesize`, and refusing would newly reject modules whose

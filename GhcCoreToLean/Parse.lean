@@ -104,10 +104,29 @@ def parseLiteral (j : Lean.Json) : Except String Literal := do
       | .ok hex  => .ok (.litStringUnrepresentable hex)
       | .error _ => .error s!"LitString `unrepresentable` must be a hex String, got: {v}"
   | "LitChar"   => do
-    let s ← j.getObjValAs? String "value"
-    match s.data with
-    | [c] => .ok (.litChar c)
-    | _   => .error s!"LitChar value must be a single-character string, got: {s}"
+    -- Same `unrepresentable` channel as `LitString`, and read the same way:
+    -- the FIELD's presence is the flag, tested BEFORE `value` is touched. The
+    -- shim sets it exactly when the `Char` is a lone surrogate (U+D800–DFFF),
+    -- which Haskell's `Char` has and Lean's does not; the payload is the code
+    -- point (`"U+D800"`), not bytes, because a `Char`'s loss is not a
+    -- byte-encoding fact. ABSENT is the normal case and means `value` is
+    -- faithful.
+    --
+    -- ORDER IS THE POINT, not a live bug fix. `value` for a flagged literal is
+    -- `T.singleton`'s U+FFFD, which is a perfectly ordinary ONE-character
+    -- string — so the `[c]` read below would SUCCEED and quietly produce
+    -- `.litChar '\65533'`, the exact silent-wrong this channel exists to
+    -- prevent. Reading the flag first is what makes `value`'s content provably
+    -- irrelevant here rather than accidentally harmless.
+    match j.getObjVal? "unrepresentable" with
+    | .ok v    => match v.getStr? with
+      | .ok cp   => .ok (.litCharUnrepresentable cp)
+      | .error _ => .error s!"LitChar `unrepresentable` must be a code-point String, got: {v}"
+    | .error _ => do                            -- field absent: faithful
+      let s ← j.getObjValAs? String "value"
+      match s.data with
+      | [c] => .ok (.litChar c)
+      | _   => .error s!"LitChar value must be a single-character string, got: {s}"
   | "LitLabel"  => do
     let s ← j.getObjValAs? String "value"
     .ok (.litLabel s)

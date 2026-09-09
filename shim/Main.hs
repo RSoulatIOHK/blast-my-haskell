@@ -15,6 +15,7 @@ import           Data.Text.Encoding          (decodeUtf8With, encodeUtf8)
 import           Data.Text.Encoding.Error    (lenientDecode)
 import qualified Data.ByteString             as BS
 import           Data.Word                   (Word8)
+import           Data.Char                   (ord, toUpper)
 import           Numeric                     (showHex)
 import           System.Environment          (getArgs)
 import           System.Exit                 (die)
@@ -325,7 +326,46 @@ unknownType = object [ "tag"  .= ("TyCon" :: T.Text)
 
 convertLit :: Lit -> Value
 convertLit = \case
-  MachChar c    -> object [ "tag" .= ("LitChar"   :: T.Text), "value" .= T.singleton c ]
+  -- M4 TASK 4. This arm was the LAST silent lossy one, and it was invisible for
+  -- the project's whole life because no dump had ever contained a `LitChar`:
+  -- `T.singleton` is not `Text`'s identity on `Char`. `text-1.2.5.0` applies
+  -- `safe`, which maps every surrogate to U+FFFD, so `T.singleton '\55296'`
+  -- (and `'\57343'`) is the REPLACEMENT CHARACTER — measured under GHC 9.2.7.
+  -- A Haskell `Char` spans [0,0x10FFFF] INCLUDING the 2048 surrogates and a Lean
+  -- `Char` excludes them, so such a literal has no Lean value at all; emitting
+  -- U+FFFD would give it a DIFFERENT, perfectly legal one, and compile.
+  -- (Measured pre-fix: `CharSurrogate.hs`'s `lone = '\55296'` emitted
+  -- `def lone : Char := '\65533'` with rc=0 and a green `lake build`.)
+  --
+  -- WHY THE PREDICATE IS NOT `MachStr`'s. The string channel tests
+  -- `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs` on the raw BYTES. Reused
+  -- here it would be a guaranteed FALSE NEGATIVE on the only case it exists to
+  -- catch: by the time `T.singleton` has run the surrogate is already U+FFFD, and
+  -- U+FFFD round-trips UTF-8 perfectly. So the test is on the `Char` ITSELF,
+  -- before `Text` can destroy it — the `Lit` carries a real `Char` all the way
+  -- from `GhcDump.Convert`, and `Codec.Serialise`'s `Char` instance is the
+  -- code point, so the CBOR is lossless and `T.singleton` is the only lossy step.
+  -- (Proven by this arm working at all: `U+D800` can only be reported if the
+  -- code point survived the dump.)
+  --
+  -- SCHEMA. The key is `unrepresentable`, the same channel `LitString` uses:
+  -- present iff the literal has no faithful Lean image, PRESENCE is the flag and
+  -- the content is the evidence the Lean-side refusal names. The CONTENT is
+  -- per-tag, and deliberately looks different so the two cannot be misread for
+  -- each other: bytes (`"78 ed a0 80 79"`) for `LitString`, whose loss is a
+  -- byte-encoding fact, and a code point (`"U+D800"`) for `LitChar`, whose loss
+  -- is not — none of the modified-UTF-8/overlong-NUL story applies to a `Char`,
+  -- which is why the refusal message is a separate one.
+  -- `value` still carries the lossy `T.singleton`: it is what the literal WOULD
+  -- have been believed to be, and it is never read, because the flag refuses
+  -- first (`Parse.parseLiteral` tests the field before touching `value`).
+  --
+  -- Flagged, not `die`d, for the same reason as `MachStr`: the shim cannot know
+  -- whether a literal reaches emission, so dying here would crash modules whose
+  -- only surrogate sits in a dropped bind.
+  MachChar c    ->
+    object ( [ "tag" .= ("LitChar" :: T.Text), "value" .= T.singleton c ]
+          ++ [ "unrepresentable" .= hexCodePoint c | isSurrogate c ] )
   -- `Ast.MachStr` carries the literal's real bytes (strict `BS.ByteString`,
   -- lossless from `GhcDump.Convert`); this arm used to throw them away and emit
   -- the placeholder `"<bs>"`, so EVERY Haskell string literal reached Lean as
@@ -404,3 +444,17 @@ undoOverlongNul = BS.pack . go . BS.unpack
 hexBytes :: BS.ByteString -> T.Text
 hexBytes = T.unwords . map (T.pack . pad2 . flip showHex "") . BS.unpack
   where pad2 h = if length h < 2 then '0' : h else h
+
+-- | A lone surrogate: exactly the code points Haskell's `Char` has and Lean's
+-- does not. Tested on the `Char`, never on `T.singleton c` (which has already
+-- replaced it with U+FFFD) or on encoded bytes (U+FFFD encodes cleanly).
+isSurrogate :: Char -> Bool
+isSurrogate c = let n = ord c in n >= 0xD800 && n <= 0xDFFF
+
+-- | `U+XXXX`, for naming the code point of a `Char` literal that has no Lean
+-- image (`'\55296'` -> `U+D800`). Uppercase with the `U+` prefix so a `LitChar`
+-- payload can never be mistaken for `hexBytes`' lowercase byte run — they are
+-- different kinds of evidence on the same JSON key.
+hexCodePoint :: Char -> T.Text
+hexCodePoint c = "U+" <> T.pack (pad4 (map toUpper (showHex (ord c) "")))
+  where pad4 h = replicate (4 - length h) '0' ++ h

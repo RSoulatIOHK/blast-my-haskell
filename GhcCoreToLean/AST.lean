@@ -50,6 +50,30 @@ inductive Literal where
       wrong string this constructor exists to keep out of the output. -/
   | litStringUnrepresentable : String → Literal
   | litChar   : Char → Literal
+  /-- A `Char` literal with NO faithful Lean image, carrying the code point
+      (`"U+D800"`) rather than any `Char`.
+
+      Haskell's `Char` spans [0,0x10FFFF] INCLUDING the 2048 surrogates
+      U+D800–DFFF; Lean's excludes them. So `'\55296'` is ordinary Haskell with
+      no Lean value at all — not a different one. The shim's `MachChar` arm used
+      `T.singleton`, which is NOT `Text`'s identity on `Char`: `text-1.2.5.0`
+      applies `safe` and maps every surrogate to U+FFFD, so such a literal used
+      to arrive as the replacement character and emit as a legal, wrong `Char`
+      (measured: `CharSurrogate.hs` emitted `def lone : Char := '\65533'`, rc=0,
+      green `lake build`). The shim now flags it (`"unrepresentable"` in the
+      JSON) and `Main.lean` REFUSES the module before emission — see
+      `Emit.unrepresentableCharLiterals`.
+
+      SAME CHANNEL, DIFFERENT EVIDENCE, from `litStringUnrepresentable`: a
+      string's loss is a byte-encoding fact (modified UTF-8) so its payload is
+      bytes; a `Char`'s is not, so its payload is a code point and none of the
+      overlong-NUL/`unpackCString#` story applies. Hence two constructors and
+      two refusal messages rather than one of each.
+
+      DECLARED AFTER `litChar`, deliberately: `deriving Inhabited` takes the
+      FIRST constructor, so the order of these arms is load-bearing for
+      `default : Literal`. -/
+  | litCharUnrepresentable : String → Literal
   | litLabel  : String → Literal
 deriving Repr, Inhabited
 

@@ -83,6 +83,33 @@ def valueMap : String → Option String
   -- `List.append (String.toList "…")` at pass-0000.
   | "GHC.CString.unpackCString#"     => some "String.toList"
   | "GHC.CString.unpackCStringUtf8#" => some "String.toList"
+  -- `Char` operations (M4 Task 4). ONLY TWO, and the smallness is the finding,
+  -- not an omission — see the loud-fail block below for the seven `Data.Char`
+  -- names that must stay unmapped and why.
+  --
+  -- OBSERVED NAMES, WITH THE NEGATIVES. The plan hedged `Data.Char.*` /
+  -- `GHC.Char.*`; measured on the pipeline's GHC 9.2.7 over `CharOps.hs`, BOTH
+  -- guesses are 0-occurrence and the real spellings are the DEFINING modules:
+  -- `GHC.Base.ord` (×1) and `GHC.Unicode.isDigit` (×1), with
+  -- `Data.Char.ord` ×0, `Data.Char.isDigit` ×0, `GHC.Char.ord` ×0,
+  -- `GHC.Char.isDigit` ×0. `Data.Char` is a re-export module and Core names come
+  -- from where a thing is DEFINED, so the `Data.Char.*` keys are not merely
+  -- unobserved — they are the wrong shape and are deliberately absent rather than
+  -- added "just in case", which would be a key that can never fire.
+  -- No bare alphabetic keys either (`| "ord"`), per this map's standing rule:
+  -- a user's own `ord` is a bare Core name and must keep resolving to their def.
+  --
+  -- `ord` IS SAFE, and the asymmetry is the whole reason. Every LEAN `Char` has a
+  -- faithful Haskell image, so the surrogate gap enters only through
+  -- CONSTRUCTION — i.e. through `chr`, which is why `ord` maps and `chr` cannot.
+  -- Haskell `ord` returns `Int`, so the result is coerced like `length`/`gcd`.
+  | "GHC.Base.ord" => some "(fun c => (c.toNat : Int))"
+  -- `isDigit` is the ONE `Data.Char` predicate that AGREES on both sides: Haskell
+  -- `GHC.Unicode.isDigit` and Lean v4.24 `Char.isDigit` both test ASCII 48..57
+  -- only. Pinned in both languages by `CharOps.hs`, including the ARABIC-INDIC
+  -- DIGIT FIVE `'٥'` (U+0665) — a Unicode digit that is `False` in Haskell and
+  -- `false` in Lean, which is exactly the agreement being claimed.
+  | "GHC.Unicode.isDigit" => some "Char.isDigit"
   | "GHC.Base.map"                => some "List.map"
   | "GHC.List.filter"             => some "List.filter"
   | "GHC.List.reverse"            => some "List.reverse"

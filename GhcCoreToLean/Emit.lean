@@ -193,6 +193,11 @@ def emitLiteral : Literal → String
   -- instead of a silently-wrong string.
   | .litStringUnrepresentable hex => s!"(GHCCore.unrepresentableStringLiteral \"{hex}\")"
   | .litChar c   => escapeCharLit c
+  -- Unreachable for the same reason and kept loud in the same way as the string
+  -- case above: `Main.lean` refuses first (`unrepresentableCharLiterals`), and if
+  -- some future caller emits without running the refusal it gets an undefined
+  -- identifier naming the code point, not `'\65533'`.
+  | .litCharUnrepresentable cp => s!"(GHCCore.unrepresentableCharLiteral \"{cp}\")"
   | .litLabel l  => s!"GHCCore.foreignLabel \"{l}\""
 
 /-- Literal in PATTERN position (a `LitAlt` alternative).
@@ -213,14 +218,25 @@ def emitLiteral : Literal → String
     (`error: Illegal unboxed string literal in pattern: "hi"#`, measured). The
     `hsLitKey` mapping still exists and TH-generated patterns / other front ends
     were not probed, so the arm is dead-but-unproven rather than ruled out.
-    Measured negatively: `LitChar` ×0 and
-    zero value-position `LitString` in any of 35 dumps, i.e. the arm is entirely
-    unobserved either way. Under "cannot rule it out ⇒ fail loud" it emits an
-    undefined pattern head, which Lean rejects with "Invalid pattern: Expected a
-    constructor or constant marked with `[match_pattern]`" (verified).
+    Measured negatively: zero value-position `LitString`
+    in any of 35 dumps, i.e. the arm is entirely unobserved either way. Under
+    "cannot rule it out ⇒ fail loud" it emits an undefined pattern head, which
+    Lean rejects with "Invalid pattern: Expected a constructor or constant marked
+    with `[match_pattern]`" (verified).
 
-    `.litChar` in pattern position is fine and stays a real literal: `'c'` against
-    a `Char` scrutinee is exactly right. -/
+    `.litChar` IS THE OPPOSITE CASE — reachable, ordinary, and now OBSERVED. A
+    Haskell `f 'a' = …` unboxes to a `case` on `Char#` whose alternatives are
+    `LitAlt (MachChar …)`, so this arm runs on real data (M4 Task 4's
+    `CharOps.classify`, the first dump in the project ever to contain a `LitChar`
+    at all — before it, `LitChar` was ×0 in 35 dumps in BOTH positions). It stays
+    a real literal, which is exactly right: `'c'` against a `Char` scrutinee is a
+    valid Lean pattern (measured — `| 'a' => (1 : Int)` elaborates).
+
+    `.litCharUnrepresentable` fails loud HERE TOO, and unlike the string case that
+    is not defence-in-depth against a dead arm: pattern position is live for
+    `Char`, so `f '\55296' = …` is a real route by which a surrogate could reach
+    the output. It is refused before emission (`unrepresentableCharLiterals` walks
+    `LitAlt` as well as value position) and this arm is the backstop. -/
 def emitLiteralPattern : Literal → String
   | .litInt n    => toString n
   | .litWord n   => toString n
@@ -229,6 +245,7 @@ def emitLiteralPattern : Literal → String
   | .litString s => s!"(GHCCore.unsupportedStringPattern {escapeStringLit s})"
   | .litStringUnrepresentable hex => s!"(GHCCore.unrepresentableStringLiteral \"{hex}\")"
   | .litChar c   => escapeCharLit c
+  | .litCharUnrepresentable cp => s!"(GHCCore.unrepresentableCharLiteral \"{cp}\")"
   | .litLabel _  => "_"
 
 /-! ## Var emission -/
@@ -3651,36 +3668,66 @@ def malformedNewtypeWarning (n : Name) : String :=
     mirroring the collapse here, which would duplicate emission logic in a
     validator and could then disagree with it. -/
 
-/-- Every `.litStringUnrepresentable` hex payload in an expression, including
-    literals in PATTERN position (a `LitAlt` alternative) — `emitLiteralPattern`
-    would put the same unrepresentable payload in the output. -/
-private partial def unrepStringsInExpr : Expr → List String
-  | .lit (.litStringUnrepresentable hex) => [hex]
-  | .app f a          => unrepStringsInExpr f ++ unrepStringsInExpr a
-  | .lam _ b          => unrepStringsInExpr b
-  | .cast e           => unrepStringsInExpr e
-  | .tick e           => unrepStringsInExpr e
+/-- Every literal with NO faithful Lean image in an expression — BOTH
+    `.litStringUnrepresentable` and `.litCharUnrepresentable` — including
+    literals in PATTERN position (a `LitAlt` alternative), since
+    `emitLiteralPattern` would put the same unrepresentable payload in the
+    output. Pattern position is dead-but-unproven for strings and LIVE for
+    `Char`s (`f 'a' = …` unboxes to `LitAlt (MachChar …)`), so the `LitAlt` arm
+    is load-bearing, not a hedge.
+
+    ONE TRAVERSAL, TWO VIEWS (`unrepresentableStringLiterals` /
+    `unrepresentableCharLiterals` below). M4 Task 4 could have added a second
+    walker beside the string one; it did not, because the failure mode of that
+    shape is a THIRD unrepresentable constructor added later and collected by
+    only one of them — a silent hole in a refusal, which is the worst place in
+    this codebase to have one. Add a constructor here and both views see it. -/
+private partial def unrepLitsInExpr : Expr → List Literal
+  | .lit l@(.litStringUnrepresentable _) => [l]
+  | .lit l@(.litCharUnrepresentable _)   => [l]
+  | .app f a          => unrepLitsInExpr f ++ unrepLitsInExpr a
+  | .lam _ b          => unrepLitsInExpr b
+  | .cast e           => unrepLitsInExpr e
+  | .tick e           => unrepLitsInExpr e
   | .let_ bnd b       =>
     (match bnd with
-     | .nonRec _ e => unrepStringsInExpr e
-     | .rec_ ps    => ps.flatMap (fun p => unrepStringsInExpr p.2))
-      ++ unrepStringsInExpr b
+     | .nonRec _ e => unrepLitsInExpr e
+     | .rec_ ps    => ps.flatMap (fun p => unrepLitsInExpr p.2))
+      ++ unrepLitsInExpr b
   | .case_ scr _ _ alts =>
-    unrepStringsInExpr scr ++
+    unrepLitsInExpr scr ++
       alts.flatMap (fun (.mk con _ rhs) =>
         (match con with
-         | .litAlt (.litStringUnrepresentable hex) => [hex]
-         | _ => []) ++ unrepStringsInExpr rhs)
+         | .litAlt l@(.litStringUnrepresentable _) => [l]
+         | .litAlt l@(.litCharUnrepresentable _)   => [l]
+         | _ => []) ++ unrepLitsInExpr rhs)
   | _                 => []
 
-/-- `(owner bind, hex bytes)` for every string literal with no faithful Lean
-    image. The owner is the TOP-LEVEL bind the literal sits under, which is what
-    the refusal names: it is the only thing that points a user at their source. -/
-def unrepresentableStringLiterals (p : Program) : List (Name × String) :=
+/-- `(owner bind, unrepresentable literal)` for the whole program. The owner is
+    the TOP-LEVEL bind the literal sits under, which is what the refusals name:
+    it is the only thing that points a user at their source. -/
+private def unrepLitsInProgram (p : Program) : List (Name × Literal) :=
   p.binds.flatMap fun b =>
     match b with
-    | .nonRec v e => (unrepStringsInExpr e).map fun h => (v.name, h)
-    | .rec_ ps    => ps.flatMap fun (v, e) => (unrepStringsInExpr e).map fun h => (v.name, h)
+    | .nonRec v e => (unrepLitsInExpr e).map fun l => (v.name, l)
+    | .rec_ ps    => ps.flatMap fun (v, e) => (unrepLitsInExpr e).map fun l => (v.name, l)
+
+/-- `(owner bind, hex bytes)` for every STRING literal with no faithful Lean
+    image. -/
+def unrepresentableStringLiterals (p : Program) : List (Name × String) :=
+  (unrepLitsInProgram p).filterMap fun (n, l) =>
+    match l with
+    | .litStringUnrepresentable hex => some (n, hex)
+    | _                             => none
+
+/-- `(owner bind, code point)` for every `Char` literal with no faithful Lean
+    image — a lone surrogate U+D800–DFFF, which Haskell's `Char` has and Lean's
+    does not. -/
+def unrepresentableCharLiterals (p : Program) : List (Name × String) :=
+  (unrepLitsInProgram p).filterMap fun (n, l) =>
+    match l with
+    | .litCharUnrepresentable cp => some (n, cp)
+    | _                          => none
 
 /-- The refusal message for one `unrepresentableStringLiterals` pair. -/
 def unrepresentableStringLiteralError (owner : Name) (hex : String) : String :=
@@ -3695,6 +3742,27 @@ def unrepresentableStringLiteralError (owner : Name) (hex : String) : String :=
   s!"  Remedy: remove the surrogate from the literal (`\\55296` and friends), or\n" ++
   s!"  represent the text as the byte/code-point list you actually mean.\n" ++
   s!"  Note: NUL is NOT this case — `\"a\\0b\"` transpiles faithfully as 3 chars."
+
+/-- The refusal message for one `unrepresentableCharLiterals` pair.
+
+    SEPARATE from the string one on purpose. A string's loss is a byte-encoding
+    fact and its message is mostly about modified UTF-8 — the overlong NUL, the
+    lenient decode, the repair. NONE of that applies to a `Char`: the code point
+    arrives intact in the CBOR and the loss is `T.singleton`'s `safe`. Sharing
+    one message would have told a user with a surrogate `Char` literal to go look
+    at bytes that were never the problem. -/
+def unrepresentableCharLiteralError (owner : Name) (cp : String) : String :=
+  s!"char literal not representable: code point `{cp}` in bind `{owner}`\n" ++
+  s!"  A Haskell `Char` spans [0,0x10FFFF] INCLUDING the 2048 SURROGATES\n" ++
+  s!"  (U+D800–U+DFFF); a Lean `Char` excludes them. So this literal has no Lean\n" ++
+  s!"  value at all — not a different one. Emitting it would put U+FFFD (the\n" ++
+  s!"  REPLACEMENT CHARACTER) in the output: a legal, plausible-looking, WRONG\n" ++
+  s!"  `Char` that compiles. So transpilation is refused instead.\n" ++
+  s!"  Remedy: remove the surrogate from the literal (`\\55296` and friends), or\n" ++
+  s!"  represent the code point as the `Nat` you actually mean.\n" ++
+  s!"  Note: this is NOT about UTF-8 — unlike the string-literal refusal, no\n" ++
+  s!"  encoding or decoding is involved. `chr` is unmapped for the same reason\n" ++
+  s!"  (no total Lean function can be faithful on the surrogate range)."
 
 /-- Characters that continue (or qualify) a Lean identifier. A ctor-name
     occurrence flanked by one of these is part of a LONGER name — `mkPoint`,

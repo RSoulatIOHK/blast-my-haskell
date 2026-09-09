@@ -6996,9 +6996,13 @@ def ambConvDfunB : Bind :=
 -- only: they pin that the walk descends under a lambda/application and into a
 -- PATTERN (`LitAlt`), which `emitLiteralPattern` would otherwise emit. The
 -- pattern case is documentation of the walk, NOT evidence that a
--- pattern-position unrepresentable literal is caught end to end — no dump has
--- ever contained one (`LitChar` x0, zero value-position `LitString` in 35 dumps),
--- and `Lower` sits between parse and this check.
+-- pattern-position unrepresentable STRING literal is caught end to end — no dump
+-- has ever contained one (zero value-position `LitString` in 35 dumps), and
+-- `Lower` sits between parse and this check. AMENDED BY M4 TASK 4: the
+-- "`LitChar` x0" half of this claim is now FALSE, and the distinction matters.
+-- `CharOps.hs` puts `LitChar` in PATTERN position for real (`classify 'a' = 1`),
+-- so for `Char`s the pattern arm is live, observed, and covered end to end by
+-- the same refusal (see the Task 4 block).
 def unrepLone : Bind :=
   .nonRec {name := "lone", unique := 1, ty := .tyCon "String" [], role := .id}
     (.app (.var {name := "GHC.CString.unpackCStringUtf8#", unique := 2,
@@ -7338,5 +7342,371 @@ Point"). Now: transpile rc=0, elaborates with 0 errors, 5 theorems green.
 -- termination argument.
 example : litSegments "/- /- \"x -/ -/z"
         = [(false, ""), (true, "/- /- \"x -/ -/"), (false, "z")] := by rfl
+
+/-! ## M4 Task 4 — `Char` operations: two mappings, nine loud failures, and the
+    surrogate refusal
+
+    THE HEADLINE. This task maps almost nothing (`ord`, `isDigit`) and that IS
+    the result: the `Data.Char` surface is mostly unmappable without
+    silent-wrongness, and pinning WHICH parts and WHY is the deliverable. The
+    second half is the review handoff from Tasks 1/2: `MachChar` had the same
+    silent surrogate loss `MachStr` had, and this is the task where a real `Char`
+    literal first exists to trigger it.
+
+    OBSERVED NAMES, QUOTED, WITH THE NEGATIVES (`CharOps.hs`, GHC 9.2.7,
+    `grep -o '"name": "[^"]*"' /tmp/transpile-CharOps.json | sort -u`):
+      "name": "GHC.Base.ord"              -- x1
+      "name": "GHC.Unicode.isDigit"       -- x1
+      "name": "GHC.Classes.$fEqChar"      -- x1  (dict, erased by Lower)
+      "name": "GHC.Classes.$fOrdChar"     -- x1  (dict, erased by Lower)
+      "name": "GHC.Types.C#" / "C#"       -- the box, erased by Lower
+      "name": "Char" / "Char#"            -- both already in typeConMap
+    and from a throwaway probe of the unmappable surface:
+      "name": "GHC.Unicode.isAlpha" / "isUpper" / "isLower" / "isSpace"
+      "name": "GHC.Unicode.toUpper" / "toLower"
+      "name": "GHC.Char.chr"
+      "name": "GHC.Classes.min" / "GHC.Classes.max"
+    NEGATIVES, all measured 0-occurrence: `Data.Char.ord`, `Data.Char.isDigit`,
+    `Data.Char.chr`, `GHC.Char.ord`, `GHC.Char.isDigit`. THE PLAN GUESSED WRONG
+    IN BOTH DIRECTIONS — it hedged `Data.Char.*`/`GHC.Char.*` for `ord`/`isDigit`
+    and the truth is `GHC.Base.ord`/`GHC.Unicode.isDigit`; it guessed
+    `Data.Char.chr` and the truth is `GHC.Char.chr`. The rule behind the result:
+    `Data.Char` is a RE-EXPORT module, and Core names come from where a thing is
+    DEFINED. Consequence for the pins below — a `#guard valueMap
+    "Data.Char.isAlpha" == none` protects nothing, because that key can never
+    appear; the load-bearing pins are the `GHC.Unicode.*` / `GHC.Char.*` ones.
+
+    `C#` ERASURE ON A REAL `Char` LITERAL — WORKS, first time ever. The path
+    (`Lower.lean:33`, `:50-52`, `Maps.isUnwrappingDataCon`) existed since the
+    Int work but had never seen a `LitChar`. (The "35 prior dumps, all zero"
+    figure is INHERITED from the Tasks 1-2 blocks, not re-measured here; what IS
+    measured here is the corpus census below, and the fact that this task's own
+    fixtures are the first to be non-zero.)
+    Observed Core for `lone = '\55296'`:
+      "rhs": { "tag": "App",
+               "fun": { "tag": "Var", "var": { "name": "GHC.Types.C#" } },
+               "arg": { "tag": "Lit", "lit": { "tag": "LitChar", ... } } }
+    and the emitted Lean is `def lone : Char := '<one char>'` — the box gone, no
+    wrapper. `CharOps.hs` also puts a `Char` literal in PATTERN position
+    (`classify 'a' = 1`), which emits `| 'a' => (1 : Int)` and elaborates: the
+    first real-dump exercise of `emitLiteralPattern`'s `.litChar` arm, and of
+    `escapeLitChar`'s raw-non-ASCII path (`'é'`, `'٥'`), previously unit-only.
+
+    THE `MachChar` SURROGATE LOSS — BEFORE AND AFTER.
+    The predicate is NOT `MachStr`'s, and that is the one thing a reader must
+    take away. Reusing `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs` here
+    would be a guaranteed FALSE NEGATIVE on the only case it exists to catch: by
+    the time `T.singleton` has run the surrogate is already U+FFFD, and U+FFFD
+    round-trips UTF-8 perfectly, so the predicate answers "not lossy". The test
+    is therefore on the `Char` ITSELF (`isSurrogate c = ord c >= 0xD800 && <=
+    0xDFFF`), before `Text` can destroy it.
+    BEFORE (parent commit 2f6729a, `CharSurrogate.hs`, `lone = '\55296'`):
+      transpile rc=0, and
+        def lone : Char :=
+          '\65533'                      -- U+FFFD, emitted bytes `ef bf bd`
+      `lake build` GREEN. A legal, plausible-looking, WRONG `Char`.
+    AFTER: transpile rc=1, no `Generated/CharSurrogate.lean`, no `.map.json`,
+      error: char literal not representable: code point `U+D800` in bind `lone`
+    SCHEMA — same channel as Task 2, per-tag evidence. `"unrepresentable"` is
+    present iff the literal has no faithful Lean image; PRESENCE is the flag and
+    the content is the evidence. The CONTENT differs by tag on purpose, so the
+    two can never be misread for one another: BYTES (`"78 ed a0 80 79"`) for
+    `LitString`, whose loss is a byte-encoding fact, and a CODE POINT
+    (`"U+D800"`) for `LitChar`, whose loss is not — no UTF-8, no overlong NUL, no
+    decode is involved. Hence two constructors and two messages.
+    THE CBOR IS LOSSLESS, and this arm proves it: `U+D800` can only be REPORTED
+    if the true code point survived `Codec.Serialise` and `GhcDump.Convert`, so
+    `T.singleton` was the only lossy step. Two-shim control over the same saved
+    `CharSurrogate.pass-0000.cbor`: the JSONs differ by EXACTLY
+    `+ "unrepresentable": "U+D800",` and nothing else.
+    `Parse` reads the FLAG FIRST, mirroring Task 2's hardening but for a sharper
+    reason. There the type-coupled read was a future-schema hedge; here it is the
+    live hazard — `value` for a flagged `LitChar` is U+FFFD, an ordinary
+    ONE-character string, so the `[c]` single-char read SUCCEEDS and would
+    quietly yield `.litChar '\65533'`. Order is what makes `value` provably
+    irrelevant rather than accidentally harmless. -/
+
+-- THE TWO MAPPINGS, under their OBSERVED keys.
+#guard valueMap "GHC.Base.ord" == some "(fun c => (c.toNat : Int))"
+#guard valueMap "GHC.Unicode.isDigit" == some "Char.isDigit"
+-- No bare alphabetic keys, per this map's standing rule (a user's own `ord`/
+-- `isDigit` is a bare Core name and must keep resolving to their def).
+#guard valueMap "ord" == none
+#guard valueMap "isDigit" == none
+
+-- LOUD-FAIL BOUNDARY GUARDS — the task's soundness core. Lean v4.24 is
+-- ASCII-ONLY for all six predicates/case-mappers while Haskell is Unicode-aware,
+-- so the mismatch set is the COMPLEMENT of what spec §M4 assumed. Measured both
+-- sides: `isAlpha 'é'` = True (Haskell) / false (Lean); same for `isUpper 'É'`,
+-- `isLower 'é'`, `toUpper 'é'`, `toLower 'É'`; `isSpace` differs on `\v`, `\f`
+-- and NBSP. Mapping ANY of them would be SILENT-WRONG — a total Lean function
+-- that compiles and answers differently. A faithful version needs `base`'s
+-- general-category tables, which is out of scope, not a small omission.
+--
+-- `chr` is worse than a mismatch: Haskell's `Char` INCLUDES the 2048 surrogates
+-- and Lean's excludes them, so `chr 0xD800` is `'\55296'` in Haskell while
+-- `Char.ofNat 0xD800` is `'\0'` in Lean — a DEFINED Haskell value mapped to a
+-- different one. No total Lean function is faithful, so it is not a
+-- ⊥-refinement (the project's allowed tradeoff) but silent-wrong (never
+-- allowed). Only `n < 0` and `n >= 0x110000` are genuinely ⊥. Note `ord` maps
+-- and `chr` does not, which is not an inconsistency: every LEAN `Char` has a
+-- faithful Haskell image, so the gap enters only through CONSTRUCTION.
+--
+-- These are the pins that BITE, because these are the keys GHC actually emits.
+#guard valueMap "GHC.Unicode.isAlpha" == none
+#guard valueMap "GHC.Unicode.isUpper" == none
+#guard valueMap "GHC.Unicode.isLower" == none
+#guard valueMap "GHC.Unicode.toUpper" == none
+#guard valueMap "GHC.Unicode.toLower" == none
+#guard valueMap "GHC.Unicode.isSpace" == none
+#guard valueMap "GHC.Char.chr"        == none
+-- The plan's hedged spelling, pinned as the plan asks — but labelled honestly:
+-- these are 0-occurrence keys (`Data.Char` re-exports; Core names come from the
+-- defining module), so they are TRIVIALLY true and protect nothing. They are
+-- here so a reader who arrives with the plan in hand sees the keys it named and
+-- the note that they are the wrong ones, rather than concluding the pin is
+-- missing.
+#guard valueMap "Data.Char.isAlpha" == none
+#guard valueMap "Data.Char.isUpper" == none
+#guard valueMap "Data.Char.isLower" == none
+#guard valueMap "Data.Char.toUpper" == none
+#guard valueMap "Data.Char.toLower" == none
+#guard valueMap "Data.Char.isSpace" == none
+#guard valueMap "Data.Char.chr"     == none
+-- `min`/`max` AT `Char` (plan correction 5) — a DOCUMENTED NEGATIVE, comment
+-- plus these two pins, and deliberately NOT a Lean witness: `example : Min Char
+-- := inferInstance` does not compile, so the only way to "test" it is to break
+-- the build. The mapping itself is correct and stays (`Min.min`/`Max.max` are
+-- right at every type that has the instance); it is `Char` that has none in
+-- v4.24. So this is a LOUD failure at `lake build`, not a transpiler bug, and it
+-- is measured, not assumed — a probe emitting `def mn : (Char → (Char → Char))
+-- := Min.min` gave exactly:
+--     error: failed to synthesize
+--       Min Char
+-- The same probe pinned the other seven as `Unknown identifier
+-- `GHC.Unicode.isAlpha`` (and so on, all seven). That is what "loud" means here:
+-- nine names, nine build failures, zero wrong answers.
+#guard valueMap "GHC.Classes.min" == some "Min.min"
+#guard valueMap "GHC.Classes.max" == some "Max.max"
+-- Everything else the `Ord` recipe asks for DOES synthesize at `Char`, which is
+-- why the fixture's `==`/`<`/`<=` theorems are green: the 8 binders in
+-- `classConMap "Ord"` minus `Min`/`Max`, plus `Inhabited Char` = `'A'`.
+#guard classConMap "Ord" == some ["[Ord {t}]", "[LT {t}]", "[LE {t}]",
+                                  "[DecidableLT {t}]", "[DecidableLE {t}]",
+                                  "[Min {t}]", "[Max {t}]", "[BEq {t}]"]
+
+-- EMISSION of an unrepresentable `Char`, loud in BOTH positions. Value position
+-- is unreachable post-refusal (defence in depth, as for strings); PATTERN
+-- position is a LIVE route for `Char`s specifically — `f '\55296' = ...` is
+-- ordinary Haskell and `LitAlt (MachChar ...)` is observed — so the pattern arm
+-- is a real backstop, not a hedge.
+#guard emitLiteral (.litCharUnrepresentable "U+D800")
+        == "(GHCCore.unrepresentableCharLiteral \"U+D800\")"
+#guard emitLiteralPattern (.litCharUnrepresentable "U+DFFF")
+        == "(GHCCore.unrepresentableCharLiteral \"U+DFFF\")"
+-- `GHCCore.unrepresentableCharLiteral` is DELIBERATELY UNDEFINED (like its
+-- string sibling): an emitter that skipped the refusal must fail `lake build`
+-- with a name that quotes the code point, never produce `'\65533'`.
+
+-- PARSING the flag: absent means faithful, present means refusable. The second
+-- guard is the live hazard — `value` is a one-character U+FFFD string that the
+-- single-char read would have ACCEPTED, so it pins the ORDER, not just the flag.
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "A")]) with
+        | .ok (.litChar c) => c == 'A'
+        | _                => false)
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "�"),
+           ("unrepresentable", "U+D800")]) with
+        | .ok (.litCharUnrepresentable cp) => cp == "U+D800"
+        | _                                => false)
+-- Present-but-non-String is an ERROR, not an absorbed `.litChar`: the same
+-- type-coupled-read hardening Task 2's review added on the string side.
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "�"),
+           ("unrepresentable", (7 : Nat))]) with
+        | .error _ => true
+        | _        => false)
+-- Non-ASCII faithful literals still parse as themselves (the `'٥'` in the
+-- fixture, and a non-BMP char to show the channel is not "refuse everything
+-- exotic").
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "٥")]) with
+        | .ok (.litChar c) => c.toNat == 0x665
+        | _                => false)
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "💩")]) with
+        | .ok (.litChar c) => c.toNat == 0x1F4A9
+        | _                => false)
+
+-- THE REFUSAL, named by owner bind. BOTH POSITIONS ARE END-TO-END here, which is
+-- the sharpest contrast with the string side: `CharSurrogate.hs` carries two
+-- binds — `lone = '\55296'` (value) and `f '\55296' = 1` (PATTERN) — and the
+-- real fixture exits 1 with TWO error lines, naming bind `lone` and bind `f`,
+-- producing no `.lean`. The pattern bind was measured refusing in ISOLATION
+-- first, so it is not carried by the value-position one. `unrepCharNested` below
+-- stays a unit guard: it pins that the ONE traversal descends under a
+-- lambda/application, a shape no fixture happens to produce.
+def unrepCharLone : Bind :=
+  .nonRec {name := "lone", unique := 1, ty := .tyCon "Char" [], role := .id}
+    (.app (.var {name := "GHC.Types.C#", unique := 2,
+                 ty := .tyCon "_Unknown" [], role := .id})
+          (.lit (.litCharUnrepresentable "U+D800")))
+def unrepCharNested : Bind :=
+  .nonRec {name := "deep", unique := 3, ty := .tyCon "Char" [], role := .id}
+    (.lam {name := "x", unique := 4, ty := .tyCon "Int" [], role := .id}
+      (.app (.var {name := "f", unique := 5, ty := .tyCon "_Unknown" [], role := .id})
+            (.lit (.litCharUnrepresentable "U+DC00"))))
+def unrepCharInPattern : Bind :=
+  .nonRec {name := "matched", unique := 6, ty := .tyCon "Int" [], role := .id}
+    (.case_ (.var {name := "c", unique := 7, ty := .tyCon "Char" [], role := .id})
+            {name := "wild", unique := 8, ty := .tyCon "Char" [], role := .id}
+            (.tyCon "Int" [])
+            [.mk (.litAlt (.litCharUnrepresentable "U+DFFF")) []
+                 (.lit (.litInt 1))])
+def faithfulChar : Bind :=
+  .nonRec {name := "fine", unique := 9, ty := .tyCon "Char" [], role := .id}
+    (.lit (.litChar '٥'))
+
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharLone], typeDecls := [], instances := []}
+       == [("lone", "U+D800")]
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharNested], typeDecls := [], instances := []}
+       == [("deep", "U+DC00")]
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharInPattern], typeDecls := [], instances := []}
+       == [("matched", "U+DFFF")]
+-- A faithful non-ASCII `Char` is NOT flagged — the refusal is about the
+-- surrogate range, not about being exotic.
+#guard unrepresentableCharLiterals
+         {binds := [faithfulChar], typeDecls := [], instances := []}
+       == []
+#guard unrepresentableCharLiterals
+         {binds := [faithfulChar, unrepCharLone, unrepCharNested],
+          typeDecls := [], instances := []}
+       == [("lone", "U+D800"), ("deep", "U+DC00")]
+
+-- ONE TRAVERSAL, TWO VIEWS. This is the guard that makes the refactor honest:
+-- a program carrying BOTH kinds is reported by both views, each seeing only its
+-- own kind and neither swallowing the other. The failure mode this rules out is
+-- a second walker added beside the first and then forgotten when a third
+-- unrepresentable constructor arrives — a silent hole in a refusal.
+#guard unrepresentableStringLiterals
+         {binds := [unrepCharLone, unrepLone], typeDecls := [], instances := []}
+       == [("lone", "78 ed a0 80 79")]
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharLone, unrepLone], typeDecls := [], instances := []}
+       == [("lone", "U+D800")]
+
+-- The message names the bind and the CODE POINT, says SURROGATE, and explicitly
+-- disclaims the UTF-8 story that the string message is made of — the two are
+-- separate so that a user with a surrogate `Char` is not sent to look at bytes
+-- that were never the problem.
+def unrepCharMsg : String := unrepresentableCharLiteralError "lone" "U+D800"
+#guard (unrepCharMsg.splitOn "code point `U+D800` in bind `lone`").length == 2
+#guard (unrepCharMsg.splitOn "SURROGATES").length == 2
+#guard (unrepCharMsg.splitOn "NOT about UTF-8").length == 2
+-- And it is NOT the string message: sharing one would have been the easy bug.
+#guard unrepCharMsg != unrepresentableStringLiteralError "lone" "U+D800"
+
+/-! ### M4 Task 4 — e2e and byte-identity
+
+    `CharOps.hs`: 18 theorems, ALL GREEN, `lake build
+    GhcCoreToLean.Generated.CharOps` rc=0. Tactics per the plan's measured table,
+    and the table held with one useful addition:
+      * `blaster` x5, all `✅ Valid` — `Char` equality (`sameChar_refl`), the
+        symbolic law `∀ (a b : Char), sameChar a b = sameChar b a`
+        (`sameChar_sym`), ordering (`charLess_digit_letter`), the symbolic
+        `∀ (c : Char), charLE c c = true` (`charLE_refl`), and the `Nat → Char →
+        Nat` ROUND-TRIP `∀ n, n < 128 → charCode (Char.ofNat n) = (n : Int)`.
+        The round-trip is the one that extends the table: correction 6 measured
+        the bare `(Char.ofNat n).toNat = n` shape, and this one carries the
+        `Nat → Int` coercion `ord`'s mapping introduces — blaster handles it.
+      * `rfl` x13 — every concrete goal: the four literals (incl. `'é'` and
+        `'٥'`), both `ord` pins, the five `isDigit` pins, the three `classify`
+        pattern-match pins.
+      * `decide` was NOT needed anywhere, and is NOT usable for the symbolic
+        goals: `∀ c : Char` has no `Decidable` instance in v4.24. `simp` was not
+        needed either — this fixture has no `∀ (cs : List Char)` law (that shape
+        is `StringBasics.shout_len`, and blaster hard-fails on it).
+    The `'٥'` pin is the load-bearing semantic one: U+0665 ARABIC-INDIC DIGIT
+    FIVE is a Unicode digit that `isDigit` rejects on BOTH sides, which is the
+    agreement that makes it the only mappable predicate. It is also the fixture's
+    non-ASCII emission test.
+
+    BYTE-IDENTITY, two-binary, CBOR HELD FIXED (the shim is a post-dump
+    translator, so replaying saved `pass-0000.cbor` is the whole method). Both
+    the shim AND the transpiler changed, so both pairs were saved and replayed.
+    13 modules replayed: `Fib`, `ListLiterals`, `RecordOps`, `UserClass`,
+    `OrdHandwritten`, `TupleBasics`, `Ratio`, `StringBasics`, `StringCtorClash`,
+    `SpecComment`, `StringSurrogate` (11 identical) and `CharOps`,
+    `CharSurrogate` (2 intentionally different). Identical means all four of
+    emitted `.lean`, transpiler stderr, rc, AND shim JSON. Harness validated
+    first, the same way Task 2 did it: its replay output plus `transpile.sh`'s
+    appended `end <mod>` line is byte-identical to the live
+    `Generated/StringBasics.lean`, so the harness introduces no drift.
+    THE 11 ZEROES ARE PROVEN, NOT ARGUED. A census of the change surface over
+    the same 13 saved JSONs — `LitChar`, `GHC.Base.ord`, `GHC.Unicode.isDigit`,
+    the only three things this commit can react to — is 0/0/0 for every module
+    that came out identical, and non-zero for exactly the two that differ
+    (`CharOps` 6/1/1, `CharSurrogate` 1/0/0). The traversal refactor's blast
+    radius is covered by `Ratio` (54 `LitString`s), `StringBasics` and
+    `StringCtorClash` specifically.
+    `CharOps`'s SIX `LitChar`s are worth naming: four in value position
+    (`letterA`, `digitZero`, `accent`, `arabicFive`) and TWO in pattern position
+    (`classify`'s `'a'` and `'b'`) — the value/pattern split this task cares
+    about, present in one ordinary fixture.
+    The two intended diffs, quoted: `CharOps` differs by exactly the two
+    mappings (`GHC.Base.ord` → `(fun c => (c.toNat : Int))`,
+    `GHC.Unicode.isDigit` → `Char.isDigit`) and nothing else; `CharSurrogate`
+    differs by rc 0→1, the loss of a `.lean` that used to contain
+    `def lone : Char := '\65533'`, and the shim JSON gaining the flag.
+    The corpus therefore CANNOT prove the new shim ran, exactly as in Task 2, and
+    Task 2's positive control is now STALE — `strings <binary> | grep -c
+    unrepresentable` no longer discriminates, because Task 2 put that key in the
+    pre-binary. The control that does work here is direct and per-tag: over the
+    saved `CharSurrogate.pass-0000.cbor` the two shims' JSON differs by exactly
+    `+ "unrepresentable": "U+D800",`; `find shim/dist-newstyle -name
+    ghc-core-shim` returns exactly ONE candidate (what `transpile.sh:127`
+    resolves) whose mtime postdates `Main.hs`; and the live pipeline's
+    `/tmp/transpile-CharSurrogate.json` carries the field.
+
+    HANDOFFS FOR TASK 5.
+    * EXPECTED REDS gain a fifth must-fail fixture: `examples/haskell/
+      CharSurrogate.hs` — rc=1, no `.lean`, message naming bind `lone` and code
+      point `U+D800`. It sits alongside `StringSurrogate.hs` and the four class
+      fixtures, and like them is EXCLUDED from the green-regression count.
+    * README limitations, each now measured rather than predicted, with the exact
+      build errors to quote: seven `Unknown identifier` (`GHC.Unicode.isAlpha`,
+      `isUpper`, `isLower`, `isSpace`, `toUpper`, `toLower`, `GHC.Char.chr`) and
+      two `failed to synthesize` (`Min Char`, `Max Char`). Note the README should
+      say `GHC.Unicode.*`/`GHC.Char.*`, NOT `Data.Char.*` — the plan's
+      spelling is 0-occurrence.
+    * SPEC CORRECTION 1 needs a second amendment, not just the Task-2 one: its
+      claim that the shim's `LitChar` arm is "already complete and lossless" was
+      measured FALSE and is now FIXED, and correction 3's `chr` verdict is
+      confirmed with the observed key `GHC.Char.chr` (the spec and plan both say
+      `Data.Char.chr`, which never appears).
+    * CORRECTION 6's table can be EXTENDED, not just recorded: the `Nat → Char →
+      Nat` round-trip verifies with blaster even with the `Nat → Int` coercion
+      in it. Still no `List Char` goal anywhere — untested by this task and
+      unchanged.
+    * `GHC.Base.chr` was never probed (only `GHC.Char.chr` was observed). If a
+      future dump shows it, it needs the same `== none` pin. Recorded as an
+      unprobed name, not as a negative.
+    * `Char` RANGES are SAFE-BY-ACCIDENT and worth a README line, because
+      `['a'..'z']` is the first thing a user writing `Char` code reaches for and
+      nothing in this task touched ranges. Measured: it transpiles (rc=0) to
+      `((Hs.enumFromTo) ('a')) ('e')` — `GHC.Enum.enumFromTo` was already mapped
+      and the `GHC.Enum.$fEnumChar` dict is erased by `Lower` — and then fails
+      LOUD at `lake build`, because `Hs.enumFromTo` is MONOMORPHIC on `Int`
+      (`Runtime.lean:20`): "Application type mismatch: 'a' has type Char but is
+      expected to have type Int". So the outcome is right, but it is guaranteed
+      by a signature nobody chose for this reason — anyone generalising
+      `Hs.enumFromTo` to an `Enum`-like class would silently turn a `Char` range
+      into whatever that instance does, and Haskell's `Enum Char` is
+      `chr`-based, i.e. exactly the unfaithful direction (correction 3). Pin it
+      before generalising. -/
 
 end GhcCoreToLean.Tests
