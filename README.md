@@ -140,6 +140,16 @@ Notes:
   `instance : BEq CustomRatio where` would read `where` as an argument and
   rewrite a *type* to a constructor.
 
+Three Lean lexical forms are **refused** inside a spec block, by name and before
+anything is emitted: a **raw string** (`r"…"`), an **interpolated string**
+(`s!"…"`), and a **guillemet identifier** (`«…»`). The constructor
+auto-qualification above is a text rewrite guarded by a scanner that masks string
+literals and comments; those three forms desync that mask, and the desync is
+silent — a constructor name inside a *string literal* gets rewritten, so the
+theorem elaborates and proves a property of a string nobody wrote (all three
+measured). Ordinary literals and comments in spec text are fine and stay
+verbatim. Must-fail fixture: `examples/haskell/SpecInterp.hs`.
+
 ## VS Code extension (optional)
 
 `vscode-extension/` provides a "verify" command that runs the pipeline and shows
@@ -494,6 +504,36 @@ Development Host.)
   quantified over element variables (`sumList [a] = a`) or over a list whose
   shape the statement fixes (`pairUp xs [] = []`). Concrete-value properties
   also close with `by decide`.
+- **A property about a *recursive* definition is verified modulo an unproved
+  termination argument.** Any def whose body references itself is emitted with
+  `decreasing_by all_goals sorry` (`GhcCoreToLean/Emit.lean:769`): the
+  transpiler supplies no termination argument at all, and does not attempt
+  Lean's structural check. That `sorry` sits *inside the definition*, so it
+  taints every theorem about it — the theorem depends on `sorryAx`, which
+  yields `False`, and a `✅ Valid` on it therefore carries no logical guarantee
+  on its own. `#print axioms` is how to check, and it is worth doing on any
+  property you intend to rely on:
+
+    ```
+    #print axioms FibComplex.correct_fib
+    -- 'FibComplex.correct_fib' depends on axioms: [sorryAx, Blaster.Tactic.blasterProven]
+    #print axioms Ratio.falty_addRatio_commutative
+    -- 'Ratio.falty_addRatio_commutative' depends on axioms: [Blaster.Tactic.blasterProven]
+    ```
+
+  A **non-recursive** def is unaffected: the second pair above is the clean case
+  (`falty_addRatio_commutative` is about a non-recursive `addRatio`), and
+  `Blaster.Tactic.blasterProven` is the solver's own axiom, not this one. To see
+  which of your modules are affected, `grep decreasing_by` in the generated
+  output; the recursive *def* itself reports `[sorryAx]` too
+  (`#print axioms Ratio.gcdInt`). Note that the hazard is already handled in the
+  one place it would be worst: the `Ord`/`Eq` bodies spliced into the data block
+  are emitted with `recOverride := some false`, i.e. **no** `decreasing_by`, so
+  no `sorry` can land under an instance and taint every `decide` proof about the
+  order — those bodies must pass Lean's structural check instead, and fail loud
+  if they cannot. Extending that to user defs — structural recursion where it
+  holds, a measure where it does not, a loud failure otherwise — is a separate
+  work item, not something this milestone claims.
 - **Verification caveat at `Char` and `List Char`** (a solver limit, not a
   transpiler one — the milestone's deliverable is transpile fidelity). `Char`
   *scalars* verify well: equality, ordering, `compare` and a `Nat → Char → Nat`

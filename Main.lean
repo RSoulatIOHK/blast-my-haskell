@@ -310,6 +310,37 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for (owner, cp) in unrepChars do
         IO.eprintln s!"error: {Emit.unrepresentableCharLiteralError owner cp}"
       return 1
+    -- Refuse a `@lean` spec block written in a Lean lexical form the ctor-rewrite
+    -- scanner cannot classify: a raw string, an interpolated string, or a
+    -- guillemet identifier. On those forms `Emit.litSegments` DESYNCS in the
+    -- silent direction — a string literal's content is read as code and a
+    -- constructor name inside it is rewritten, so the theorem elaborates and
+    -- proves a property of a string the user never wrote (all three MEASURED;
+    -- see Emit's "The refusal that replaces the last hedge"). Detect-and-refuse
+    -- rather than one more scanner state: three forms with this signature were
+    -- found one at a time, so a per-form state is a fix only for the forms
+    -- already found.
+    --
+    -- THE SPECS ARE LOADED HERE, not at emission, and that placement is the
+    -- point: the block above promises "BEFORE any emission", and a second
+    -- refusal site after the file is written would break it.
+    --
+    -- LAST of the refusals. Like the two literal ones above (and unlike the
+    -- collision/ambiguity pair, whose ORDER is load-bearing) it reads nothing
+    -- from the program, so it could sit anywhere among them; last is a
+    -- deliberate choice rather than a constraint — a module whose CODE is
+    -- refused should hear about the code first, since its spec text may be moot.
+    -- Per BLOCK (each block is resolved separately below, so a desync cannot
+    -- cross one), and every offending block is named before the return.
+    let specs ← loadSpecs moduleName
+    let desyncBlocks := specs.filterMap fun (hsStart, hsEnd, raw) =>
+      match Emit.desyncCapableSpecForms raw.trim with
+      | []    => none
+      | forms => some (hsStart, hsEnd, forms)
+    if !desyncBlocks.isEmpty then
+      for (hsStart, hsEnd, forms) in desyncBlocks do
+        IO.eprintln s!"error: {Emit.specTextDesyncError hsStart hsEnd forms}"
+      return 1
     -- Name every instance `emitInstanceUser` is about to SKIP, and the method
     -- that costs it. Not a refusal (the skip is already loud at `lake build`, as
     -- `failed to synthesize`, and refusing would newly reject modules whose
@@ -410,7 +441,6 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let depImports := String.join (imports.map (s!"import {·}\n"))
     let header     := s!"import Lean\nimport Blaster\nimport GhcCoreToLean.Runtime\n{depImports}\n"
     let pre := header ++ nsOpen ++ crib ++ body ++ "\n"
-    let specs ← loadSpecs moduleName
     let mut out := pre
     let mut leanCursor := (pre.splitOn "\n").length
     let mut blocks : List (Nat × Nat × Nat × Nat) := []   -- hsS hsE leanS leanE

@@ -3917,15 +3917,37 @@ ways:
     fixed needle (` C (`) can no longer span a comment, so it degrades to a
     skipped rewrite.
   * NOT RULED OUT, a LEAK — literal content read as code, which is the silent
-    shape. Two Lean lexical forms this scanner does NOT model can produce one. A
-    RAW string literal (`r"a\"` is the two characters `a\`, not an escape) is read
-    here as an escape and runs on, so a following real literal's content can be
-    classified as code. An INTERPOLATION with a nested literal (`s!"{f "y"}"`)
-    closes the outer literal on the inner literal's opening quote. Both parse in
-    Lean 4.24.0 (measured). Neither occurs anywhere in the corpus, and a desync
-    cannot cross `@lean` blocks — `Main.lean:400-407` resolves each block
-    separately — but a spec block that used either would be silent-wrong
-    territory, and the fix for it is another state, not another hedge.
+    shape. AT LEAST THE FOLLOWING Lean lexical forms this scanner does not model
+    can produce one; the list is open-ended, and that is the whole point of the
+    refusal below. A RAW string literal (`r"a\"` is the two characters `a\`, not
+    an escape) is read here as an escape and runs on, so a following real
+    literal's content can be classified as code. An INTERPOLATION with a nested
+    literal (`s!"{f "y"}"`) closes the outer literal on the inner literal's
+    opening quote. A GUILLEMET IDENTIFIER carrying a quote — `«a"b»` is a legal
+    Lean identifier, `def «a"b» : Nat := 1` elaborates in 4.24.0 (measured) —
+    opens a literal on that quote. All three parse in 4.24.0 (measured), and all
+    three leak IDENTICALLY through `resolveSpecText`:
+
+        resolveSpecText [pointDecl] [] "theorem t : x = r\"a\\\" ++ \"Point (1)\""
+          → "theorem t : x = r\"a\\\" ++ \"Point.Point (1)\""
+        resolveSpecText [pointDecl] [] "theorem t : x = s!\"{f \"Point (1)\"}\""
+          → "theorem t : x = s!\"{f \"Point.Point (1)\"}\""
+        resolveSpecText [pointDecl] [] "theorem t : «a\"b» = 1 ∧ label = \"Point (1)\""
+          → "theorem t : «a\"b» = 1 ∧ label = \"Point.Point (1)\""
+
+    An earlier version of this comment said there were TWO such forms and that
+    "the fix is another state, not another hedge". The third one (found by the M4
+    gate review, measured above) is the counter-evidence: the family is not
+    bounded by a form the author happens to have thought of, so adding a state
+    per discovery cannot terminate, and the NEXT undiscovered form would be
+    silent exactly like these three were. So the fix is NEITHER a state nor a
+    hedge: `desyncCapableSpecForms` below DETECTS these forms in user-authored
+    spec text and `Main.lean` REFUSES the module — a scanner that cannot be
+    complete is made to fail loud on the inputs it cannot classify. None of the
+    three occurs in any corpus module that transpiles (the one that carries one,
+    `examples/haskell/SpecInterp.hs`, is a MUST-FAIL fixture for this refusal),
+    and a desync cannot cross `@lean` blocks — `Main.lean` resolves each block
+    separately — so the refusal is per block.
 -/
 
 /-- The scanner's lexical state. `block d` means `d + 1` block-comment openers are
@@ -4006,6 +4028,151 @@ private def litScan : List Char → LexState → String → List (Bool × String
     `Tests/Unit.lean`). See the section header for the state machine. -/
 def litSegments (src : String) : List (Bool × String) :=
   litScan src.data .code ""
+
+/-! ### The refusal that replaces the last hedge
+
+`litScan` models four of Lean's lexical states and Lean has more, so on
+USER-AUTHORED spec text it can DESYNC — see the section header above for the two
+directions and the three MEASURED leak forms (a raw string, an interpolation with
+a nested literal, a guillemet identifier carrying a quote). The leak direction is
+silent: literal content read as code, so a ctor name INSIDE a string literal gets
+rewritten and the theorem is about a different string than the one written.
+
+THE DECISION: detect and refuse, not one more state. Three forms with the same
+signature were found one at a time, two of them by review, and each was
+"the last one" until the next; a per-form state is a fix for the forms already
+found and no fix at all for the next. So the forms are detected here and
+`Main.lean` refuses the module before anything is written.
+
+WHY THIS IS NOT CIRCULAR (detecting a desync with the scanner that desyncs).
+`litSegments` is CORRECT on all text preceding the FIRST desync-capable form —
+that is what the differential fuzz established for the four states it does model
+— so the first such form is always observed in a correctly-classified position,
+and one hit is enough to refuse. What happens to text AFTER the first hit does
+not matter: the block is already refused.
+
+The one thing this does NOT detect is a form sitting after a MASK-direction
+degradation (an unterminated string literal or block comment classifies the tail
+as verbatim, so a form in that tail is invisible here). That needs no detection:
+the tail is copied verbatim, so no rewrite is made there at all, and the
+unterminated delimiter is a Lean syntax error on the very block that carries it.
+
+The detection is FORM-shaped, not consequence-shaped: it fires on the form
+whether or not the block also mentions a local constructor. Two reasons. The ctor
+set is a property of the MODULE, so the same block text would refuse in one module
+and pass in another, and adding a constructor elsewhere in the file could flip a
+passing property to refused — not a rule a user can hold in their head. And
+deciding whether a block mentions a ctor in a position that MATTERS means deciding
+which occurrences are inside a literal, which is the exact question the desync
+makes the scanner answer wrongly; a test built on that answer inherits the error.
+(A crude ctor-substring test avoids the circularity but not the module-dependence,
+and it would still refuse every hazardous block this one does.)
+-/
+
+/-- Characters that continue a Lean identifier for the purposes of the two
+    OPENER tests below: `isIdentish` plus `!` and `?`, which Lean admits inside a
+    name (`Option.get!`, `List.get?`). This is what makes `get!"x"` and `f r"x"`
+    the only false positives of those tests rather than every `get! "x"` and
+    `f r "x"` in ordinary spec text: with a SPACE the code segment ends in the
+    space, and without one the text IS the Lean spelling of the hazardous form. -/
+private def isNameChar (c : Char) : Bool :=
+  isIdentish c || c == '!' || c == '?'
+
+/-- Does this CODE segment end in the opener of a RAW string literal, i.e. is the
+    string literal that follows it `r"…"` / `r#"…"#` rather than `"…"`? Trailing
+    `#`s are dropped first (`r#"hi"#` elaborates in 4.24.0 — measured), and the
+    `r` must start a token, so `numerator"`, `Foo.r"` and `xr"` do not match. -/
+private def rawStringOpener (code : String) : Bool :=
+  match code.data.reverse.dropWhile (· == '#') with
+  | ['r']         => true
+  | 'r' :: c :: _ => !isNameChar c
+  | _             => false
+
+/-- Does this CODE segment end in the prefix of an INTERPOLATED string literal
+    (`s!"…"`, `m!"…"`, `f!"…"`)? The `!` must be adjacent to the following quote
+    AND preceded by a name character: a bare `!"…"` is `not` applied to a
+    literal, which is no interpolation and desyncs nothing. -/
+private def interpolationOpener (code : String) : Bool :=
+  match code.data.reverse with
+  | '!' :: c :: _ => isNameChar c
+  | _             => false
+
+/-- Is a GUILLEMET identifier split across this CODE segment's boundary? In
+    well-formed Lean every `«` in code position has its `»` in the same code
+    position, so an imbalance means the scanner ended the segment INSIDE the
+    identifier — which is exactly the desync, and it covers every hazardous
+    payload at once: the measured `«a"b»`, and equally `«a--b»` or a `«…»` name
+    carrying a block-comment opener, neither of which was ever measured.
+
+    ITS ONE KNOWN FALSE POSITIVE, stated rather than papered over: a guillemet
+    CHAR LITERAL (`c = '«'`). `litScan` copies a simple char literal into the
+    code segment, so the count is 1/0 and this fires — on text that desyncs
+    NOTHING. Measured absent from the corpus (0 of its 197 spec blocks), and no
+    carve-out is made for it: the test would have to know which `'` is a
+    delimiter and which is an identifier's trailing tick, which is the same
+    lexical guessing this whole refusal exists to stop. A property that needs
+    that character can spell it `Char.ofNat 171`. -/
+private def guillemetSplit (code : String) : Bool :=
+  (code.data.filter (· == '«')).length != (code.data.filter (· == '»')).length
+
+/-- The three form names, spelled once so the guards, the refusal message and
+    this detector cannot drift apart. -/
+def rawStringFormName      : String := "raw string literal (`r\"…\"`)"
+def interpolationFormName  : String := "string interpolation (`s!\"…\"`)"
+def guillemetFormName      : String := "guillemet identifier (`«…»`)"
+
+/-- Every desync-capable Lean lexical form in one block of user-authored spec
+    text, by name, in a stable order and deduplicated. `[]` means `litSegments`
+    classifies this text with the four states it does model, so the ctor rewrite
+    is safe on it; a non-empty result is a REFUSAL (`Main.lean`).
+
+    Reads `litSegments`' own segmentation, which is what keeps it honest about
+    context: a `r"` or `s!"` or `«` sitting inside a real string literal or
+    inside a COMMENT is in a VERBATIM segment, desyncs nothing (a literal's
+    escapes are tracked; a comment's content is skipped wholesale) and is NOT
+    reported. The `startsWith "\""` test is load-bearing for the same reason —
+    comments are verbatim segments too, and without it `x = r-- note` would
+    refuse. -/
+def desyncCapableSpecForms (src : String) : List String :=
+  let segs := litSegments src
+  -- The two OPENER forms straddle a segment boundary: `litScan` puts the opening
+  -- `"` at the START of the literal segment, so the `r` / `s!` is the TAIL of the
+  -- preceding code segment. Hence the pairwise walk rather than a substring scan.
+  let openers := (segs.zip (segs.drop 1)).flatMap fun ((v1, s1), (v2, s2)) =>
+    if v1 || !v2 || !(s2.startsWith "\"") then []
+    else (if rawStringOpener s1 then [rawStringFormName] else [])
+      ++ (if interpolationOpener s1 then [interpolationFormName] else [])
+  -- The guillemet form is INSIDE a code segment, and its tell is the imbalance.
+  let guillemets :=
+    if segs.any (fun (v, s) => !v && guillemetSplit s) then [guillemetFormName] else []
+  dedup (openers ++ guillemets)
+
+/-- The refusal message for one spec block, naming the block by its HASKELL
+    source line range (the only coordinate a user can act on — the Lean file does
+    not exist yet), every form found, and the remedy.
+
+    A REFUSAL rather than a warning, unlike the emitter-side degradations that
+    only cost a skipped rewrite: this one is the SILENT direction. The theorem
+    would elaborate, `blaster` would print `✅ Valid`, and the property proved
+    would be about `"Point.Point (1)"` — a string the user never wrote. -/
+def specTextDesyncError (hsStart hsEnd : Nat) (forms : List String) : String :=
+  let formList := String.intercalate ", " forms
+  s!"spec text uses a lexical form the constructor rewrite cannot scan: \
+{formList}\n" ++
+  s!"  In the `@lean` block at {hsStart}-{hsEnd} of the source module.\n" ++
+  s!"  The name-resolution pass that qualifies a user constructor (`Point` →\n" ++
+  s!"  `Point.Point`) is a TEXT rewrite guarded by a scanner that masks string\n" ++
+  s!"  literals and comments. That scanner models four of Lean's lexical states;\n" ++
+  s!"  the form above is one it does NOT model, and on it the mask DESYNCS — the\n" ++
+  s!"  content of a following string literal is read as code and rewritten. That\n" ++
+  s!"  is the silent-wrong direction: `\"Point (1)\"` becomes\n" ++
+  s!"  `\"Point.Point (1)\"`, the theorem elaborates, and it proves a property of a\n" ++
+  s!"  string you did not write. So transpilation is refused instead.\n" ++
+  s!"  Remedy: rewrite the property without the raw string / interpolation /\n" ++
+  s!"  guillemet identifier — or, if the form is what the property is ABOUT, keep\n" ++
+  s!"  every constructor name of this module out of the string literals in it.\n" ++
+  s!"  Ordinary literals and comments in spec text are fine and stay verbatim;\n" ++
+  s!"  only these forms are refused."
 
 /-- Apply `f` to every CODE segment of `src`, copying string literals AND COMMENTS
     verbatim. THE guard on every bare-identifier rewrite: `f` never sees literal

@@ -30,6 +30,17 @@ accented = "caf\233"
 withNul :: String
 withNul = "a\0b"
 
+-- An APOSTROPHE inside a string literal — the most common hazardous character in
+-- real Haskell text, and the last of the emitter's escape arms with no fixture.
+-- `escapeLitChar` escapes `'` to `\'` in STRING position too, not just in char
+-- position, so the emitted literal reads `"don\'t"`; Lean accepts that escape
+-- inside a string (measured, 4.24.0: `"don\'t".toList = ['d','o','n','\'','t']`
+-- closes by `rfl`), which is why the escape is harmless rather than a syntax
+-- error. The pin below is on the CODE POINTS, so an escape that silently
+-- lengthened or dropped the character fails it.
+apostrophe :: String
+apostrophe = "don't"
+
 shout :: String -> String
 shout s = s ++ "!"
 
@@ -66,6 +77,10 @@ theorem withNul_val : withNul = ['a', '\x00', 'b'] := by rfl
 
 {- @lean
 theorem withNul_len : nameLen withNul = 3 := by rfl
+-}
+
+{- @lean
+theorem apostrophe_val : apostrophe = ['d', 'o', 'n', '\'', 't'] := by rfl
 -}
 
 {- @lean

@@ -7322,17 +7322,97 @@ Point"). Now: transpile rc=0, elaborates with 0 errors, 5 theorems green.
 #guard litSegments "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)"
        == [(false, "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)")]
 
--- THE TWO RESIDUAL LEAKS, pinned as KNOWN rather than argued away — this is the
--- silent direction, and it is still open. A RAW string literal (`r"a\"` is the
--- two characters `a\`, not an escape) and an INTERPOLATION with a nested literal
--- (`s!"{f "y"}"`) are Lean lexical forms this scanner does not model; both parse
--- in 4.24.0 (measured) and both still rewrite inside the literal. Neither occurs
--- anywhere in the corpus. The fix for them is a fifth and sixth state, not a
--- hedge; these guards go RED the moment one is added, which is the point.
-#guard resolveSpecText [pointDecl] [] "theorem t : x = r\"a\\\" ++ \"Point (1)\""
-       == "theorem t : x = r\"a\\\" ++ \"Point.Point (1)\""
-#guard resolveSpecText [pointDecl] [] "theorem t : x = s!\"{f \"Point (1)\"}\""
-       == "theorem t : x = s!\"{f \"Point.Point (1)\"}\""
+/-! ### M4 GATE REVIEW — the residual leaks are REFUSED, not pinned
+
+THE PARENT COMMIT pinned two of these as expected WRONG output, with a comment
+saying "the fix is another state, not another hedge". The gate review measured a
+THIRD form with the same signature — `«a"b»` is a legal Lean identifier carrying
+an unbalanced `"` (`def «a"b» : Nat := 1` elaborates in 4.24.0, measured) — which
+is the counter-evidence to that plan: the family is not bounded by the forms an
+author happens to think of, so a state per discovery never terminates and the
+next undiscovered form is silent exactly as these three were.
+
+ALL THREE MEASURED THROUGH `resolveSpecText` at the parent (`6bb139e`), quoted
+here as the evidence for the refusal rather than pinned as an expectation — a
+`#guard` on wrong output says "expected", and it would go red the day someone
+adds the state:
+
+    r"a\" ++ "Point (1)"          → r"a\" ++ "Point.Point (1)"
+    s!"{f "Point (1)"}"           → s!"{f "Point.Point (1)"}"
+    «a"b» = 1 ∧ label = "Point (1)" → «a"b» = 1 ∧ label = "Point.Point (1)"
+
+`resolveSpecText` is UNCHANGED and still leaks on all three: the fix is UPSTREAM
+of it. `Emit.desyncCapableSpecForms` detects the forms and `Main.lean` refuses
+the module before anything is written, so no such text ever reaches the rewrite.
+
+CORPUS: exactly ONE hit over ALL 197 spec blocks of `examples/haskell/**/*.hs`
+(116 `{- @lean -}` + 81 `[lean| … |]`, extracted from the sources and run through
+the detector in one pass), and that hit is `examples/haskell/SpecInterp.hs` — the
+MUST-FAIL fixture added for this refusal, which carries an ordinary-looking
+`s!"…"` property and now refuses end-to-end with `rc=1` and no `.lean` written.
+The other 196 blocks pass, so the refusal costs the corpus nothing. The one known
+false positive is a guillemet CHAR literal (`c = '«'`), absent from all 197; see
+`Emit.guillemetSplit` for why no carve-out is made.
+
+E2E, both directions, MEASURED with the parent binary and the new one over the
+SAME dump (`StringCtorClash`, four hand-written blocks — the three forms plus one
+ordinary line): PRE emitted all three leaks with `rc=0` (`"Point.Point (1)"`
+inside each literal) while leaving the ordinary block's literal verbatim and its
+real ctor qualified; POST refuses, naming all three blocks by source line and
+NOT naming the fourth.
+-/
+
+-- THE THREE MEASURED FORMS, each now a REFUSAL.
+#guard desyncCapableSpecForms "theorem t : x = r\"a\\\" ++ \"Point (1)\""
+       == [rawStringFormName]
+#guard desyncCapableSpecForms "theorem t : x = s!\"{f \"Point (1)\"}\""
+       == [interpolationFormName]
+#guard desyncCapableSpecForms "theorem t : «a\"b» = 1 ∧ label = \"Point (1)\""
+       == [guillemetFormName]
+-- The form NAMES, pinned once so the three guards above stay about the FORM and
+-- the refusal message stays free to be reworded.
+#guard [rawStringFormName, interpolationFormName, guillemetFormName]
+       == ["raw string literal (`r\"…\"`)", "string interpolation (`s!\"…\"`)",
+           "guillemet identifier (`«…»`)"]
+-- `r#"…"#` is a raw string too (elaborates in 4.24.0, measured), and the trailing
+-- `#`s are why the opener test drops them before looking for the `r`.
+#guard desyncCapableSpecForms "theorem t : x = r#\"a\"# ++ \"Point (1)\""
+       == [rawStringFormName]
+-- More than one form in one block reports both, deduplicated.
+#guard desyncCapableSpecForms "theorem t : r\"a\" = s!\"b\" ∧ x = s!\"c\""
+       == [rawStringFormName, interpolationFormName]
+
+-- ORDINARY SPEC TEXT MUST NOT REFUSE — the reachability half, since a refusal
+-- that fires on innocent text is a regression. Real corpus lines first
+-- (`StringCtorClash.hs`, `SpecComment.hs`), then the near-misses the boundary
+-- tests exist for.
+#guard desyncCapableSpecForms
+         "theorem label_then_ctor : (label, mkPoint 1 2) = (\"Point (1)\".toList, Point 1 2) := by rfl"
+       == []
+#guard desyncCapableSpecForms
+         "-- the label is \"Point (1)\ntheorem t : label = \"Point (1)\".toList := by rfl"
+       == []
+-- A word ENDING in `r` before a closing quote — `"numerator"` is ordinary
+-- Haskell/Lean text, and a substring test for `r\"` would refuse it.
+#guard desyncCapableSpecForms "theorem t : field = \"numerator\"" == []
+-- An identifier ENDING in `!` applied to a string — `get!`/`panic!` are real
+-- Lean names, and the space is what distinguishes them from `s!\"`.
+#guard desyncCapableSpecForms "theorem t : m.get! \"key\" = 1" == []
+#guard desyncCapableSpecForms "theorem t : xs = panic! \"nope\"" == []
+-- A BALANCED guillemet identifier is fine: both delimiters land in the same code
+-- segment, so nothing is split.
+#guard desyncCapableSpecForms "theorem «my thm» : label = \"Point (1)\"" == []
+-- All three forms INSIDE a string literal, and all three inside a COMMENT: both
+-- are verbatim segments, neither desyncs anything, so neither is reported. The
+-- second is what the `startsWith \"\\\"\"` test buys — comments are verbatim too.
+#guard desyncCapableSpecForms "theorem t : x = \"r\" ++ \"s!\" ++ \"«a»\"" == []
+#guard desyncCapableSpecForms "-- r\"a\" s!\"b\" «c\ntheorem t : x = \"Point (1)\"" == []
+-- A bare `!\"` is `not` applied to a literal, not an interpolation.
+#guard desyncCapableSpecForms "theorem t : !\"\".isEmpty = false" == []
+-- Every escape shape the char-literal arms handle, and the `\\` that is a real
+-- Lean token: none of them is a desync form.
+#guard desyncCapableSpecForms "theorem t : ['\\n', '\\x00', '\\\\', '\\''] = cs" == []
+#guard desyncCapableSpecForms "theorem t : (label, s \\\"Point (1)\") = x" == []
 
 -- KERNEL REDUCTION, the property `partial` would have cost: every `#guard` above
 -- and this `rfl` need `litScan` to reduce, and it does because it is STRUCTURAL on
