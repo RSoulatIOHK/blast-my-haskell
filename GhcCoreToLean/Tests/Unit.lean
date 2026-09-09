@@ -905,27 +905,41 @@ def mkPartialBind (nm : String) : Bind :=
 -- For every shape the fixtures exercise, fix (B) is loud in both directions —
 -- a false positive puts a TERM where a type is expected (`BEq Point.Point`), a
 -- false negative leaves a type where a function is expected, both elaboration
--- errors — EXCEPT inside a hand-written string literal, the one silent-rewrite
--- hedge below.
+-- errors — EXCEPT inside a string literal, the one silent-rewrite exposure,
+-- hedged here at M2 time and CLOSED by M4 Task 3 (below).
 --
--- KNOWN HEDGE (the single non-loud exposure): the rewrite is textual, so a ctor
--- name followed by args inside a hand-written STRING LITERAL in a spec block is
--- rewritten too — `"s = \"Point 1\""` becomes `Point.Point 1` inside the
--- literal. That is pre-existing exposure of the ` Ctor (` needle as well, not
--- new to `replaceCtorApps`. No fixture emits a `LitString` outside the dropped
--- `$tr`/`$tc` binds (6 there, see the census above), and no Haskell string
--- literal can reach the emitter at all — the AIRTIGHT reason is upstream of
--- `valueMap`: the shim DISCARDS string payloads entirely (`shim/Main.hs:291`
--- emits `"value": "<bs>"` for `MachStr`), so a string literal cannot round-trip
--- regardless of what the maps do. (Belt and braces: Core spells the literal
--- `unpackCString# "…"#` and `unpackCString#` has no `valueMap` arm, so outside
--- the `error`/`undefined` spine — where the whole application collapses to
--- `default` — it would emit as a loud unknown identifier anyway. And note the
--- narrower claim: the string TYPE is mapped — `String` is `[Char]` in Core,
--- which `typeConMap` sends to `List Char`. It is literal PRODUCTION that cannot
--- compile today, not String-typed code in general.) So the residual risk is a
--- hand-authored literal in theorem text — rare, and reviewable in the spec
--- block itself.
+-- THE HEDGE, AND WHY IT DID NOT HOLD (updated by M4 Task 3 — the text below used
+-- to argue this was airtight; the argument's premise is now FALSE). The rewrite
+-- is textual, so a ctor name followed by args inside a STRING LITERAL was
+-- rewritten too — `"s = \"Point 1\""` became `Point.Point 1` inside the literal.
+-- That was pre-existing exposure of the ` Ctor (` needle as well, not new to
+-- `replaceCtorApps`. At M2 time no fixture emitted a `LitString` outside the
+-- dropped `$tr`/`$tc` binds (6 there, see the census above), and the reason given
+-- for hedging rather than fixing sat upstream of `valueMap`: the shim DISCARDED
+-- string payloads entirely (it emitted `"value": "<bs>"` for `MachStr`), so a
+-- string literal could not round-trip regardless of what the maps did.
+--
+-- M4 TASK 1 REPLACED THAT ARM WITH THE LITERAL'S REAL BYTES
+-- (`shim/Main.hs:368`, the `MachStr bs ->` case — the `:291` this comment used
+-- to cite was accurate when written, verified at `70f651a`, and drifted as Task
+-- 1's own explanation grew) and M4 TASK 2 mapped `unpackCString#`. From
+-- that moment a Haskell literal `"Point (1)"` emitted as
+-- `"Point.Point (1)".toList` — type-correct, compiles, silently wrong, and no
+-- longer confined to hand-authored spec text. M4 Task 3 closed it: both
+-- `replaceCtorApps` and the four needles now run only over the CODE segments of
+-- `Emit.mapOutsideLiterals` (state machine in `Emit.lean`'s "Literal- and
+-- comment-aware scanning" header; guards and the measured pre-fix output in the "M4 Task 3"
+-- section at the end of this file; `examples/haskell/StringCtorClash.hs` is the
+-- e2e fixture).
+--
+-- Two M2-era observations that are still TRUE and worth keeping: Core spells the
+-- literal `unpackCString# "…"#`, so before Task 2 gave `unpackCString#` a
+-- `valueMap` arm a literal outside the `error`/`undefined` spine — where the
+-- whole application collapses to `default` — emitted as a loud unknown
+-- identifier; and the string TYPE was mapped from the start (`String` is
+-- `[Char]` in Core, which `typeConMap` sends to `List Char`), so it was literal
+-- PRODUCTION that could not compile at M2 time, not String-typed code in
+-- general.
 
 def pointDecl : DataDecl :=
   {name := "Point", kind := "data",
@@ -6457,5 +6471,1322 @@ def ambConvDfunB : Bind :=
 #guard classifyInstanceMethod [] [.nonRec ambCeqUser (.lit (.litInt 0)), ambMyEqDfun]
          "MyEq" (emitType ambR) (ambMyEqClass.methods.head!)
          == .field "_dollar_c_eq__eq__2948"
+
+/-! ## M4 Task 1 — the shim's `MachStr` arm emits the literal's real bytes
+
+    THE FIX. `shim/Main.hs`'s `convertLit` had exactly one lossy arm; every
+    Haskell string literal in the program reached Lean as the same four
+    characters:
+    ```haskell
+      MachStr _     -> object [ "tag" .= ("LitString" :: T.Text), "value" .= ("<bs>" :: T.Text) ]
+    ```
+    It is now `MachStr bs -> … "value" .= decodeUtf8With lenientDecode bs`.
+    Upstream was never the problem: `GhcDump.Ast` declares `MachStr
+    BS.ByteString` (strict, verified in the 0.2.1.0 tarball at `Ast.hs:120`) and
+    `Convert.hs:266` passes the bytes through, so the payload always arrived and
+    the shim threw it away.
+
+    WHY THE LENIENT DECODER and not `decodeUtf8`: GHC's payload is *modified*
+    UTF-8, which standard UTF-8 rejects, so the partial decoder THROWS — inside a
+    shim invoked from `transpile.sh` that is a crashed transpile of an otherwise
+    fine module. Measured, not defensive, on the SHIM'S OWN toolchain (GHC 9.2.7,
+    `text-1.2.5.0`) over the bytes lifted out of a real `pass-0000.cbor`
+    (`"a\0b"` sits at offset 94 under a CBOR `bstr(4)` header as `61 c0 80 62`;
+    `"x\55296y"` at 277 under `bstr(5)` as `78 ed a0 80 79`):
+    ```
+      bytes [97,192,128,98]      strict decodeUtf8 = THROWS: Cannot decode byte '\xc0'
+                                 lenient           = "a\65533\65533b"  (len 4)
+                                 encodeUtf8 . decode == bs  =  False
+      bytes [120,237,160,128,121] strict decodeUtf8 = THROWS: Cannot decode byte '\xed'
+                                 lenient           = "x\65533\65533\65533y" (len 5)
+                                 encodeUtf8 . decode == bs  =  False
+      bytes [99,97,102,195,169]  strict decodeUtf8 = 4       (`"caf\233"`, fine)
+                                 encodeUtf8 . decode == bs  =  True
+    ```
+    So the crash is real, and the round-trip predicate prescribed to Task 2 below
+    is confirmed to fire on exactly the lossy inputs and not on valid UTF-8.
+    **No cabal change** — `text` and
+    `bytestring` were already `shim.cabal` deps; the two added imports are
+    `Data.Text.Encoding (decodeUtf8With)` and `Data.Text.Encoding.Error
+    (lenientDecode)`. A strict-`Data.ByteString` import turned out NOT to be
+    needed (the argument type is fixed by `Ast.MachStr`), and adding one would be
+    an unused import under the package's `-Wall`.
+
+    RESTAGE PROOF (a stale shim silently producing old JSON is this project's
+    classic false-green; `transpile.sh:127` resolves the binary by
+    `find shim/dist-newstyle -name ghc-core-shim | head -1`):
+    * that `find` returns exactly ONE candidate — no second binary to pick;
+    * `shim/Main.hs` mtime `Sep 8 15:16:42` < binary mtime `Sep 8 15:16:50`
+      (re-checked after the last comment-only edit; the rebuilt binary reproduces
+      the measured JSON byte-for-byte on the saved `Fib`/`Ratio` dumps);
+    * `strings <binary> | grep -c '^<bs>$'` is **1 before / 0 after** — the
+      positive control matters: the placeholder is verifiably in the old binary
+      and verifiably gone from the new one;
+    * and the JSON below settles it independently.
+
+    OBSERVATION FIXTURE `examples/haskell/StringBasics.hs` — two defs, the second
+    HAZARDOUS (`"say \"hi\"\n"` = a quote, an escape, a newline). No `@lean`
+    properties: this task's deliverable is the observation, and the emitted Lean
+    does NOT compile until Task 2 maps `unpackCString#` (quoted below).
+
+    BOTH LITERALS, verbatim from `/tmp/transpile-StringBasics.json` (aeson-pretty
+    output; the shim ran over the same `StringBasics.pass-0000.cbor` both times):
+    ```json
+      // PRE-fix — both defs, indistinguishable:
+                    "lit": { "tag": "LitString", "value": "<bs>" },
+      // POST-fix, `greeting`:
+                    "lit": {
+                        "tag": "LitString",
+                        "value": "hi"
+                    },
+      // POST-fix, `quoted`:
+                    "lit": {
+                        "tag": "LitString",
+                        "value": "say \"hi\"\n"
+                    },
+    ```
+    THE SPINE (unchanged by this task; recorded for Task 2's `valueMap` key —
+    GHC applies it directly to the literal, with no intervening helper bind):
+    ```json
+                "fun": { "tag": "Var", "var": { "name": "GHC.CString.unpackCString#",
+                                                "role": "id", "unique": 20, … } },
+                "tag": "App"
+    ```
+    So the key Task 2 needs is `"GHC.CString.unpackCString#"` (fully qualified;
+    the bare `"unpackCString#"` was NOT observed).
+
+    HAZARDOUS CHARACTERS SURVIVE THE ROUND TRIP — checked on the DECODED value,
+    not the bytes on disk, because a JSON encoder escapes exactly these:
+    `json.load` gives `greeting = 'hi'` (len 2, codepoints `0x68 0x69`) and
+    `quoted = 'say "hi"\n'` (len 9, codepoints
+    `0x73 0x61 0x79 0x20 0x22 0x68 0x69 0x22 0x0a`). The `"` is a real U+0022 and
+    the newline a real U+000A after decoding — aeson escaped them on the way out
+    and the reader restored them. **NO trailing NUL**: `greeting` is 2 code
+    points, so GHC's `LitString` payload does not carry the C terminator and Task
+    2 must not strip one (a `"hi ".toList` would have been a silent
+    off-by-one in every string's `length`).
+
+    THE EXPECTED LOUD FAILURE, verbatim from `lake build
+    GhcCoreToLean.Generated.StringBasics` — this is the point of the fixture:
+    ```
+      error: GhcCoreToLean/Generated/StringBasics.lean:12:16: Unknown identifier `GHCCore.tyConOpaque`
+      error: GhcCoreToLean/Generated/StringBasics.lean:13:3: Unknown identifier `GHC.CString.unpackCString_hash_`
+      error: GhcCoreToLean/Generated/StringBasics.lean:16:43: unexpected identifier; expected ')', ',' or ':'
+      error: GhcCoreToLean/Generated/StringBasics.lean:15:14: Unknown identifier `GHCCore.tyConOpaque`
+    ```
+    from
+    ```lean
+      def greeting : (GHCCore.tyConOpaque "String") :=
+        (GHC.CString.unpackCString_hash_) ("hi")
+
+      def quoted : (GHCCore.tyConOpaque "String") :=
+        (GHC.CString.unpackCString_hash_) ("say "hi"
+      ")
+    ```
+    Three distinct Task 2 items, and note the ORDER: at `quoted` the raw `"`
+    makes it a *syntax* error at 16:43, which fires INSTEAD of the
+    unknown-identifier error `greeting` gets at 13:3 — the mapping is not even
+    observable at a hazardous literal until the escaping lands. That is why Task
+    2's Steps 1 and 2 must ship together, and it also means the shim fix alone
+    could not have been "finished" by adding the mapping first: per the plan's
+    ordering constraint, mapping `unpackCString#` before this commit would have
+    made every literal emit a type-correct, compiling, silently wrong
+    `"<bs>".toList`.
+
+    CENSUS — the exploration claim was "`LitString` appears in all dumps but
+    EXCLUSIVELY inside `$tr`/`$tc` Typeable binds that `isJunkName` drops". That
+    claim is **too strong**; measured structurally (walk every top-level bind,
+    collect the owner of every `LitString` node) over 7 corpus dumps:
+    | dump | `LitString` | owners |
+    |---|---|---|
+    | `Fib`, `TupleBasics`, `ListLiterals` | 2 | `$trModule` only |
+    | `RecordOps` | 6 | `$trModule`, `$tcPoint`, `$tc'Point`, `$tcRect`, `$tc'Rect` |
+    | `UserClass` | 6 | `$trModule`, `$tcSized`, `$tc'C:Sized`, `$tcBox`, `$tc'Box` |
+    | `OrdHandwritten` | 16 | `$trModule` + 14 `$tc…` |
+    | `Ratio` | 54 | `$trModule`, 4 `$tc…`, **`$cshowsPrec` ×8, `$dIP` ×12, and 7 REAL USER BINDS ×9** |
+    `Ratio`'s non-Typeable owners are `tryMkRatio`, `fromRatioSOPSafe`,
+    `safeRatioMatch`, `recipC`, `integerRecipMulRatioC`, `safeRecipRatio`,
+    `recipMulRatio` — i.e. `error "…"` messages (`'recipC: division by zero'`)
+    plus the `HasCallStack` strings GHC inlines beside them (`'Ratio.hs'`,
+    `'Ratio'`, `'transpile-sandbox-0.1.0.0-inplace'`, `'error'`) — and
+    `$cshowsPrec`'s derived record syntax (`'CustomRatio {'`,
+    `'numerator = '`, `'}'`). They are dropped by THREE different mechanisms,
+    only one of which is `isJunkName`: `$dIP` by prefix and `$cshowsPrec` by
+    `Emit.isDerivedShowMethod` (both `Main.lean`'s `isGhcRuntimePlumbing`), and
+    the user binds' literals by the `error`→`default` collapse, which discards
+    the whole application including its message. Verified: no `<bs>` occurs in
+    any pre-fix emitted `.lean` OF THE 7 CORPUS FIXTURES, and no error message
+    occurs in the post-fix ones. Scope matters — the pre-fix binary DOES emit
+    `(GHC.CString.unpackCString_hash_) ("<bs>")` for both `StringBasics` defs,
+    since that fixture is this commit's own literal-bearing addition.
+
+    BYTE-IDENTITY — two-binary method over 7 fixtures (`Fib`, `ListLiterals`,
+    `RecordOps`, `UserClass`, `OrdHandwritten`, `TupleBasics`, `Ratio`). Result:
+    **JSON DIFFERS for all 7 / emitted `.lean` byte-identical for all 7**, with
+    identical (byte-equal) transpiler stderr. (All 7 JSONs re-confirmed
+    byte-identical under the finally-committed binary, after the comment-only
+    edits that followed the measurement.) Both halves are load-bearing: the
+    JSON diff proves the new shim is the one that ran, and without it a
+    byte-identical `.lean` would be equally consistent with "the change did
+    nothing".
+
+    WHAT WAS COMPARED, precisely. The shim is a POST-dump translator (CBOR →
+    JSON) and `shim/cabal.project` is `packages: .`; the `.pass-0000.cbor` comes
+    from `ghc-dump-core`'s `GhcDump.Plugin` during the sandbox `cabal build`,
+    which this change cannot reach. So the DUMP WAS HELD FIXED and both binaries
+    were run over the same saved `dump.cbor` (+ the same `decls.json`,
+    `.leanspecs`, and a per-run COPY of the pre-append `transpile-ext-types.tsv`,
+    since `emit_module` appends to that file and a shared copy would fake a
+    diff), then the transpiler was run on each JSON with byte-equal environment.
+    Holding the dump fixed is what the plan's byte-identity rule already
+    prescribes ("run BOTH binaries over the SAME saved dumps"), and it is the
+    right method here for a structural reason: the shim is a post-dump
+    CBOR→JSON translator (`shim/cabal.project` is `packages: .`), so it cannot
+    influence the CBOR — re-dumping would vary an input the change cannot
+    affect. CORRECTION (review, re-measured): an earlier draft of this comment
+    claimed re-dumping was *measurably* unsafe, citing two consecutive
+    `transpile.sh` runs producing CBORs differing in 6 bytes (`greeting` unique
+    1153 then 2129). That does NOT reproduce — repeated runs give byte-identical
+    CBORs (749 B, 0 differing bytes), including across a 6-hour gap with many
+    intervening runs. Uniques here are CONFIGURATION-sensitive, not
+    run-sensitive: a direct `ghc-9.2.7 -fplugin GhcDump.Plugin` gives 2113 while
+    `transpile.sh` (two extra plugins) gives 2129. So re-dumping would have
+    worked; the held-fixed method is preferred as strictly more robust, not as a
+    rescue. A `post` vs `post2` control (same binary, twice, through the same
+    harness) was byte-identical for all 7, so the harness contributes no noise.
+
+    ENCODING PROBE (scratch modules, not committed — the fixture stays the two
+    plain defs the plan asks for). Each def is `<name> = <literal>`; the table is
+    the observed spine head and the DECODED payload:
+    | literal | spine | decoded | code points |
+    |---|---|---|---|
+    | `"plain"` | `unpackCString#` | `plain` | ASCII |
+    | `"caf\233"` | **`unpackCStringUtf8#`** | `café` | `0x63 0x61 0x66 0xe9` |
+    | `"\255"` | **`unpackCStringUtf8#`** | `ÿ` | `0xff` |
+    | `"\128169"` | **`unpackCStringUtf8#`** | `💩` | `0x1f4a9` |
+    | `"a\0b"` | **`unpackCStringUtf8#`** | `a??b` | `0x61 0xfffd 0xfffd 0x62` |
+    | `"x\55296y"` | **`unpackCStringUtf8#`** | `x???y` | `0x78 0xfffd 0xfffd 0xfffd 0x79` |
+
+    TWO CONSEQUENCES, both for Task 2, both bigger than the plan assumed:
+
+    1. `unpackCStringUtf8#` is NOT a hedge — it is REQUIRED. GHC picks
+       `unpackCString#` only for a pure-ASCII literal and
+       `GHC.CString.unpackCStringUtf8#` for *every* non-ASCII one. Map both or
+       every accented string in the corpus fails loud.
+    2. THE DECODE IS LOSSY ON ORDINARY HASKELL, and Task 2 must make that loud.
+       `"a\0b"` and `"x\55296y"` are ordinary Haskell; GHC encodes them in
+       *modified* UTF-8 — standard UTF-8 EXCEPT an overlong NUL (`0xC0 0x80`)
+       and 3-byte encodings of LONE surrogates. It is NOT CESU-8: supplementary
+       characters get standard 4-byte UTF-8 (measured: `"\128169"` → `💩`
+       decodes correctly), so a refusal must not reject non-BMP literals. Both
+       exceptional forms are invalid standard UTF-8, so lenient decoding replaces them
+       — `"a\0b"` (3 chars) arrives as 4 code points with two U+FFFD. Today the
+       lossy value is not silently believed, because the unpackers are UNMAPPED:
+       any literal that reaches emission fails loud (`StringBasics` emits
+       `("hi")` and an unknown `unpackCString_hash_` — literals DO reach
+       emission in this very commit; what byte-identity shows is that no
+       literal reaches it in the 7 corpus fixtures). The moment Task 2 maps the
+       unpackers, the loud failure is REPLACED by a silently-wrong value —
+       wrong `length`, wrong content, compiles fine. Task 2 therefore replaces
+       a loud failure, it does not add a check where nothing arrived. The shim cannot fix it by
+       decoding harder (Lean's `Char` cannot hold a surrogate at all —
+       plan correction 3), so the safe design is detection: the decode is lossy
+       exactly when `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs`, which
+       the shim can test in one line, and such a literal must FAIL LOUD rather
+       than emit a plausible-looking string. Not done here: it needs a JSON
+       schema field and a Lean-side refusal, i.e. Task 2's commit, not this one.
+
+       PREDICATE AUDIT (review). Sound as a LOSSINESS test, in both directions:
+       no false negatives — replacement output is always whole `EF BF BD`
+       triples and `EF BF BD` is itself valid UTF-8, so it is never the invalid
+       input, hence any replacement forces a byte/length mismatch; and success
+       implies `bs` is valid standard UTF-8, which (GHC's encoder being
+       standard and injective off NUL/lone-surrogates) implies the decode
+       recovered exactly GHC's Chars, all legal Lean `Char`s. No false
+       positives either: a GENUINE U+FFFD literal round-trips `True`
+       (measured on `[239,191,189]` and `[97,239,191,189,98]`).
+       BUT COARSE AS A REFUSAL CRITERION, and Task 2 must split it: the two
+       failing forms have different correct remedies. U+0000 is a perfectly
+       legal Lean `Char`, so refusing it declines Haskell a modified-UTF-8-aware
+       decoder would transpile faithfully; only U+D800–DFFF is genuinely
+       unrepresentable (plan correction 3). One blanket refusal loses NUL
+       support permanently.
+       ALSO: the predicate is computable ONLY in the shim — the bytes are gone
+       after JSON — so Task 2's Lean-side refusal REQUIRES a shim-emitted flag
+       field and cannot recompute it. Deferring to Lean (rather than dying in
+       the shim) is right for a reason worth recording: the shim cannot know
+       whether a literal reaches emission, so a shim-level `die` would crash
+       modules whose only lossy literal sits in a dropped `$tr`/`$cshowsPrec`/
+       error-collapsed bind — modules that transpile fine today.
+
+    HANDOFFS.
+    * Both items above (`unpackCStringUtf8#`, and the lossy-decode loud-fail).
+    * Task 2 needs a `typeConMap "String"` arm too: GHC Core keeps the SYNONYM in
+      the binder type (`"type": {"tag":"TyCon","name":"String","args":[]}`), so
+      `greeting` emits `(GHCCore.tyConOpaque "String")`, not `List Char`. The
+      plan's correction 1 ("`typeConMap` already sends `[] [Char]` → `List
+      Char`") is true but does not cover this spelling — pinned below.
+    * TASK 4 (review finding): `MachChar` has the SAME silent surrogate loss,
+      so the plan's correction 1 ("the shim's `LitChar` arm is already complete
+      and lossless") is measurably FALSE. `text-1.2.5.0`'s `T.singleton`
+      applies `safe`: `T.singleton '\55296'` and `'\57343'` both yield U+FFFD
+      (measured under GHC 9.2.7). Latent only because every dump so far has
+      zero `LitChar`; Task 4 is where a real `Char` literal first appears.
+    * Task 2's escaping must handle U+FFFD arriving from a non-UTF-8 literal; the
+      decoder guarantees a valid `Text`, not an ASCII one.
+    * Task 3's hedge now has observed ammunition rather than a hypothetical:
+      `Ratio`'s `$cshowsPrec` literals contain `'CustomRatio {'` — a real
+      constructor name inside a real string literal, in the corpus, today. It is
+      invisible only because that bind is dropped; the `error`-message literals in
+      the 7 user binds are one emitter change away from the same exposure. -/
+
+-- Task-1 TRIPWIRES, ALL FIVE FLIPPED BY M4 TASK 2 (see its block below for the
+-- measurements). Kept in place rather than deleted: each one names the exact
+-- state the loud failure above was made of, so the pair reads as a before/after.
+--   * the two unpackers were `none` — the unknown-identifier half of the failure;
+--   * `typeConMap "String"` was `none` — the `tyConOpaque "String"` half;
+--   * `emitLiteral`/`emitLiteralPattern` interpolated the payload RAW — the
+--     16:43 syntax error, which fired INSTEAD of the other two at `quoted`.
+#guard valueMap "GHC.CString.unpackCString#" == some "String.toList"
+#guard valueMap "GHC.CString.unpackCStringUtf8#" == some "String.toList"
+#guard typeConMap "String" [] == some "List Char"
+-- `[Char]` mapped all along (correction 1) — the gap was the `String` spelling.
+#guard typeConMap "[]" ["Char"] == some "List Char"
+#guard emitLiteral (.litString "hi") == "\"hi\""
+#guard emitLiteral (.litString "say \"hi\"\n") == "\"say \\\"hi\\\"\\n\""
+#guard emitLiteralPattern (.litString "say \"hi\"\n")
+        == "(GHCCore.unsupportedStringPattern \"say \\\"hi\\\"\\n\")"
+-- The `<bs>` era is over on the Lean side too: nothing special-cases it, so it
+-- was never distinguishable from a user literal spelled `<bs>`.
+#guard emitLiteral (.litString "<bs>") == "\"<bs>\""
+
+/-! ## M4 Task 2 — string literals: the mapping, the escaping, and the split refusal
+
+    FIVE PIECES, ONE COMMIT, because no subset of them is safe. The plan's
+    ordering constraint says the mapping cannot land before the shim fix; Task 1's
+    measurement adds that it cannot land before the ESCAPING either (at a
+    hazardous literal the raw `"` was a *syntax* error at 16:43 that fired
+    INSTEAD of the unknown-identifier error, so the mapping was not even
+    observable), nor before the REFUSAL (mapping replaces a loud failure with a
+    silently-wrong value — measured below, exactly).
+
+    1. ESCAPING (`escapeStringLit`/`escapeCharLit`). Escapes both quotes, the
+       backslash, and the C0 controls (`\n`/`\t`/`\r` by name, the rest `\xNN`);
+       non-ASCII emits RAW. Verified in v4.24: `"a\x00b"` is a 3-char String,
+       `"a\x7fb"` a 3-char one, `'\"'`/`'\''` both parse, `"a\'b"` parses, and the
+       accented/emoji char literals parse — so one escaper serves the string and
+       char positions and no `\uXXXX` path is needed (it could not spell a non-BMP
+       character anyway).
+       WHY ESCAPING AND NOT `Char.ofNat n` for chars: `Char.ofNat n` is not a
+       PATTERN — Lean answers "Invalid pattern: Expected a constructor or constant
+       marked with `[match_pattern]`" (measured) — so `emitLiteralPattern` needs a
+       real escaped literal regardless, and position-dependent spellings of one
+       `Char` would be strictly worse than a single escaper.
+    2. THE MAPPING: both unpackers → `String.toList`. `.toList` is load-bearing (a
+       bare `"hi"` is a `String`, not a `List Char`).
+    3. `typeConMap "String" [] = some "List Char"` — Core keeps the SYNONYM in
+       binder types, so without this arm a `String` def had a `tyConOpaque
+       "String"` signature over a `List Char` body.
+    4. THE `.litString` PATTERN ARM now FAILS LOUD (see `emitLiteralPattern`'s doc
+       for the `LitAlt (MachStr …)` reachability argument: unreachable from any
+       ordinary string pattern via `tidyLitPat`/`eqString`, NOT ruled out for an
+       `HsStringPrim` `Addr#` pattern under `MagicHash` via `hsLitKey`).
+    5. THE SPLIT REFUSAL: NUL faithful, lone surrogate refused.
+
+    OBSERVED SPINE NAMES, from `/tmp/transpile-StringBasics.json` — every literal
+    of the fixture, with the DECODED payload's code points, which is what settles
+    both "which unpacker" and "was the decode faithful":
+    ```
+      GHC.CString.unpackCString#     "hi"            [104,105]
+      GHC.CString.unpackCString#     "say \"hi\"\n"  [115,97,121,32,34,104,105,34,10]
+      GHC.CString.unpackCString#     "\""            [34]
+      GHC.CString.unpackCString#     "\\"            [92]
+      GHC.CString.unpackCStringUtf8# "caf\233"       [99,97,102,233]
+      GHC.CString.unpackCStringUtf8# "a\0b"          [97,0,98]     ← 3, NOT 4
+      GHC.CString.unpackCString#     "!"             [33]
+    ```
+    So BOTH unpackers are required in one module, confirming Task 1's finding
+    (plain for pure ASCII, Utf8 for every non-ASCII literal) — and note `"a\0b"`
+    now arrives as THREE code points where Task 1 measured four with two U+FFFD.
+    NEGATIVES recorded: the bare `unpackCString#` (unqualified) does not occur;
+    `unpackAppendCString#` and `unpackFoldrCString#` are 0-occurrence in every
+    dump, including this fixture's `s ++ "!"` — the RULE that introduces them does
+    not fire at pass-0000, exactly like `GHC.Base.augment`. A literal `++` arrives
+    as `List.append (String.toList "!")`, which is what the fixture proves.
+
+    THE SHIM SCHEMA (one optional field, `shim/Main.hs`'s `MachStr` arm; the NUL
+    below is written as aeson writes it, `\u0000`):
+    ```json
+      // faithful — the normal case, field ABSENT:
+      { "tag": "LitString", "value": "a\u0000b" }
+      // no Lean image — field PRESENT, carrying the ORIGINAL bytes as hex:
+      { "tag": "LitString", "value": "x???y"  (three U+FFFD),
+        "unrepresentable": "78 ed a0 80 79" }
+    ```
+    Presence is the flag; the value is the evidence the refusal names. The hex is
+    of the bytes GHC produced, not of the NUL-repaired ones. `value` still carries
+    the lenient decode and is never emitted for a flagged literal — the refusal
+    fires first.
+
+    THE SPLIT, and why it is not one blanket refusal. Modified UTF-8 deviates from
+    the standard in exactly two ways (GHC 9.2.7 `utf8EncodeChar`): overlong NUL
+    `C0 80`, and 3-byte lone surrogates. `undoOverlongNul` repairs the first by a
+    two-byte scan — safe because `0xC0` is not a legal byte anywhere in standard
+    UTF-8, so it cannot occur inside a valid sequence — and then the audited
+    predicate `encodeUtf8 (decodeUtf8With lenientDecode bs') /= bs'` runs on the
+    REPAIRED bytes, so it fires on exactly the residue. U+0000 is a legal Lean
+    `Char` and now transpiles faithfully; U+D800–DFFF is not a Lean `Char` at all
+    (correction 3), so no decoder can help and it must refuse. Transport verified
+    end to end before relying on it: `Lean.Json.parse` on `{"value":"a\u0000b"}`
+    yields code points `[97,0,98]` — aeson escapes a real NUL on the way out and
+    Lean's reader restores it — so the faithful half is not merely a shim-side
+    claim. Incidentally Lean's JSON reader turns a `\ud800` escape into U+FFFD
+    (`[120,65533,121]`), which is irrelevant here only because the flag refuses
+    first.
+
+    THE SILENT-WRONG, MEASURED RATHER THAN ARGUED. Same new transpiler, same CBOR,
+    two shims — i.e. the flag is the ONLY difference:
+    ```
+      new transpiler ← OLD shim's JSON (no flag):  rc=0, and it emits
+          def lone : List Char :=
+            (String.toList) ("x???y")     -- 5 code points, 3 of them U+FFFD
+      new transpiler ← NEW shim's JSON (flag):     rc=1, no .lean written
+          error: string literal not representable: bytes `78 ed a0 80 79` in bind `lone`
+    ```
+    The rc=0 file compiles: a `List Char` of length 5 where the source says 3.
+    That is the value this task would have introduced without piece 5, and it is
+    why the refusal is not optional hardening.
+
+    WHERE THE REFUSAL RUNS. `Main.lean`, on `userProg` — post-filter, post-`Lower`
+    — beside the other Program-level refusals, before any emission. Deliberately
+    NOT in the shim: the shim cannot know whether a literal reaches emission, so a
+    `die` there would crash modules whose only lossy literal sits in a dropped
+    `$tr`/`$cshowsPrec`/error-collapsed bind. `Ratio` is exactly that module (54
+    `LitString`s, 9 in real user binds' `error` messages) and it is byte-identical
+    and rc=0 below.
+
+    E2E. `StringBasics` transpiles and `lake build
+    GhcCoreToLean.Generated.StringBasics` is GREEN with all 10 properties,
+    including `withNul_val : withNul = ['a', '\x00', 'b']` and `withNul_len :
+    nameLen withNul = 3` (the NUL-faithful half, proved by `rfl` in the kernel)
+    and `shout_len : ∀ (cs : List Char), nameLen (shout cs) = nameLen cs + 1` by
+    `simp`. `StringSurrogate` refuses: rc=1, the message above, and no
+    `Generated/StringSurrogate.lean`.
+
+    TACTIC TABLE, REFINED (plan correction 6 is too strong in one direction).
+    Measured on the emitted defs: `blaster` PROVES concrete `List Char` goals —
+    `greeting = ['h','i']` and `nameLen greeting = 2` both report Valid — and
+    fails on the symbolic law `∀ (cs : List Char), nameLen (shout cs) = nameLen cs
+    + 1` with `Inductive datatype with instance parameters not supported: 'BitVec`.
+    So correction 6's "every `List Char` goal fails" holds only for goals with a
+    SYMBOLIC list; the plan's tactic-table row ("concrete literal + `++`/`length`
+    → blaster or rfl") is the accurate one. The fixture nonetheless uses `rfl` for
+    every concrete goal on purpose: a `blaster` success is `blasterProven`
+    (SMT-verified, no proof term), while `rfl` is a kernel proof of the same
+    statement — strictly stronger evidence at zero cost here.
+
+    BYTE-IDENTITY — two-binary method, CBOR dumps HELD FIXED (the shim is a
+    post-dump translator; `shim/cabal.project` is `packages: .`, so it cannot
+    influence the CBOR). Both the shim AND the transpiler changed, so both binary
+    pairs were saved and replayed over the same 7 saved `pass-0000.cbor` +
+    `decls.json` + `.leanspecs` + a per-run COPY of the manifest. Harness
+    validated first by replaying the PRE binaries and comparing to the live
+    `transpile.sh` output: byte-identical for all 7, so the harness introduces no
+    drift. Result over `Fib`, `ListLiterals`, `RecordOps`, `UserClass`,
+    `OrdHandwritten`, `TupleBasics`, `Ratio`:
+    **emitted `.lean` byte-identical 7/7, transpiler stderr byte-identical 7/7,
+    rc=0 on both sides 7/7** — that last one is its own pass/fail, since "no
+    corpus fixture newly REFUSES" is exactly the risk `Ratio`'s literals carry —
+    and a post/post2 control was byte-identical for all 7.
+    The shim JSON is byte-identical 7/7 too, which is a WEAKER position than Task
+    1's (there the JSON diff was what proved the new shim had run). It cannot
+    prove that here — no corpus literal contains a NUL or a surrogate, so the
+    shim's output genuinely does not change — so the positive control is separate
+    and direct: over `StringSurrogate.pass-0000.cbor` the two shims' JSON DIFFERS
+    by exactly the new field, and `strings <binary> | grep -c unrepresentable` is
+    0 for the saved pre-binary and 1 for the rebuilt one. `find shim/dist-newstyle
+    -name ghc-core-shim` returns exactly ONE candidate (what `transpile.sh:127`
+    resolves), its mtime is after `Main.hs`'s, and the live pipeline's
+    `/tmp/transpile-StringSurrogate.json` carries the field — so the sandbox ran
+    the rebuilt shim, not a stale one.
+    `Generated/UserClass.lean` is RED, before and after and byte-identically so:
+    that fixture's property is `boxTotal boxes = total boxes + 1`, a deliberate
+    FALSIFICATION (blaster reports it falsified, with a counterexample), which is
+    its expected state and unrelated to strings. The other 6 plus `StringBasics`
+    are GREEN.
+
+    HANDOFFS.
+    * TASK 3 (ctor-rewrite hedge): the exposure is now REAL, not hypothetical.
+      String literals reach emission in `StringBasics` today, and the textual
+      ctor-rewrite pass runs over emitted text that can contain a constructor name
+      INSIDE a string literal (`Ratio`'s `$cshowsPrec` has `'CustomRatio {'`, one
+      dropped bind away). Escaping does not protect against it: the rewrite cannot
+      tell a literal from a term.
+    * TASK 4 (`Char`): `shim/Main.hs`'s `MachChar` arm is still the lossy one —
+      `T.singleton` of a surrogate yields U+FFFD (`text-1.2.5.0`'s `safe`). The
+      `unrepresentable` channel built here is the shape that fixes it: flag in the
+      shim, refuse in Lean. A `litCharUnrepresentable` sibling of
+      `litStringUnrepresentable` is the obvious landing, and `escapeCharLit` is
+      already in place for the representable case.
+    * TASK 5 (expected-reds): add `examples/haskell/StringSurrogate.hs` — rc=1, no
+      `.lean`, message naming bind `lone` and bytes `78 ed a0 80 79`. Also worth
+      recording there: `UserClass` is a standing RED by design.
+    * Task 1's handoff "escaping must handle U+FFFD arriving from a non-UTF-8
+      literal" is DISCHARGED by the split rather than by the escaper: post-refusal
+      a U+FFFD in an emitted literal is always a genuine user U+FFFD, and it emits
+      raw like any other non-ASCII character. -/
+
+-- ESCAPING. The hazardous set from Task 1's fixture, plus the two single-char
+-- hazards the task asks for by name (a literal that is exactly `"`, one that is
+-- exactly `\`) and a literal with a newline. Written with explicit Lean escapes
+-- on the RIGHT-hand side, so each guard says what text lands in the file.
+#guard emitLiteral (.litString "\"") == "\"\\\"\""
+#guard emitLiteral (.litString "\\") == "\"\\\\\""
+#guard emitLiteral (.litString "a\nb") == "\"a\\nb\""
+#guard emitLiteral (.litString "a\tb\rc") == "\"a\\tb\\rc\""
+-- Control characters with no named escape → `\xNN`, two lowercase hex digits.
+#guard emitLiteral (.litString "a\x00b") == "\"a\\x00b\""
+#guard emitLiteral (.litString "\x1f\x7f") == "\"\\x1f\\x7f\""
+-- BOUNDARY: Lean's `\xNN` takes EXACTLY two hex digits, so a control character
+-- followed by a hex digit is unambiguous — measured, not inferred, because a
+-- greedy lexer would make this exact case silently wrong and no fixture literal
+-- reaches it: `"\x1fab"` is `[31, 97, 98]` and `"\x00ff"` is `[0, 102, 102]`,
+-- both by `rfl` in v4.24. No `\uXXXX` fallback is therefore needed.
+#guard emitLiteral (.litString "\x1fab") == "\"\\x1fab\""
+#guard emitLiteral (.litString "\x00ff") == "\"\\x00ff\""
+-- Non-ASCII is RAW: the emitted file is UTF-8 and these are Lean literals.
+#guard emitLiteral (.litString "café") == "\"café\""
+#guard emitLiteral (.litString "💩") == "\"💩\""
+-- Chars: same escaper, so the char position needs no separate rules.
+#guard emitLiteral (.litChar '\'') == "'\\''"
+#guard emitLiteral (.litChar '"') == "'\\\"'"
+#guard emitLiteral (.litChar '\\') == "'\\\\'"
+#guard emitLiteral (.litChar '\n') == "'\\n'"
+#guard emitLiteral (.litChar (Char.ofNat 0)) == "'\\x00'"
+#guard emitLiteral (.litChar 'é') == "'é'"
+-- PATTERN position: `.litChar` stays a real literal (correct against a `Char`
+-- scrutinee); `.litString` is loud (it would be ill-typed against `List Char`).
+#guard emitLiteralPattern (.litChar '\'') == "'\\''"
+#guard emitLiteralPattern (.litChar 'a') == "'a'"
+#guard emitLiteralPattern (.litString "hi")
+        == "(GHCCore.unsupportedStringPattern \"hi\")"
+-- An unrepresentable literal is loud in BOTH positions — defence in depth behind
+-- the Program-level refusal, which normally means these are never emitted.
+#guard emitLiteral (.litStringUnrepresentable "78 ed a0 80 79")
+        == "(GHCCore.unrepresentableStringLiteral \"78 ed a0 80 79\")"
+#guard emitLiteralPattern (.litStringUnrepresentable "78 ed a0 80 79")
+        == "(GHCCore.unrepresentableStringLiteral \"78 ed a0 80 79\")"
+
+-- PARSING the flag. Absent means faithful (`.litString`); present means
+-- refusable, and its content is the hex. Both shapes are real shim output.
+-- (`Literal` has no `BEq`, so these match on the constructor rather than
+-- comparing values.)
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitString"), ("value", "a\x00b")]) with
+        | .ok (.litString v) => v.toList.map Char.toNat == [97, 0, 98]
+        | _                  => false)
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitString"), ("value", "x???y"),
+           ("unrepresentable", "78 ed a0 80 79")]) with
+        | .ok (.litStringUnrepresentable hex) => hex == "78 ed a0 80 79"
+        | _                                   => false)
+
+-- THE REFUSAL, named by OWNER BIND. `lone` mirrors `StringSurrogate.hs` — that
+-- one IS end-to-end (rc=1 on the real fixture). The other two are unit-level
+-- only: they pin that the walk descends under a lambda/application and into a
+-- PATTERN (`LitAlt`), which `emitLiteralPattern` would otherwise emit. The
+-- pattern case is documentation of the walk, NOT evidence that a
+-- pattern-position unrepresentable STRING literal is caught end to end — no dump
+-- has ever contained one (zero value-position `LitString` in 35 dumps), and
+-- `Lower` sits between parse and this check. AMENDED BY M4 TASK 4: the
+-- "`LitChar` x0" half of this claim is now FALSE, and the distinction matters.
+-- `CharOps.hs` puts `LitChar` in PATTERN position for real (`classify 'a' = 1`),
+-- so for `Char`s the pattern arm is live, observed, and covered end to end by
+-- the same refusal (see the Task 4 block).
+def unrepLone : Bind :=
+  .nonRec {name := "lone", unique := 1, ty := .tyCon "String" [], role := .id}
+    (.app (.var {name := "GHC.CString.unpackCStringUtf8#", unique := 2,
+                 ty := .tyCon "_Unknown" [], role := .id})
+          (.lit (.litStringUnrepresentable "78 ed a0 80 79")))
+def unrepNested : Bind :=
+  .nonRec {name := "deep", unique := 3, ty := .tyCon "String" [], role := .id}
+    (.lam {name := "x", unique := 4, ty := .tyCon "Int" [], role := .id}
+      (.app (.var {name := "f", unique := 5, ty := .tyCon "_Unknown" [], role := .id})
+            (.lit (.litStringUnrepresentable "c0 c0"))))
+def unrepInPattern : Bind :=
+  .nonRec {name := "matched", unique := 6, ty := .tyCon "Int" [], role := .id}
+    (.case_ (.var {name := "s", unique := 7, ty := .tyCon "String" [], role := .id})
+            {name := "wild", unique := 8, ty := .tyCon "String" [], role := .id}
+            (.tyCon "Int" [])
+            [.mk (.litAlt (.litStringUnrepresentable "ed a0 80")) []
+                 (.lit (.litInt 1))])
+def unrepFaithful : Bind :=
+  .nonRec {name := "fine", unique := 9, ty := .tyCon "String" [], role := .id}
+    (.lit (.litString "a\x00b"))
+
+#guard unrepresentableStringLiterals
+         {binds := [unrepLone], typeDecls := [], instances := []}
+       == [("lone", "78 ed a0 80 79")]
+#guard unrepresentableStringLiterals
+         {binds := [unrepNested], typeDecls := [], instances := []}
+       == [("deep", "c0 c0")]
+#guard unrepresentableStringLiterals
+         {binds := [unrepInPattern], typeDecls := [], instances := []}
+       == [("matched", "ed a0 80")]
+-- A faithful NUL literal is NOT flagged: that is the whole point of the split.
+#guard unrepresentableStringLiterals
+         {binds := [unrepFaithful], typeDecls := [], instances := []}
+       == []
+#guard unrepresentableStringLiterals
+         {binds := [unrepFaithful, unrepLone, unrepNested], typeDecls := [],
+          instances := []}
+       == [("lone", "78 ed a0 80 79"), ("deep", "c0 c0")]
+-- The message names the bind, the bytes, and the surrogate as the reason, and
+-- says NUL is not this case (the split, stated where a user reads it).
+def unrepMsg : String := unrepresentableStringLiteralError "lone" "78 ed a0 80 79"
+#guard (unrepMsg.splitOn "bytes `78 ed a0 80 79` in bind `lone`").length == 2
+#guard (unrepMsg.splitOn "LONE SURROGATE").length == 2
+#guard (unrepMsg.splitOn "NUL is NOT this case").length == 2
+
+/-! ## M4 Task 3 — the ctor rewrites skip string literals AND comments
+
+Pass 3 (`resolveUserCtors` + `replaceCtorApps`) is the ONLY textual pass whose
+needles are BARE identifiers. Passes 1, 2 and 4 key off
+`(GHCCore.tyConOpaque "X")`, whose own quote delimiters cannot appear unescaped
+inside a Lean string literal, so they are self-protecting by construction
+(audited: the only other `String.replace` in `Emit.lean` is the `{t}` template
+fill, which rewrites map TEMPLATES, not emitted source). Pass 3 was therefore the
+one place a rewrite could land INSIDE a literal, and the M2-era hedge above ("THE
+HEDGE, AND WHY IT DID NOT HOLD", in the M2 Task 1 records) held only while no
+Haskell string literal could reach the emitter at all. Tasks 1 and 2 made literals
+real; this task makes the rewrites literal- and COMMENT-aware
+(`Emit.mapOutsideLiterals`, and the four-state machine documented in the "Literal-
+and comment-aware scanning" section header there). The comment half arrived a
+commit later, after review found the leak it closes; its own records are in the
+"second pass" subsection below.
+
+MEASURED AT THE PARENT COMMIT (3664d3f) on `examples/haskell/StringCtorClash.hs`
+— transpile rc=0, and with the pins removed `lake build` rc=0 too, i.e. FULLY
+SILENT:
+
+    def label : List Char :=          -- Haskell: label = "Point (1)"
+      (String.toList) ("Point.Point (1)")
+    def needles : List Char :=
+      (String.toList) ("| Point.Point y (Point.Point) x Point.Point (1) (Point.Point (1))")
+    theorem esc_then_ctor : ("\"Point.Point (1)\"".toList, …
+
+THE TRAP THAT SHAPES THE PINS. A theorem comparing the transpiled literal against
+a HAND-WRITTEN copy of itself (`label = "Point (1)".toList`) still PASSED before
+the fix, because the rewrite hit both sides equally. Measured pre-fix: the build
+failed at exactly the five code-point/length pins and at NONE of the four
+self-referential ones — a fixture written only in the self-referential shape
+would have been green on silently-wrong output. Hence `label.length = 9` and the
+explicit `['P', 'o', …]` spelling in the fixture.
+-/
+
+-- THE SCANNER, segment by segment. `false` is code, `true` is VERBATIM — a string
+-- literal (quotes included) or a comment (delimiters included; see the "second
+-- pass" subsection below for those). The last case is the whole point: the scanner
+-- RESUMES, so the ` ++ Point (1)` after each literal is still code.
+#guard litSegments "a \"lit\" b"
+       == [(false, "a "), (true, "\"lit\""), (false, " b")]
+-- An escaped quote does NOT end the literal (Task 2's escaping, first direction).
+#guard litSegments "\"say \\\"hi\\\"\" ++ Point (1)"
+       == [(false, ""), (true, "\"say \\\"hi\\\"\""), (false, " ++ Point (1)")]
+-- A literal ENDING in an escaped BACKSLASH ends at the next quote (Task 2's
+-- escaping, second direction — the case a naive "skip the char after a
+-- backslash" gets wrong, running the literal on to the end of the file).
+#guard litSegments "\"x\\\\\" ++ Point (1)"
+       == [(false, ""), (true, "\"x\\\\\""), (false, " ++ Point (1)")]
+-- A raw `"` inside a CHAR literal does not open a string literal. This is real
+-- corpus text, not a hypothetical: `Generated/StringBasics.lean:44,48`.
+#guard litSegments "['\"'] ++ Point (1)" == [(false, "['\"'] ++ Point (1)")]
+#guard litSegments "theorem quoted_val : quoted = ['s', 'a', 'y', ' ', '\"', 'h', 'i', '\"', '\\n'] := by rfl"
+       == [(false, "theorem quoted_val : quoted = ['s', 'a', 'y', ' ', '\"', 'h', 'i', '\"', '\\n'] := by rfl")]
+-- An identifier's trailing apostrophe is NOT a delimiter (Lean allows `x'`), so
+-- the literal after it is still found.
+#guard litSegments "x' ++ \"Point (1)\""
+       == [(false, "x' ++ "), (true, "\"Point (1)\""), (false, "")]
+-- The EMITTER's spelling of a double-quote char literal is `'\"'` (`escapeLitChar`
+-- escapes both quotes in both positions), which the OUTSIDE escape rule covers.
+#guard litSegments "c == '\\\"' && Point (1)" == [(false, "c == '\\\"' && Point (1)")]
+-- Escaped char literals need no arm of their own: the escape rule steps over the
+-- payload and the surrounding quotes then change no state.
+#guard litSegments "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)"
+       == [(false, "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)")]
+-- DEGRADATION, both of THESE fail-loud (the two that are NOT are enumerated in
+-- the "second pass" subsection below): an unterminated literal classifies the
+-- tail as literal, so rewrites there are SKIPPED (Lean: "function expected at
+-- Point"), never made wrongly. Unreachable from emitter output — of the six sites in
+-- `Emit.lean` that write a `"`, five write BALANCED delimiters, and the sixth
+-- (`escapeCharLit '"'`, which is `'\"'` — exactly ONE quote, the file's only
+-- odd-quote emitter site) is covered by the escaped-char-literal arm, pinned
+-- below.
+#guard litSegments "f (Point 1) ++ \"unterminated Point (1)"
+       == [(false, "f (Point 1) ++ "), (true, "\"unterminated Point (1)")]
+#guard litSegments "" == [(false, "")]
+
+-- ROUND-TRIP: concatenating the segments is the identity on every case above.
+-- This is what makes `mapOutsideLiterals` safe to run over arbitrary emitted
+-- text — it can only change what `f` changes.
+#guard (["a \"lit\" b", "\"say \\\"hi\\\"\" ++ Point (1)", "\"x\\\\\" ++ Point (1)",
+         "['\"'] ++ Point (1)", "x' ++ \"Point (1)\"", "c == '\\\"' && Point (1)",
+         "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)", "",
+         "f (Point 1) ++ \"unterminated Point (1)", "\"\"", "\\", "'",
+         -- the comment shapes, same property (added with the second pass)
+         "-- a \" b\nf (Point 1) ++ \"Point (1)\"", "/- /- \"x -/ -/ Point (1)",
+         "-- one \" quote\nPoint (1)", "x -- y", "x /- y", "x -/ y", "x-y",
+         "f (Point 1) ++ /- unterminated Point (1)", "--", "/-", "-/", "\n",
+         "s \\\"Point (1)\""]).all
+       fun s => String.join ((litSegments s).map (·.2)) == s
+
+-- THE FIX AS A CONTRAST, not an assertion: the raw pass still rewrites inside a
+-- literal (this is the silent-wrong line, kept executable), the wrapped one does
+-- not, and both agree on ordinary code.
+#guard replaceCtorAppsCode "Point" "Point.Point" "\"Point (1)\"" == "\"Point.Point (1)\""
+#guard replaceCtorApps     "Point" "Point.Point" "\"Point (1)\"" == "\"Point (1)\""
+#guard replaceCtorApps     "Point" "Point.Point" "f (Point 1)"
+       == replaceCtorAppsCode "Point" "Point.Point" "f (Point 1)"
+
+-- INSIDE a literal, NONE of the five rewrites fire — the four fixed needles
+-- (`| C `, `(C)`, ` C (`, `(C (`) and `replaceCtorApps`. One literal carrying all
+-- four, which is what `needles` in the fixture is.
+#guard resolveUserCtors [pointDecl]
+         "\"| Point y (Point) x Point (1) (Point (1))\""
+       == "\"| Point y (Point) x Point (1) (Point (1))\""
+#guard resolveSpecText [pointDecl] [] "\"| Point y (Point) x Point (1) (Point (1))\""
+       == "\"| Point y (Point) x Point (1) (Point (1))\""
+
+-- OUTSIDE a literal, ALL FIVE still fire — the direction a fix like this breaks
+-- silently if it is only tested one way.
+#guard resolveUserCtors [pointDecl] "| Point ds_1 ds_2 =>" == "| Point.Point ds_1 ds_2 =>"
+#guard resolveUserCtors [pointDecl] "((Point) (x_1)) (y_2)" == "((Point.Point) (x_1)) (y_2)"
+#guard resolveUserCtors [pointDecl] "f (Point (1)) 2" == "f (Point.Point (1)) 2"
+#guard resolveUserCtors [pointDecl] "eq (Point 1 2)" == "eq (Point.Point 1 2)"
+#guard resolveUserCtors [pointDecl] "[Point 1 2]" == "[Point.Point 1 2]"
+-- ...and the boundary negatives are unaffected by the scan (`Point` is a
+-- substring of `mkPoint`, and a type annotation is not an application).
+#guard resolveUserCtors [pointDecl] "mkPoint 1 2 = (p : Point)"
+       == "mkPoint 1 2 = (p : Point)"
+
+-- THE ESCAPE BOUNDARIES, each followed by real code that must still be
+-- rewritten — the "scanner resumes" property at the rewrite level rather than
+-- the segment level. Pre-fix every one of these rewrote inside the literal.
+#guard resolveUserCtors [pointDecl] "f \"Point (1)\" (Point 1 2)"
+       == "f \"Point (1)\" (Point.Point 1 2)"
+#guard resolveUserCtors [pointDecl] "f \"\\\"Point (1)\\\"\" (Point 1 2)"
+       == "f \"\\\"Point (1)\\\"\" (Point.Point 1 2)"
+#guard resolveUserCtors [pointDecl] "f \"Point (1)\\\\\" (Point 1 2)"
+       == "f \"Point (1)\\\\\" (Point.Point 1 2)"
+-- A ctor name flanked by escaped quotes INSIDE one literal: the `\"` is content,
+-- not a boundary, so nothing here is code.
+#guard resolveUserCtors [pointDecl] "\"x\\\"Point (1)\\\"y\""
+       == "\"x\\\"Point (1)\\\"y\""
+-- A ctor name SPANNING an escape is invisible to a textual needle either way
+-- (`Poi\x6et` is `Point` only after Lean decodes it) — recorded because it is the
+-- one shape the fix does not need to handle: no rewrite is the safe direction.
+#guard resolveUserCtors [pointDecl] "\"Poi\\x6et (1)\"" == "\"Poi\\x6et (1)\""
+-- Two literals with code between and after them — the multi-segment case.
+#guard resolveUserCtors [pointDecl] "(\"Point (1)\", Point 1 2, \"Point (2)\", Point 3 4)"
+       == "(\"Point (1)\", Point.Point 1 2, \"Point (2)\", Point.Point 3 4)"
+-- The emitted shape end-to-end, exactly as `StringCtorClash.lean` has it.
+#guard resolveUserCtors [pointDecl]
+         "((Prod.mk) ((String.toList) (\"Point (1)\"))) (((Point) (n)) (n))"
+       == "((Prod.mk) ((String.toList) (\"Point (1)\"))) (((Point.Point) (n)) (n))"
+
+-- `mapOutsideLiterals` itself: `f` sees only code segments, and never literal or
+-- comment content. Marking each segment `f` receives makes that visible directly.
+#guard mapOutsideLiterals (fun c => "<" ++ c ++ ">") "a \"b\" c"
+       == "<a >\"b\"< c>"
+#guard mapOutsideLiterals id "any \"text\" at all" == "any \"text\" at all"
+#guard mapOutsideLiterals (fun c => "<" ++ c ++ ">") "a -- b\nc"
+       == "<a >-- b\n<c>"
+
+/-! ### M4 Task 3, SECOND PASS — the scanner tracks Lean COMMENTS
+
+Review found that the first version of `Emit.litScan` modelled string and char
+literals but NO comments, and that Lean comments are reachable in the text it
+scans: `shim/spec-plugin/GhcSpecDump.hs` lexes with `rawTokStream = True` and
+copies a `{- @lean … -}` body verbatim, the `lean` quasi-quoter does the same for
+a `[lean| … |]` block, and `Main.lean:401` hands the result to `resolveSpecText`.
+So the mask leaked, and the leak was SILENT rather than fail-loud: a comment
+carrying an ODD number of `"` opened a spurious literal, that literal closed on
+the OPENING quote of the next REAL literal, and the real literal's contents landed
+in a CODE segment and were rewritten.
+
+MEASURED at `37140d0` (the parent), through `resolveSpecText`, both comment forms.
+The `segs` line is the evidence: `Point (1)` — the content of the REAL literal —
+was classified `false`, i.e. CODE.
+
+    in : -- the label is "Point (1)
+         theorem t : label = "Point (1)".toList := by rfl
+    out: -- the label is "Point (1)
+         theorem t : label = "Point.Point (1)".toList := by rfl
+    segs: [(false, -- the label is ), (true, "Point (1)
+          theorem t : label = "), (false, Point (1)), (true, ".toList := by rfl)]
+
+    in : /- note: "Point -/ theorem t : label = "Point (1)".toList := by rfl
+    out: /- note: "Point -/ theorem t : label = "Point.Point (1)".toList := by rfl
+    segs: [(false, /- note: ), (true, "Point -/ theorem t : label = "),
+          (false, Point (1)), (true, ".toList := by rfl)]
+
+Latent, not observed: 1 of the corpus's 162 spec blocks comments at all
+(`examples/haskell/DefaultMethods.hs`, six `--` lines) and those carry no quote —
+but spec text is USER-AUTHORED, so a commented theorem block is ordinary.
+
+DIFFERENTIAL FUZZ against an independent Python model of the same four-state
+lexer, comparing a per-character VERBATIM bitmap: 307,286 inputs over four
+alphabets (`" \ ' x (` to length 7; `" \ ' x - ⏎` to 6; `" \ ' x / -` to 6;
+`" - / ⏎ x` to 7), ZERO divergences and ZERO round-trip failures. The same model
+against the PRE binary reports 9,697 / 14,067 / 24,020 divergences on the three
+comment-bearing alphabets, including the `--"⏎"…` leak family below, so the
+harness demonstrably reports.
+
+E2E: `examples/haskell/SpecComment.hs`, five spec blocks. At `37140d0` it does not
+build — three errors, one per hazard, and the generated diff shows the inversion
+exactly: the literal was rewritten (`"Point.Point (1)".toList`) while the real
+ctor application beside it was NOT (`Point 1 2` left bare → "Function expected at
+Point"). Now: transpile rc=0, elaborates with 0 errors, 5 theorems green.
+-/
+
+-- THE MEASURED LEAK, both forms, pinned as the fixed shape.
+#guard resolveSpecText [pointDecl] []
+         "-- the label is \"Point (1)\ntheorem t : label = \"Point (1)\".toList := by rfl"
+       == "-- the label is \"Point (1)\ntheorem t : label = \"Point (1)\".toList := by rfl"
+#guard resolveSpecText [pointDecl] []
+         "/- note: \"Point -/ theorem t : label = \"Point (1)\".toList := by rfl"
+       == "/- note: \"Point -/ theorem t : label = \"Point (1)\".toList := by rfl"
+
+-- A `--` comment with an ODD quote count, then a real literal that must NOT be
+-- rewritten and code that MUST be — the three-way discrimination in one string.
+-- The comment is one verbatim segment, its NEWLINE included.
+#guard litSegments "-- a \" b\nf (Point 1) ++ \"Point (1)\""
+       == [(false, ""), (true, "-- a \" b\n"), (false, "f (Point 1) ++ "),
+           (true, "\"Point (1)\""), (false, "")]
+#guard resolveUserCtors [pointDecl] "-- a \" b\nf (Point 1) ++ \"Point (1)\""
+       == "-- a \" b\nf (Point.Point 1) ++ \"Point (1)\""
+
+-- NESTED block comments. Lean nests these (`/- -/` inside `/- -/` elaborates
+-- clean, measured in 4.24.0), so the state carries a depth: the inner opener
+-- pushes, the first closer pops to depth 1, the second closes. The `"` inside
+-- changes no literal state, and the code after the comment is still rewritten.
+#guard litSegments "/- /- \"x -/ -/ Point (1)"
+       == [(false, ""), (true, "/- /- \"x -/ -/"), (false, " Point (1)")]
+#guard resolveUserCtors [pointDecl] "/- /- \"x -/ -/ Point (1)"
+       == "/- /- \"x -/ -/ Point.Point (1)"
+
+-- Neither comment opener is special INSIDE a string literal...
+#guard litSegments "\"-- not a comment\" ++ Point (1)"
+       == [(false, ""), (true, "\"-- not a comment\""), (false, " ++ Point (1)")]
+#guard litSegments "\"/- not a comment\" ++ Point (1)"
+       == [(false, ""), (true, "\"/- not a comment\""), (false, " ++ Point (1)")]
+-- ...and a `"` is not a delimiter inside a comment. Both directions are Lean's
+-- own lexing, and both had to be pinned: getting either backwards desyncs the
+-- scanner on ordinary text.
+#guard litSegments "-- one \" quote\nPoint (1)"
+       == [(false, ""), (true, "-- one \" quote\n"), (false, "Point (1)")]
+
+-- `-` and `/` that are NOT comment starts: subtraction, division, a negative
+-- literal argument and an unspaced `x-y`. One character of the pair is not
+-- enough, and nothing here changes state.
+#guard litSegments "a - b / c ++ (x - -1) ++ Point (1)"
+       == [(false, "a - b / c ++ (x - -1) ++ Point (1)")]
+#guard litSegments "x-y" == [(false, "x-y")]
+-- ...against the two that ARE (a comment running to EOF is the tail).
+#guard litSegments "x -- y" == [(false, "x "), (true, "-- y")]
+#guard litSegments "x /- y" == [(false, "x "), (true, "/- y")]
+-- A block CLOSER in code position is not a token this scanner reacts to: at
+-- depth 0 there is nothing to close, and in Lean it is a syntax error anyway.
+#guard litSegments "x -/ y" == [(false, "x -/ y")]
+
+-- DEGRADATION, the loud direction: an unterminated block comment classifies the
+-- tail as verbatim, so rewrites there are SKIPPED, never made wrongly.
+#guard litSegments "f (Point 1) ++ /- unterminated Point (1)"
+       == [(false, "f (Point 1) ++ "), (true, "/- unterminated Point (1)")]
+
+-- THE SAME ROOT CAUSE, footnote: the OUTSIDE `\` arm used to be unconditional,
+-- but `\` is a real Lean token (`SDiff` — `#eval "abc" \ "b"` parses), so it read
+-- the `\"` below as an ESCAPED QUOTE and the literal's contents as CODE.
+-- Measured pre-fix: `s \"Point.Point (1)"`. It is now the escaped-CHAR-literal
+-- arm (`'` `\` c `'`), which fires only where the backslash is inside a char
+-- literal, so the `\` here is code and the literal after it is a literal.
+#guard litSegments "s \\\"Point (1)\""
+       == [(false, "s \\"), (true, "\"Point (1)\""), (false, "")]
+#guard resolveSpecText [pointDecl] [] "theorem t : (label, s \\\"Point (1)\") = x"
+       == "theorem t : (label, s \\\"Point (1)\") = x"
+-- ...and both quote-bearing spellings of a char literal still classify as code,
+-- as do the LONGER escapes that match neither char arm (`'\x00'` is hand-written
+-- corpus text, `Generated/StringBasics.lean:54`).
+#guard litSegments "c == '\\\"' && Point (1)" == [(false, "c == '\\\"' && Point (1)")]
+#guard litSegments "['\"'] ++ Point (1)" == [(false, "['\"'] ++ Point (1)")]
+#guard litSegments "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)"
+       == [(false, "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)")]
+
+/-! ### M4 GATE REVIEW — the residual leaks are REFUSED, not pinned
+
+THE PARENT COMMIT pinned two of these as expected WRONG output, with a comment
+saying "the fix is another state, not another hedge". The gate review measured a
+THIRD form with the same signature — `«a"b»` is a legal Lean identifier carrying
+an unbalanced `"` (`def «a"b» : Nat := 1` elaborates in 4.24.0, measured) — which
+is the counter-evidence to that plan: the family is not bounded by the forms an
+author happens to think of, so a state per discovery never terminates and the
+next undiscovered form is silent exactly as these three were.
+
+ALL THREE MEASURED THROUGH `resolveSpecText` at the parent (`6bb139e`), quoted
+here as the evidence for the refusal rather than pinned as an expectation — a
+`#guard` on wrong output says "expected", and it would go red the day someone
+adds the state:
+
+    r"a\" ++ "Point (1)"          → r"a\" ++ "Point.Point (1)"
+    s!"{f "Point (1)"}"           → s!"{f "Point.Point (1)"}"
+    «a"b» = 1 ∧ label = "Point (1)" → «a"b» = 1 ∧ label = "Point.Point (1)"
+
+`resolveSpecText` is UNCHANGED and still leaks on all three: the fix is UPSTREAM
+of it. `Emit.desyncCapableSpecForms` detects the forms and `Main.lean` refuses
+the module before anything is written, so no such text ever reaches the rewrite.
+
+CORPUS: exactly ONE hit over ALL 197 spec blocks of `examples/haskell/**/*.hs`
+(116 `{- @lean -}` + 81 `[lean| … |]`, extracted from the sources and run through
+the detector in one pass), and that hit is `examples/haskell/SpecInterp.hs` — the
+MUST-FAIL fixture added for this refusal, which carries an ordinary-looking
+`s!"…"` property and now refuses end-to-end with `rc=1` and no `.lean` written.
+The other 196 blocks pass, so the refusal costs the corpus nothing. The one known
+false positive is a guillemet CHAR literal (`c = '«'`), absent from all 197; see
+`Emit.guillemetSplit` for why no carve-out is made.
+
+E2E, both directions, MEASURED with the parent binary and the new one over the
+SAME dump (`StringCtorClash`, four hand-written blocks — the three forms plus one
+ordinary line): PRE emitted all three leaks with `rc=0` (`"Point.Point (1)"`
+inside each literal) while leaving the ordinary block's literal verbatim and its
+real ctor qualified; POST refuses, naming all three blocks by source line and
+NOT naming the fourth.
+-/
+
+-- THE THREE MEASURED FORMS, each now a REFUSAL.
+#guard desyncCapableSpecForms "theorem t : x = r\"a\\\" ++ \"Point (1)\""
+       == [rawStringFormName]
+#guard desyncCapableSpecForms "theorem t : x = s!\"{f \"Point (1)\"}\""
+       == [interpolationFormName]
+#guard desyncCapableSpecForms "theorem t : «a\"b» = 1 ∧ label = \"Point (1)\""
+       == [guillemetFormName]
+-- The form NAMES, pinned once so the three guards above stay about the FORM and
+-- the refusal message stays free to be reworded.
+#guard [rawStringFormName, interpolationFormName, guillemetFormName]
+       == ["raw string literal (`r\"…\"`)", "string interpolation (`s!\"…\"`)",
+           "guillemet identifier (`«…»`)"]
+-- `r#"…"#` is a raw string too (elaborates in 4.24.0, measured), and the trailing
+-- `#`s are why the opener test drops them before looking for the `r`.
+#guard desyncCapableSpecForms "theorem t : x = r#\"a\"# ++ \"Point (1)\""
+       == [rawStringFormName]
+-- More than one form in one block reports both, deduplicated.
+#guard desyncCapableSpecForms "theorem t : r\"a\" = s!\"b\" ∧ x = s!\"c\""
+       == [rawStringFormName, interpolationFormName]
+
+-- ORDINARY SPEC TEXT MUST NOT REFUSE — the reachability half, since a refusal
+-- that fires on innocent text is a regression. Real corpus lines first
+-- (`StringCtorClash.hs`, `SpecComment.hs`), then the near-misses the boundary
+-- tests exist for.
+#guard desyncCapableSpecForms
+         "theorem label_then_ctor : (label, mkPoint 1 2) = (\"Point (1)\".toList, Point 1 2) := by rfl"
+       == []
+#guard desyncCapableSpecForms
+         "-- the label is \"Point (1)\ntheorem t : label = \"Point (1)\".toList := by rfl"
+       == []
+-- A word ENDING in `r` before a closing quote — `"numerator"` is ordinary
+-- Haskell/Lean text, and a substring test for `r\"` would refuse it.
+#guard desyncCapableSpecForms "theorem t : field = \"numerator\"" == []
+-- An identifier ENDING in `!` applied to a string — `get!`/`panic!` are real
+-- Lean names, and the space is what distinguishes them from `s!\"`.
+#guard desyncCapableSpecForms "theorem t : m.get! \"key\" = 1" == []
+#guard desyncCapableSpecForms "theorem t : xs = panic! \"nope\"" == []
+-- A BALANCED guillemet identifier is fine: both delimiters land in the same code
+-- segment, so nothing is split.
+#guard desyncCapableSpecForms "theorem «my thm» : label = \"Point (1)\"" == []
+-- All three forms INSIDE a string literal, and all three inside a COMMENT: both
+-- are verbatim segments, neither desyncs anything, so neither is reported. The
+-- second is what the `startsWith \"\\\"\"` test buys — comments are verbatim too.
+#guard desyncCapableSpecForms "theorem t : x = \"r\" ++ \"s!\" ++ \"«a»\"" == []
+#guard desyncCapableSpecForms "-- r\"a\" s!\"b\" «c\ntheorem t : x = \"Point (1)\"" == []
+-- A bare `!\"` is `not` applied to a literal, not an interpolation.
+#guard desyncCapableSpecForms "theorem t : !\"\".isEmpty = false" == []
+-- Every escape shape the char-literal arms handle, and the `\\` that is a real
+-- Lean token: none of them is a desync form.
+#guard desyncCapableSpecForms "theorem t : ['\\n', '\\x00', '\\\\', '\\''] = cs" == []
+#guard desyncCapableSpecForms "theorem t : (label, s \\\"Point (1)\") = x" == []
+
+-- KERNEL REDUCTION, the property `partial` would have cost: every `#guard` above
+-- and this `rfl` need `litScan` to reduce, and it does because it is STRUCTURAL on
+-- the character list — `litScan._sunfold` exists in the environment (the marker of
+-- structural rather than well-founded recursion), and the block-comment DEPTH is a
+-- plain `Nat` in the state, matched as `0` or `d + 1`, so nesting never enters the
+-- termination argument.
+example : litSegments "/- /- \"x -/ -/z"
+        = [(false, ""), (true, "/- /- \"x -/ -/"), (false, "z")] := by rfl
+
+/-! ## M4 Task 4 — `Char` operations: two mappings, nine loud failures, and the
+    surrogate refusal
+
+    THE HEADLINE. This task maps almost nothing (`ord`, `isDigit`) and that IS
+    the result: the `Data.Char` surface is mostly unmappable without
+    silent-wrongness, and pinning WHICH parts and WHY is the deliverable. The
+    second half is the review handoff from Tasks 1/2: `MachChar` had the same
+    silent surrogate loss `MachStr` had, and this is the task where a real `Char`
+    literal first exists to trigger it.
+
+    OBSERVED NAMES, QUOTED, WITH THE NEGATIVES (`CharOps.hs`, GHC 9.2.7,
+    `grep -o '"name": "[^"]*"' /tmp/transpile-CharOps.json | sort -u`):
+      "name": "GHC.Base.ord"              -- x1
+      "name": "GHC.Unicode.isDigit"       -- x1
+      "name": "GHC.Classes.$fEqChar"      -- x1  (dict, erased by Lower)
+      "name": "GHC.Classes.$fOrdChar"     -- x1  (dict, erased by Lower)
+      "name": "GHC.Types.C#" / "C#"       -- the box, erased by Lower
+      "name": "Char" / "Char#"            -- both already in typeConMap
+    and from a throwaway probe of the unmappable surface:
+      "name": "GHC.Unicode.isAlpha" / "isUpper" / "isLower" / "isSpace"
+      "name": "GHC.Unicode.toUpper" / "toLower"
+      "name": "GHC.Char.chr"
+      "name": "GHC.Classes.min" / "GHC.Classes.max"
+    NEGATIVES, all measured 0-occurrence: `Data.Char.ord`, `Data.Char.isDigit`,
+    `Data.Char.chr`, `GHC.Char.ord`, `GHC.Char.isDigit`. THE PLAN GUESSED WRONG
+    IN BOTH DIRECTIONS — it hedged `Data.Char.*`/`GHC.Char.*` for `ord`/`isDigit`
+    and the truth is `GHC.Base.ord`/`GHC.Unicode.isDigit`; it guessed
+    `Data.Char.chr` and the truth is `GHC.Char.chr`. The rule behind the result:
+    `Data.Char` is a RE-EXPORT module, and Core names come from where a thing is
+    DEFINED. Consequence for the pins below — a `#guard valueMap
+    "Data.Char.isAlpha" == none` protects nothing, because that key can never
+    appear; the load-bearing pins are the `GHC.Unicode.*` / `GHC.Char.*` ones.
+
+    `C#` ERASURE ON A REAL `Char` LITERAL — WORKS, first time ever. The path
+    (`Lower.lean:33`, `:50-52`, `Maps.isUnwrappingDataCon`) existed since the
+    Int work but had never seen a `LitChar`. (The "35 prior dumps, all zero"
+    figure is INHERITED from the Tasks 1-2 blocks, not re-measured here; what IS
+    measured here is the corpus census below, and the fact that this task's own
+    fixtures are the first to be non-zero.)
+    Observed Core for `lone = '\55296'`:
+      "rhs": { "tag": "App",
+               "fun": { "tag": "Var", "var": { "name": "GHC.Types.C#" } },
+               "arg": { "tag": "Lit", "lit": { "tag": "LitChar", ... } } }
+    and the emitted Lean is `def lone : Char := '<one char>'` — the box gone, no
+    wrapper. `CharOps.hs` also puts a `Char` literal in PATTERN position
+    (`classify 'a' = 1`), which emits `| 'a' => (1 : Int)` and elaborates: the
+    first real-dump exercise of `emitLiteralPattern`'s `.litChar` arm, and of
+    `escapeLitChar`'s raw-non-ASCII path (`'é'`, `'٥'`), previously unit-only.
+
+    THE `MachChar` SURROGATE LOSS — BEFORE AND AFTER.
+    The predicate is NOT `MachStr`'s, and that is the one thing a reader must
+    take away. Reusing `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs` here
+    would be a guaranteed FALSE NEGATIVE on the only case it exists to catch: by
+    the time `T.singleton` has run the surrogate is already U+FFFD, and U+FFFD
+    round-trips UTF-8 perfectly, so the predicate answers "not lossy". The test
+    is therefore on the `Char` ITSELF (`isSurrogate c = ord c >= 0xD800 && <=
+    0xDFFF`), before `Text` can destroy it.
+    BEFORE (parent commit 2f6729a, `CharSurrogate.hs`, `lone = '\55296'`):
+      transpile rc=0, and
+        def lone : Char :=
+          '\65533'                      -- U+FFFD, emitted bytes `ef bf bd`
+      `lake build` GREEN. A legal, plausible-looking, WRONG `Char`.
+    AFTER: transpile rc=1, no `Generated/CharSurrogate.lean`, no `.map.json`,
+      error: char literal not representable: code point `U+D800` in bind `lone`
+    SCHEMA — same channel as Task 2, per-tag evidence. `"unrepresentable"` is
+    present iff the literal has no faithful Lean image; PRESENCE is the flag and
+    the content is the evidence. The CONTENT differs by tag on purpose, so the
+    two can never be misread for one another: BYTES (`"78 ed a0 80 79"`) for
+    `LitString`, whose loss is a byte-encoding fact, and a CODE POINT
+    (`"U+D800"`) for `LitChar`, whose loss is not — no UTF-8, no overlong NUL, no
+    decode is involved. Hence two constructors and two messages.
+    THE CBOR IS LOSSLESS, and this arm proves it: `U+D800` can only be REPORTED
+    if the true code point survived `Codec.Serialise` and `GhcDump.Convert`, so
+    `T.singleton` was the only lossy step. Two-shim control over the same saved
+    `CharSurrogate.pass-0000.cbor`: the JSONs differ by EXACTLY
+    `+ "unrepresentable": "U+D800",` and nothing else.
+    `Parse` reads the FLAG FIRST, mirroring Task 2's hardening but for a sharper
+    reason. There the type-coupled read was a future-schema hedge; here it is the
+    live hazard — `value` for a flagged `LitChar` is U+FFFD, an ordinary
+    ONE-character string, so the `[c]` single-char read SUCCEEDS and would
+    quietly yield `.litChar '\65533'`. Order is what makes `value` provably
+    irrelevant rather than accidentally harmless. -/
+
+-- THE TWO MAPPINGS, under their OBSERVED keys.
+#guard valueMap "GHC.Base.ord" == some "(fun c => (c.toNat : Int))"
+#guard valueMap "GHC.Unicode.isDigit" == some "Char.isDigit"
+-- No bare alphabetic keys, per this map's standing rule (a user's own `ord`/
+-- `isDigit` is a bare Core name and must keep resolving to their def).
+#guard valueMap "ord" == none
+#guard valueMap "isDigit" == none
+
+-- LOUD-FAIL BOUNDARY GUARDS — the task's soundness core. Lean v4.24 is
+-- ASCII-ONLY for all six predicates/case-mappers while Haskell is Unicode-aware,
+-- so the mismatch set is the COMPLEMENT of what spec §M4 assumed. Measured both
+-- sides: `isAlpha 'é'` = True (Haskell) / false (Lean); same for `isUpper 'É'`,
+-- `isLower 'é'`, `toUpper 'é'`, `toLower 'É'`; `isSpace` differs on `\v`, `\f`
+-- and NBSP. Mapping ANY of them would be SILENT-WRONG — a total Lean function
+-- that compiles and answers differently. A faithful version needs `base`'s
+-- general-category tables, which is out of scope, not a small omission.
+--
+-- `chr` is worse than a mismatch: Haskell's `Char` INCLUDES the 2048 surrogates
+-- and Lean's excludes them, so `chr 0xD800` is `'\55296'` in Haskell while
+-- `Char.ofNat 0xD800` is `'\0'` in Lean — a DEFINED Haskell value mapped to a
+-- different one. No total Lean function is faithful, so it is not a
+-- ⊥-refinement (the project's allowed tradeoff) but silent-wrong (never
+-- allowed). Only `n < 0` and `n >= 0x110000` are genuinely ⊥. Note `ord` maps
+-- and `chr` does not, which is not an inconsistency: every LEAN `Char` has a
+-- faithful Haskell image, so the gap enters only through CONSTRUCTION.
+--
+-- These are the pins that BITE, because these are the keys GHC actually emits.
+#guard valueMap "GHC.Unicode.isAlpha" == none
+#guard valueMap "GHC.Unicode.isUpper" == none
+#guard valueMap "GHC.Unicode.isLower" == none
+#guard valueMap "GHC.Unicode.toUpper" == none
+#guard valueMap "GHC.Unicode.toLower" == none
+#guard valueMap "GHC.Unicode.isSpace" == none
+#guard valueMap "GHC.Char.chr"        == none
+-- The plan's hedged spelling, pinned as the plan asks — but labelled honestly:
+-- these are 0-occurrence keys (`Data.Char` re-exports; Core names come from the
+-- defining module), so they are TRIVIALLY true and protect nothing. They are
+-- here so a reader who arrives with the plan in hand sees the keys it named and
+-- the note that they are the wrong ones, rather than concluding the pin is
+-- missing.
+#guard valueMap "Data.Char.isAlpha" == none
+#guard valueMap "Data.Char.isUpper" == none
+#guard valueMap "Data.Char.isLower" == none
+#guard valueMap "Data.Char.toUpper" == none
+#guard valueMap "Data.Char.toLower" == none
+#guard valueMap "Data.Char.isSpace" == none
+#guard valueMap "Data.Char.chr"     == none
+-- `min`/`max` AT `Char` (plan correction 5) — a DOCUMENTED NEGATIVE, comment
+-- plus these two pins, and deliberately NOT a Lean witness: `example : Min Char
+-- := inferInstance` does not compile, so the only way to "test" it is to break
+-- the build. The mapping itself is correct and stays (`Min.min`/`Max.max` are
+-- right at every type that has the instance); it is `Char` that has none in
+-- v4.24. So this is a LOUD failure at `lake build`, not a transpiler bug, and it
+-- is measured, not assumed — a probe emitting `def mn : (Char → (Char → Char))
+-- := Min.min` gave exactly:
+--     error: failed to synthesize
+--       Min Char
+-- The same probe pinned the other seven as `Unknown identifier
+-- `GHC.Unicode.isAlpha`` (and so on, all seven). That is what "loud" means here:
+-- nine names, nine build failures, zero wrong answers.
+#guard valueMap "GHC.Classes.min" == some "Min.min"
+#guard valueMap "GHC.Classes.max" == some "Max.max"
+-- Everything else the `Ord` recipe asks for DOES synthesize at `Char`, which is
+-- why the fixture's `==`/`<`/`<=` theorems are green: the 8 binders in
+-- `classConMap "Ord"` minus `Min`/`Max`, plus `Inhabited Char` = `'A'`.
+#guard classConMap "Ord" == some ["[Ord {t}]", "[LT {t}]", "[LE {t}]",
+                                  "[DecidableLT {t}]", "[DecidableLE {t}]",
+                                  "[Min {t}]", "[Max {t}]", "[BEq {t}]"]
+
+-- EMISSION of an unrepresentable `Char`, loud in BOTH positions. Value position
+-- is unreachable post-refusal (defence in depth, as for strings); PATTERN
+-- position is a LIVE route for `Char`s specifically — `f '\55296' = ...` is
+-- ordinary Haskell and `LitAlt (MachChar ...)` is observed — so the pattern arm
+-- is a real backstop, not a hedge.
+#guard emitLiteral (.litCharUnrepresentable "U+D800")
+        == "(GHCCore.unrepresentableCharLiteral \"U+D800\")"
+#guard emitLiteralPattern (.litCharUnrepresentable "U+DFFF")
+        == "(GHCCore.unrepresentableCharLiteral \"U+DFFF\")"
+-- `GHCCore.unrepresentableCharLiteral` is DELIBERATELY UNDEFINED (like its
+-- string sibling): an emitter that skipped the refusal must fail `lake build`
+-- with a name that quotes the code point, never produce `'\65533'`.
+
+-- PARSING the flag: absent means faithful, present means refusable. The second
+-- guard is the live hazard — `value` is a one-character U+FFFD string that the
+-- single-char read would have ACCEPTED, so it pins the ORDER, not just the flag.
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "A")]) with
+        | .ok (.litChar c) => c == 'A'
+        | _                => false)
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "�"),
+           ("unrepresentable", "U+D800")]) with
+        | .ok (.litCharUnrepresentable cp) => cp == "U+D800"
+        | _                                => false)
+-- Present-but-non-String is an ERROR, not an absorbed `.litChar`: the same
+-- type-coupled-read hardening Task 2's review added on the string side.
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "�"),
+           ("unrepresentable", (7 : Nat))]) with
+        | .error _ => true
+        | _        => false)
+-- Non-ASCII faithful literals still parse as themselves (the `'٥'` in the
+-- fixture, and a non-BMP char to show the channel is not "refuse everything
+-- exotic").
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "٥")]) with
+        | .ok (.litChar c) => c.toNat == 0x665
+        | _                => false)
+#guard (match parseLiteral (Lean.Json.mkObj
+          [("tag", "LitChar"), ("value", "💩")]) with
+        | .ok (.litChar c) => c.toNat == 0x1F4A9
+        | _                => false)
+
+-- THE REFUSAL, named by owner bind. BOTH POSITIONS ARE END-TO-END here, which is
+-- the sharpest contrast with the string side: `CharSurrogate.hs` carries two
+-- binds — `lone = '\55296'` (value) and `f '\55296' = 1` (PATTERN) — and the
+-- real fixture exits 1 with TWO error lines, naming bind `lone` and bind `f`,
+-- producing no `.lean`. The pattern bind was measured refusing in ISOLATION
+-- first, so it is not carried by the value-position one. `unrepCharNested` below
+-- stays a unit guard: it pins that the ONE traversal descends under a
+-- lambda/application, a shape no fixture happens to produce.
+def unrepCharLone : Bind :=
+  .nonRec {name := "lone", unique := 1, ty := .tyCon "Char" [], role := .id}
+    (.app (.var {name := "GHC.Types.C#", unique := 2,
+                 ty := .tyCon "_Unknown" [], role := .id})
+          (.lit (.litCharUnrepresentable "U+D800")))
+def unrepCharNested : Bind :=
+  .nonRec {name := "deep", unique := 3, ty := .tyCon "Char" [], role := .id}
+    (.lam {name := "x", unique := 4, ty := .tyCon "Int" [], role := .id}
+      (.app (.var {name := "f", unique := 5, ty := .tyCon "_Unknown" [], role := .id})
+            (.lit (.litCharUnrepresentable "U+DC00"))))
+def unrepCharInPattern : Bind :=
+  .nonRec {name := "matched", unique := 6, ty := .tyCon "Int" [], role := .id}
+    (.case_ (.var {name := "c", unique := 7, ty := .tyCon "Char" [], role := .id})
+            {name := "wild", unique := 8, ty := .tyCon "Char" [], role := .id}
+            (.tyCon "Int" [])
+            [.mk (.litAlt (.litCharUnrepresentable "U+DFFF")) []
+                 (.lit (.litInt 1))])
+def faithfulChar : Bind :=
+  .nonRec {name := "fine", unique := 9, ty := .tyCon "Char" [], role := .id}
+    (.lit (.litChar '٥'))
+
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharLone], typeDecls := [], instances := []}
+       == [("lone", "U+D800")]
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharNested], typeDecls := [], instances := []}
+       == [("deep", "U+DC00")]
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharInPattern], typeDecls := [], instances := []}
+       == [("matched", "U+DFFF")]
+-- A faithful non-ASCII `Char` is NOT flagged — the refusal is about the
+-- surrogate range, not about being exotic.
+#guard unrepresentableCharLiterals
+         {binds := [faithfulChar], typeDecls := [], instances := []}
+       == []
+#guard unrepresentableCharLiterals
+         {binds := [faithfulChar, unrepCharLone, unrepCharNested],
+          typeDecls := [], instances := []}
+       == [("lone", "U+D800"), ("deep", "U+DC00")]
+
+-- ONE TRAVERSAL, TWO VIEWS. This is the guard that makes the refactor honest:
+-- a program carrying BOTH kinds is reported by both views, each seeing only its
+-- own kind and neither swallowing the other. The failure mode this rules out is
+-- a second walker added beside the first and then forgotten when a third
+-- unrepresentable constructor arrives — a silent hole in a refusal.
+#guard unrepresentableStringLiterals
+         {binds := [unrepCharLone, unrepLone], typeDecls := [], instances := []}
+       == [("lone", "78 ed a0 80 79")]
+#guard unrepresentableCharLiterals
+         {binds := [unrepCharLone, unrepLone], typeDecls := [], instances := []}
+       == [("lone", "U+D800")]
+
+-- The message names the bind and the CODE POINT, says SURROGATE, and explicitly
+-- disclaims the UTF-8 story that the string message is made of — the two are
+-- separate so that a user with a surrogate `Char` is not sent to look at bytes
+-- that were never the problem.
+def unrepCharMsg : String := unrepresentableCharLiteralError "lone" "U+D800"
+#guard (unrepCharMsg.splitOn "code point `U+D800` in bind `lone`").length == 2
+#guard (unrepCharMsg.splitOn "SURROGATES").length == 2
+#guard (unrepCharMsg.splitOn "NOT about UTF-8").length == 2
+-- And it is NOT the string message: sharing one would have been the easy bug.
+#guard unrepCharMsg != unrepresentableStringLiteralError "lone" "U+D800"
+
+/-! ### M4 Task 4 — e2e and byte-identity
+
+    `CharOps.hs`: 18 theorems, ALL GREEN, `lake build
+    GhcCoreToLean.Generated.CharOps` rc=0. Tactics per the plan's measured table,
+    and the table held with one useful addition:
+      * `blaster` x5, all `✅ Valid` — `Char` equality (`sameChar_refl`), the
+        symbolic law `∀ (a b : Char), sameChar a b = sameChar b a`
+        (`sameChar_sym`), ordering (`charLess_digit_letter`), the symbolic
+        `∀ (c : Char), charLE c c = true` (`charLE_refl`), and the `Nat → Char →
+        Nat` ROUND-TRIP `∀ n, n < 128 → charCode (Char.ofNat n) = (n : Int)`.
+        The round-trip is the one that extends the table: correction 6 measured
+        the bare `(Char.ofNat n).toNat = n` shape, and this one carries the
+        `Nat → Int` coercion `ord`'s mapping introduces — blaster handles it.
+      * `rfl` x13 — every concrete goal: the four literals (incl. `'é'` and
+        `'٥'`), both `ord` pins, the five `isDigit` pins, the three `classify`
+        pattern-match pins.
+      * `decide` was NOT needed anywhere, and is NOT usable for the symbolic
+        goals: `∀ c : Char` has no `Decidable` instance in v4.24. `simp` was not
+        needed either — this fixture has no `∀ (cs : List Char)` law (that shape
+        is `StringBasics.shout_len`, and blaster hard-fails on it).
+    The `'٥'` pin is the load-bearing semantic one: U+0665 ARABIC-INDIC DIGIT
+    FIVE is a Unicode digit that `isDigit` rejects on BOTH sides, which is the
+    agreement that makes it the only mappable predicate. It is also the fixture's
+    non-ASCII emission test.
+
+    BYTE-IDENTITY, two-binary, CBOR HELD FIXED (the shim is a post-dump
+    translator, so replaying saved `pass-0000.cbor` is the whole method). Both
+    the shim AND the transpiler changed, so both pairs were saved and replayed.
+    13 modules replayed: `Fib`, `ListLiterals`, `RecordOps`, `UserClass`,
+    `OrdHandwritten`, `TupleBasics`, `Ratio`, `StringBasics`, `StringCtorClash`,
+    `SpecComment`, `StringSurrogate` (11 identical) and `CharOps`,
+    `CharSurrogate` (2 intentionally different). Identical means all four of
+    emitted `.lean`, transpiler stderr, rc, AND shim JSON. Harness validated
+    first, the same way Task 2 did it: its replay output plus `transpile.sh`'s
+    appended `end <mod>` line is byte-identical to the live
+    `Generated/StringBasics.lean`, so the harness introduces no drift.
+    THE 11 ZEROES ARE PROVEN, NOT ARGUED. A census of the change surface over
+    the same 13 saved JSONs — `LitChar`, `GHC.Base.ord`, `GHC.Unicode.isDigit`,
+    the only three things this commit can react to — is 0/0/0 for every module
+    that came out identical, and non-zero for exactly the two that differ
+    (`CharOps` 6/1/1, `CharSurrogate` 1/0/0). The traversal refactor's blast
+    radius is covered by `Ratio` (54 `LitString`s), `StringBasics` and
+    `StringCtorClash` specifically.
+    `CharOps`'s SIX `LitChar`s are worth naming: four in value position
+    (`letterA`, `digitZero`, `accent`, `arabicFive`) and TWO in pattern position
+    (`classify`'s `'a'` and `'b'`) — the value/pattern split this task cares
+    about, present in one ordinary fixture.
+    The two intended diffs, quoted: `CharOps` differs by exactly the two
+    mappings (`GHC.Base.ord` → `(fun c => (c.toNat : Int))`,
+    `GHC.Unicode.isDigit` → `Char.isDigit`) and nothing else; `CharSurrogate`
+    differs by rc 0→1, the loss of a `.lean` that used to contain
+    `def lone : Char := '\65533'`, and the shim JSON gaining the flag.
+    The corpus therefore CANNOT prove the new shim ran, exactly as in Task 2, and
+    Task 2's positive control is now STALE — `strings <binary> | grep -c
+    unrepresentable` no longer discriminates, because Task 2 put that key in the
+    pre-binary. The control that does work here is direct and per-tag: over the
+    saved `CharSurrogate.pass-0000.cbor` the two shims' JSON differs by exactly
+    `+ "unrepresentable": "U+D800",`; `find shim/dist-newstyle -name
+    ghc-core-shim` returns exactly ONE candidate (what `transpile.sh:127`
+    resolves) whose mtime postdates `Main.hs`; and the live pipeline's
+    `/tmp/transpile-CharSurrogate.json` carries the field.
+
+    HANDOFFS FOR TASK 5.
+    * EXPECTED REDS gain a fifth must-fail fixture: `examples/haskell/
+      CharSurrogate.hs` — rc=1, no `.lean`, message naming bind `lone` and code
+      point `U+D800`. It sits alongside `StringSurrogate.hs` and the four class
+      fixtures, and like them is EXCLUDED from the green-regression count.
+    * README limitations, each now measured rather than predicted, with the exact
+      build errors to quote: seven `Unknown identifier` (`GHC.Unicode.isAlpha`,
+      `isUpper`, `isLower`, `isSpace`, `toUpper`, `toLower`, `GHC.Char.chr`) and
+      two `failed to synthesize` (`Min Char`, `Max Char`). Note the README should
+      say `GHC.Unicode.*`/`GHC.Char.*`, NOT `Data.Char.*` — the plan's
+      spelling is 0-occurrence.
+    * SPEC CORRECTION 1 needs a second amendment, not just the Task-2 one: its
+      claim that the shim's `LitChar` arm is "already complete and lossless" was
+      measured FALSE and is now FIXED, and correction 3's `chr` verdict is
+      confirmed with the observed key `GHC.Char.chr` (the spec and plan both say
+      `Data.Char.chr`, which never appears).
+    * CORRECTION 6's table can be EXTENDED, not just recorded: the `Nat → Char →
+      Nat` round-trip verifies with blaster even with the `Nat → Int` coercion
+      in it. Still no `List Char` goal anywhere — untested by this task and
+      unchanged.
+    * `GHC.Base.chr` was never probed (only `GHC.Char.chr` was observed). If a
+      future dump shows it, it needs the same `== none` pin. Recorded as an
+      unprobed name, not as a negative.
+    * `Char` RANGES are SAFE-BY-ACCIDENT and worth a README line, because
+      `['a'..'z']` is the first thing a user writing `Char` code reaches for and
+      nothing in this task touched ranges. Measured: it transpiles (rc=0) to
+      `((Hs.enumFromTo) ('a')) ('e')` — `GHC.Enum.enumFromTo` was already mapped
+      and the `GHC.Enum.$fEnumChar` dict is erased by `Lower` — and then fails
+      LOUD at `lake build`, because `Hs.enumFromTo` is MONOMORPHIC on `Int`
+      (`Runtime.lean:20`): "Application type mismatch: 'a' has type Char but is
+      expected to have type Int". So the outcome is right, but it is guaranteed
+      by a signature nobody chose for this reason — anyone generalising
+      `Hs.enumFromTo` to an `Enum`-like class would silently turn a `Char` range
+      into whatever that instance does, and Haskell's `Enum Char` is
+      `chr`-based, i.e. exactly the unfaithful direction (correction 3). Pin it
+      before generalising. -/
 
 end GhcCoreToLean.Tests

@@ -124,24 +124,128 @@ partial def emitType : GHCType → String
   | .tyLit (.nat n)  => toString n
   | .tyLit (.str s)  => s!"\"{s}\""
 
-/-! ## Literal emission -/
+/-! ## Literal emission
+
+    STRING AND CHAR LITERAL ESCAPING (M4 Task 2). Both payloads used to be
+    interpolated RAW, which was harmless only while the shim discarded them and
+    every string arrived as the placeholder `<bs>`. With real bytes flowing, a
+    literal containing `"` or a newline emits unparseable Lean: MEASURED on
+    `quoted = "say \"hi\"\n"`, whose emitted `("say "hi"\n")` was a SYNTAX error
+    (`16:43: unexpected identifier; expected ')', ',' or ':'`) that fired
+    *instead of* the unknown-identifier error the mapping was supposed to produce
+    — see the `M4 Task 1` block in `Tests/Unit.lean`.
+
+    ESCAPING, NOT `Char.ofNat`. The alternative was to sidestep quoting by
+    emitting char literals as `Char.ofNat n`. Rejected because it buys nothing:
+    `emitLiteralPattern` must emit a real char literal (`Char.ofNat n` is not a
+    pattern — Lean answers "Invalid pattern: Expected a constructor or constant
+    marked with `[match_pattern]`"), so an escaper is needed for the pattern
+    position regardless, and having two different spellings of a `Char` literal
+    depending on position is strictly worse than one.
+
+    WHAT IS ESCAPED, and what deliberately is not: the two quotes, the backslash,
+    and the C0 control characters (`\n`/`\t`/`\r` by name, the rest as `\xNN`) —
+    all verified accepted by the v4.24 parser in BOTH literal positions. Non-ASCII
+    is emitted RAW: the generated file is UTF-8, `'é'`/`'💩'` are valid Lean
+    literals, and `\uXXXX` cannot spell a non-BMP character anyway. That also
+    settles Task 1's handoff about a U+FFFD "arriving from a non-UTF-8 literal":
+    post-refusal (see `unrepresentableStringLiterals`) a U+FFFD in an emitted
+    literal is always a genuine user U+FFFD, and it emits raw like any other
+    non-ASCII character. -/
+
+/-- One character, escaped for a Lean string or char literal. Both quotes are
+    escaped in both positions: `\"` and `\'` are accepted inside either literal
+    form, so one escaper serves both and there is no position-dependent variant to
+    get wrong. -/
+private def escapeLitChar (c : Char) : String :=
+  match c with
+  | '\\' => "\\\\"
+  | '"'  => "\\\""
+  | '\'' => "\\'"
+  | '\n' => "\\n"
+  | '\t' => "\\t"
+  | '\r' => "\\r"
+  | c    =>
+    let n := c.toNat
+    if n < 0x20 || n == 0x7F then
+      let hex := (Nat.toDigits 16 n).asString
+      s!"\\x{if hex.length == 1 then "0" ++ hex else hex}"
+    else String.singleton c
+
+/-- A Lean string literal (quotes included) for `s`. -/
+def escapeStringLit (s : String) : String :=
+  "\"" ++ s.foldl (fun acc c => acc ++ escapeLitChar c) "" ++ "\""
+
+/-- A Lean char literal (quotes included) for `c`. -/
+def escapeCharLit (c : Char) : String :=
+  "'" ++ escapeLitChar c ++ "'"
 
 def emitLiteral : Literal → String
   | .litInt n    => s!"({n} : Int)"
   | .litWord n   => s!"({n} : Nat)"
   | .litFloat f  => s!"({f} : Float)"
   | .litDouble f => s!"({f} : Float)"
-  | .litString s => s!"\"{s}\""
-  | .litChar c   => s!"'{c}'"
+  | .litString s => escapeStringLit s
+  -- Unreachable in a module that emits at all: `Main.lean` refuses the program
+  -- before emission (`unrepresentableStringLiterals`). Kept LOUD rather than
+  -- plausible — an undefined identifier — so that a future caller who emits
+  -- without running the refusal gets a `lake build` failure naming the bytes
+  -- instead of a silently-wrong string.
+  | .litStringUnrepresentable hex => s!"(GHCCore.unrepresentableStringLiteral \"{hex}\")"
+  | .litChar c   => escapeCharLit c
+  -- Unreachable for the same reason and kept loud in the same way as the string
+  -- case above: `Main.lean` refuses first (`unrepresentableCharLiterals`), and if
+  -- some future caller emits without running the refusal it gets an undefined
+  -- identifier naming the code point, not `'\65533'`.
+  | .litCharUnrepresentable cp => s!"(GHCCore.unrepresentableCharLiteral \"{cp}\")"
   | .litLabel l  => s!"GHCCore.foreignLabel \"{l}\""
 
+/-- Literal in PATTERN position (a `LitAlt` alternative).
+
+    THE `.litString` ARM FAILS LOUD, and that is a change of kind, not of text. A
+    Haskell string literal is a `[Char]`, so against the `List Char` scrutinee
+    that `unpackCString#` now produces, `"hi"` is a type error at best; before
+    this task it emitted a `String` pattern that could only ever be ill-typed.
+
+    IS `LitAlt (MachStr …)` REACHABLE? Not from a string pattern in ordinary
+    Haskell: GHC's `tidyLitPat` expands a SHORT `HsString` pattern into a
+    cons-chain of `Char` patterns and routes a long one through `eqString`, so
+    `case s of "hi" -> …` never becomes a literal alternative. But `hsLitKey` maps
+    `HsStringPrim` (an `Addr#` literal pattern) to `LitString`, and `matchLiterals`
+    builds `LitAlt` from `hsLitKey`. REVIEW CORRECTION: the `MagicHash` route
+    this comment used to name is NOT reachable — GHC 9.2.7 rejects both
+    `f "hi"# = 1` and `case a of "hi"# -> 1` in the front end, before Core
+    (`error: Illegal unboxed string literal in pattern: "hi"#`, measured). The
+    `hsLitKey` mapping still exists and TH-generated patterns / other front ends
+    were not probed, so the arm is dead-but-unproven rather than ruled out.
+    Measured negatively: zero value-position `LitString`
+    in any of 35 dumps, i.e. the arm is entirely unobserved either way. Under
+    "cannot rule it out ⇒ fail loud" it emits an undefined pattern head, which
+    Lean rejects with "Invalid pattern: Expected a constructor or constant marked
+    with `[match_pattern]`" (verified).
+
+    `.litChar` IS THE OPPOSITE CASE — reachable, ordinary, and now OBSERVED. A
+    Haskell `f 'a' = …` unboxes to a `case` on `Char#` whose alternatives are
+    `LitAlt (MachChar …)`, so this arm runs on real data (M4 Task 4's
+    `CharOps.classify`, the first dump in the project ever to contain a `LitChar`
+    at all — before it, `LitChar` was ×0 in 35 dumps in BOTH positions). It stays
+    a real literal, which is exactly right: `'c'` against a `Char` scrutinee is a
+    valid Lean pattern (measured — `| 'a' => (1 : Int)` elaborates).
+
+    `.litCharUnrepresentable` fails loud HERE TOO, and unlike the string case that
+    is not defence-in-depth against a dead arm: pattern position is live for
+    `Char`, so `f '\55296' = …` is a real route by which a surrogate could reach
+    the output. It is refused before emission (`unrepresentableCharLiterals` walks
+    `LitAlt` as well as value position) and this arm is the backstop. -/
 def emitLiteralPattern : Literal → String
   | .litInt n    => toString n
   | .litWord n   => toString n
   | .litFloat f  => toString f
   | .litDouble f => toString f
-  | .litString s => s!"\"{s}\""
-  | .litChar c   => s!"'{c}'"
+  | .litString s => s!"(GHCCore.unsupportedStringPattern {escapeStringLit s})"
+  | .litStringUnrepresentable hex => s!"(GHCCore.unrepresentableStringLiteral \"{hex}\")"
+  | .litChar c   => escapeCharLit c
+  | .litCharUnrepresentable cp => s!"(GHCCore.unrepresentableCharLiteral \"{cp}\")"
   | .litLabel _  => "_"
 
 /-! ## Var emission -/
@@ -3157,6 +3261,12 @@ single identifier occurrence, so none can span the `\n\n` between two pieces.
 Pass 4 must run last, and pass 1 must have reached every section before it, or a
 local type still spelled opaque gets rewritten to `M.T` for its OWN module `M`.
 
+PASS 3 IS ALSO THE ONLY PASS WHOSE NEEDLES ARE BARE IDENTIFIERS — 1, 2 and 4 all
+match `(GHCCore.tyConOpaque "X")`, whose own quotes cannot occur unescaped inside
+a Lean string literal — so it is the only one that needs to know where the string
+literals are. See "Literal- and comment-aware scanning" below for the scan, its
+four lexical states and the audit.
+
 Newtype erasure (pass 2) adds two constraints of its own, both live:
 
 * Passes 1 and 3 take `keptTypeDecls`, NOT `p.typeDecls`. Pass 1 on the full set
@@ -3516,6 +3626,144 @@ def malformedNewtypeWarning (n : Name) : String :=
   s!"  expected to FAIL to typecheck (identity bodies against a one-field\n" ++
   s!"  inductive). This indicates a corrupt or out-of-date decl sidecar."
 
+/-! ## Unrepresentable string literals
+
+    THE SOUNDNESS CORE OF M4 TASK 2. Mapping `unpackCString#` turns a string
+    literal from a loud unknown identifier into a value Lean believes, so any
+    literal whose bytes did not survive the trip is no longer merely wrong — it is
+    SILENTLY wrong: wrong `length`, wrong content, compiles fine.
+
+    GHC writes literals in MODIFIED UTF-8, which deviates from the standard in
+    exactly two ways (`utf8EncodeChar`, GHC 9.2.7): the overlong NUL `C0 80`, and
+    3-byte encodings of lone surrogates. It is NOT CESU-8 — a supplementary
+    character gets standard 4-byte UTF-8 (measured: `"\128169"` decodes to `💩`
+    correctly) — so this must not become a blanket refusal of non-ASCII.
+
+    THE SPLIT (this is why the coarse "any lossy decode" predicate was not the
+    refusal criterion):
+    * U+0000 IS A LEGAL LEAN `Char`. The shim now decodes `C0 80` back to a real
+      NUL (`undoOverlongNul`), so `"a\0b"` transpiles FAITHFULLY as three
+      characters. Refusing it would have declined Haskell that has a perfect Lean
+      image, and it would have done so permanently.
+    * U+D800–DFFF IS NOT A LEAN `Char` AT ALL (plan correction 3: Haskell's `Char`
+      spans [0,0x10FFFF] including the 2048 surrogates; Lean's excludes them). No
+      decoder can help, so this is the residue that must REFUSE.
+
+    WHY THE FLAG COMES FROM THE SHIM. The predicate is `encodeUtf8 (decodeUtf8With
+    lenientDecode bs) /= bs` over the NUL-repaired bytes — and the BYTES ARE GONE
+    after JSON, so Lean cannot recompute it. The shim therefore emits
+    `"unrepresentable": "<hex>"` and this pass reads it. And the refusal lives
+    HERE rather than as a `die` in the shim because the shim cannot know whether a
+    literal reaches emission: a shim-level death would crash modules whose only
+    such literal sits in a dropped `$tr`/`$cshowsPrec`/error-collapsed bind, i.e.
+    modules that transpile fine today. `Ratio` is that module — 54 `LitString`s,
+    9 of them in real user binds' `error` messages — and it must stay green.
+
+    SCOPE, stated honestly. `Main.lean` runs this over the FILTERED, post-`Lower`
+    binds, so junk binds cannot trigger it. Binds dropped LATER, at emission (the
+    `error`→`default` collapse discards a bottom's whole application, message
+    included), are still in the walked set: a lone surrogate inside an `error`
+    string would refuse a module that would have emitted fine. That is a
+    conservative refusal — loud, never silent-wrong — and it is preferred to
+    mirroring the collapse here, which would duplicate emission logic in a
+    validator and could then disagree with it. -/
+
+/-- Every literal with NO faithful Lean image in an expression — BOTH
+    `.litStringUnrepresentable` and `.litCharUnrepresentable` — including
+    literals in PATTERN position (a `LitAlt` alternative), since
+    `emitLiteralPattern` would put the same unrepresentable payload in the
+    output. Pattern position is dead-but-unproven for strings and LIVE for
+    `Char`s (`f 'a' = …` unboxes to `LitAlt (MachChar …)`), so the `LitAlt` arm
+    is load-bearing, not a hedge.
+
+    ONE TRAVERSAL, TWO VIEWS (`unrepresentableStringLiterals` /
+    `unrepresentableCharLiterals` below). M4 Task 4 could have added a second
+    walker beside the string one; it did not, because the failure mode of that
+    shape is a THIRD unrepresentable constructor added later and collected by
+    only one of them — a silent hole in a refusal, which is the worst place in
+    this codebase to have one. Add a constructor here and both views see it. -/
+private partial def unrepLitsInExpr : Expr → List Literal
+  | .lit l@(.litStringUnrepresentable _) => [l]
+  | .lit l@(.litCharUnrepresentable _)   => [l]
+  | .app f a          => unrepLitsInExpr f ++ unrepLitsInExpr a
+  | .lam _ b          => unrepLitsInExpr b
+  | .cast e           => unrepLitsInExpr e
+  | .tick e           => unrepLitsInExpr e
+  | .let_ bnd b       =>
+    (match bnd with
+     | .nonRec _ e => unrepLitsInExpr e
+     | .rec_ ps    => ps.flatMap (fun p => unrepLitsInExpr p.2))
+      ++ unrepLitsInExpr b
+  | .case_ scr _ _ alts =>
+    unrepLitsInExpr scr ++
+      alts.flatMap (fun (.mk con _ rhs) =>
+        (match con with
+         | .litAlt l@(.litStringUnrepresentable _) => [l]
+         | .litAlt l@(.litCharUnrepresentable _)   => [l]
+         | _ => []) ++ unrepLitsInExpr rhs)
+  | _                 => []
+
+/-- `(owner bind, unrepresentable literal)` for the whole program. The owner is
+    the TOP-LEVEL bind the literal sits under, which is what the refusals name:
+    it is the only thing that points a user at their source. -/
+private def unrepLitsInProgram (p : Program) : List (Name × Literal) :=
+  p.binds.flatMap fun b =>
+    match b with
+    | .nonRec v e => (unrepLitsInExpr e).map fun l => (v.name, l)
+    | .rec_ ps    => ps.flatMap fun (v, e) => (unrepLitsInExpr e).map fun l => (v.name, l)
+
+/-- `(owner bind, hex bytes)` for every STRING literal with no faithful Lean
+    image. -/
+def unrepresentableStringLiterals (p : Program) : List (Name × String) :=
+  (unrepLitsInProgram p).filterMap fun (n, l) =>
+    match l with
+    | .litStringUnrepresentable hex => some (n, hex)
+    | _                             => none
+
+/-- `(owner bind, code point)` for every `Char` literal with no faithful Lean
+    image — a lone surrogate U+D800–DFFF, which Haskell's `Char` has and Lean's
+    does not. -/
+def unrepresentableCharLiterals (p : Program) : List (Name × String) :=
+  (unrepLitsInProgram p).filterMap fun (n, l) =>
+    match l with
+    | .litCharUnrepresentable cp => some (n, cp)
+    | _                          => none
+
+/-- The refusal message for one `unrepresentableStringLiterals` pair. -/
+def unrepresentableStringLiteralError (owner : Name) (hex : String) : String :=
+  s!"string literal not representable: bytes `{hex}` in bind `{owner}`\n" ++
+  s!"  GHC writes string literals in MODIFIED UTF-8, and these bytes decode to a\n" ++
+  s!"  LONE SURROGATE (U+D800–DFFF) or are not valid UTF-8 even after the overlong\n" ++
+  s!"  NUL (`C0 80`) is repaired. A Haskell `Char` spans [0,0x10FFFF] INCLUDING the\n" ++
+  s!"  2048 surrogates; a Lean `Char` excludes them, so this literal has no Lean\n" ++
+  s!"  value at all — not a different one. Emitting it would put U+FFFD replacement\n" ++
+  s!"  characters in the output: a plausible-looking string of the wrong length and\n" ++
+  s!"  the wrong content, which compiles. So transpilation is refused instead.\n" ++
+  s!"  Remedy: remove the surrogate from the literal (`\\55296` and friends), or\n" ++
+  s!"  represent the text as the byte/code-point list you actually mean.\n" ++
+  s!"  Note: NUL is NOT this case — `\"a\\0b\"` transpiles faithfully as 3 chars."
+
+/-- The refusal message for one `unrepresentableCharLiterals` pair.
+
+    SEPARATE from the string one on purpose. A string's loss is a byte-encoding
+    fact and its message is mostly about modified UTF-8 — the overlong NUL, the
+    lenient decode, the repair. NONE of that applies to a `Char`: the code point
+    arrives intact in the CBOR and the loss is `T.singleton`'s `safe`. Sharing
+    one message would have told a user with a surrogate `Char` literal to go look
+    at bytes that were never the problem. -/
+def unrepresentableCharLiteralError (owner : Name) (cp : String) : String :=
+  s!"char literal not representable: code point `{cp}` in bind `{owner}`\n" ++
+  s!"  A Haskell `Char` spans [0,0x10FFFF] INCLUDING the 2048 SURROGATES\n" ++
+  s!"  (U+D800–U+DFFF); a Lean `Char` excludes them. So this literal has no Lean\n" ++
+  s!"  value at all — not a different one. Emitting it would put U+FFFD (the\n" ++
+  s!"  REPLACEMENT CHARACTER) in the output: a legal, plausible-looking, WRONG\n" ++
+  s!"  `Char` that compiles. So transpilation is refused instead.\n" ++
+  s!"  Remedy: remove the surrogate from the literal (`\\55296` and friends), or\n" ++
+  s!"  represent the code point as the `Nat` you actually mean.\n" ++
+  s!"  Note: this is NOT about UTF-8 — unlike the string-literal refusal, no\n" ++
+  s!"  encoding or decoding is involved. `chr` is unmapped for the same reason\n" ++
+  s!"  (no total Lean function can be faithful on the surrogate range)."
+
 /-- Characters that continue (or qualify) a Lean identifier. A ctor-name
     occurrence flanked by one of these is part of a LONGER name — `mkPoint`,
     `Points`, `Point.Point` — and must never be rewritten. -/
@@ -3535,14 +3783,428 @@ private def isIdentish (c : Char) : Bool :=
 private def isArgStart (c : Char) : Bool :=
   c == '(' || c == '[' || c == '⟨' || c.isDigit
 
-/-- Boundary-aware rewrite of `bare` → `qual` at every APPLICATION-position
+/-! ### Literal- and comment-aware scanning (pass 3's silent holes, closed)
+
+M4 TASK 3. Pass 3 is the ONLY pass in the pipeline above whose needles are BARE
+identifiers. Passes 1, 2 and 4 all key off `(GHCCore.tyConOpaque "X")`, and that
+needle carries its own `"` delimiters: a Lean string literal spells an inner
+quote `\"`, so the needle cannot match inside one. They are self-protecting by
+construction (audited, M4 Task 3 — the only other `String.replace` in this file is
+the `{t}` template fill in `Maps`-driven signature emission, which rewrites map
+TEMPLATES, not emitted source). Pass 3 had no such protection: it is a plain text
+rewrite, so a ctor name followed by an argument INSIDE a string literal was
+rewritten too. That was documented as a hedge while its premise held — no Haskell
+string literal could reach the emitter at all — and M4 Task 2 destroyed the
+premise: `"Point (1)"` emitted as `"Point.Point (1)".toList`, type-correct,
+compiles, SILENTLY WRONG (measured before the fix, `rc=0` on both transpile and
+`lake build`).
+
+COMMENTS ARE PART OF THE PROBLEM, and the first version of this scanner modelled
+string and char literals only. Lean comments REACH this code:
+`shim/spec-plugin/GhcSpecDump.hs:43-47,60-65` lexes with `rawTokStream = True` and
+copies a `{- @lean … -}` body VERBATIM (no comment stripping), the `lean`
+quasi-quoter does the same for a `[lean| … |]` block, and `Main.lean:401` hands the
+result to `resolveSpecText`, where this pass runs. A scanner that masks literals
+but not comments is mask-then-LEAK, and the leak is SILENT: a comment carrying an
+ODD number of `"` opens a spurious literal, that literal closes on the OPENING
+quote of the next REAL literal, and the real literal's CONTENTS therefore land in
+a CODE segment and get rewritten. MEASURED through `resolveSpecText` on the
+pre-fix binary, both forms, and both are clean now:
+
+    in : -- the label is "Point (1)
+         theorem t : label = "Point (1)".toList := by rfl
+    out: -- the label is "Point (1)
+         theorem t : label = "Point.Point (1)".toList := by rfl
+
+    in : /- note: "Point -/ theorem t : label = "Point (1)".toList := by rfl
+    out: /- note: "Point -/ theorem t : label = "Point.Point (1)".toList := by rfl
+
+Reachability was never hypothetical: spec text is USER-AUTHORED and copied
+uninterpreted, and one corpus fixture already comments inside a spec block
+(`examples/haskell/DefaultMethods.hs`: six `--` lines, 1 of the corpus's 162
+blocks). Those six carry no quote, which is why the leak was latent rather than
+observed.
+
+THE STATE MACHINE. Four states, at most four characters of lookahead. Lean spells
+its block comment `/- … -/` and NESTS it, so the block state carries a depth;
+`block d` means `d + 1` openers are unclosed, which is why the closer has two arms
+— `d = 0` closes, `d + 1` pops — and no `Nat` subtraction appears anywhere.
+
+    CODE                                    STRING
+      `"`            flush, go STRING         `\` c    copy both, stay
+      `--`           flush, go LINE           `"`      close, go CODE
+      block opener   flush, go BLOCK 0        any c    copy, stay
+      `'` `\` c `'`  copy all four, stay
+      `'` c `'`      copy all three, stay   LINE (inside a `--` comment)
+      any c          copy, stay               newline  close (newline included)
+                                              any c    copy, stay
+    the two char-literal arms fire only
+    where the opening `'` cannot be an      BLOCK d
+    identifier's trailing apostrophe          block opener   go BLOCK (d + 1)
+    (`isIdentish`)                            block closer   d = 0: close, go CODE
+                                                             d + 1: go BLOCK d
+                                              any c          copy, stay
+
+Why each arm exists:
+
+* `\` c in STRING is what makes Task 2's escaping safe, in BOTH of its directions:
+  `"say \"hi\""` must not end at the first `\"`, and `"x\\"` must end at the quote
+  that follows the escaped BACKSLASH rather than reading `\"` as an escape and
+  running past the end of the literal. Quote-counting gets the first wrong;
+  quote-counting plus a naive "skip the char after a backslash" gets the second
+  wrong. The state machine tracks escape state, so both hold.
+* The two CHAR-LITERAL arms cover the two quote-bearing spellings of a char
+  literal, and both are real corpus text rather than hypotheses. `['"']` and
+  `['s', 'a', 'y', ' ', '"', …]` — a RAW quote inside a char literal — are
+  hand-written spec text (`Generated/StringBasics.lean:44,48`), and `'\"'` is what
+  the EMITTER writes (`escapeLitChar` escapes both quote characters in both
+  literal positions). Neither may open a string literal. This is deliberately NOT
+  a fifth state: Lean allows `'` inside identifiers (`x'`, `ds'`), so treating
+  every apostrophe as a delimiter would desync the scanner on ordinary code — the
+  exact mistake these arms are shaped to avoid. Requiring a non-identifier
+  character BEFORE the quote and a closing quote at the exact offset makes them
+  fire on char literals and never on `x'`.
+* A LONGER escape (`'\x00'`, itself hand-written corpus text at
+  `Generated/StringBasics.lean:54`, or `'é'`) matches NEITHER char arm and
+  needs no arm of its own: the apostrophe is copied, the scan resumes at the
+  backslash, and the payload is hex digits, so every character classifies as code
+  and no state changes. There is no unconditional `\` arm in CODE, and THAT IS THE
+  POINT: `\` is a real Lean token (`SDiff` — `#eval "abc" \ "b"` parses), so an
+  unconditional arm read the `\"` of `s \"Point (1)"` as an escaped quote and the
+  literal's contents as CODE, measured as `s \"Point.Point (1)"`. That is the same
+  silent shape as the comment leak, and the `'` `\` c `'` arm replaces it: it
+  fires only where the backslash sits INSIDE a char literal.
+* The `--` and BLOCK arms exist because comment text is copied verbatim into spec
+  files (above), and a comment is exactly where a user writes prose carrying an
+  unbalanced quote. Comment content is treated like literal content — copied,
+  never rewritten — and, crucially, it changes NO literal state: a `"` inside a
+  comment is not a delimiter, and a `--` or a block opener inside a string literal
+  is not a comment. Both directions are Lean's own lexing, pinned by elaborating
+  `/- -- -/`, a `--` line holding a block opener, and `/- /- -/ -/` in a scratch
+  file (all clean, 4.24.0).
+
+RESIDUAL DEGRADATIONS, and where "silent" is and is not ruled out.
+
+For EMITTER-GENERATED output the scan is exact, and that rests on an enumeration
+rather than an assumption. Every site in this file that writes a `"` into the
+OUTPUT is one of six: `escapeStringLit` and `escapeCharLit` (these are the
+literals this scan is about), and four RAW interpolations whose payload is a name,
+a hex string or a label — `(GHCCore.tyConOpaque "T")`,
+`(GHCCore.unrepresentableStringLiteral "hex")` (unreachable post-refusal),
+`GHCCore.foreignLabel "l"` and `emitType`'s `.tyLit (.str s)`. FIVE of the six
+write BALANCED delimiters. THE SIXTH DOES NOT, and it is the only odd-quote
+emitter site in the file: `escapeCharLit '"'` is `'\"'`, exactly ONE `"`. That is
+not a hole, it is what the `'` `\` c `'` arm is for. The four raw interpolations
+interpolate WITHOUT escaping, so a payload CONTAINING a raw quote or a trailing
+backslash would desync the scan — but that same payload is a Lean SYNTAX error on
+the line that carries it, so the failure is loud before the scan matters, and all
+four are unobserved with such a payload in every generated file in the corpus. The
+emitter writes no COMMENT at all: the only `--` text IT puts in a generated file
+is the symbol crib, and `Main.lean` concatenates that AFTER this pass runs. Spec
+text in the same file CAN carry comments — `Generated/DefaultMethods.lean:70-81`
+and `Generated/SpecComment.lean` both do — but that text is user-authored, which
+is the case below, not this one.
+
+For USER-AUTHORED spec text the honest claim is narrower, because the scanner
+models four of Lean's lexical states and Lean has more. The degradations split two
+ways:
+
+  * FAIL-LOUD, a MASK — code read as verbatim, so a rewrite is SKIPPED and Lean
+    says "function expected at Point", never a wrong value. An unterminated string
+    literal or an unterminated block comment classifies the tail as verbatim; a
+    raw `"` that no arm covers opens a spurious literal that runs to the next
+    quote. Splitting a code segment at a comment boundary is the same direction: a
+    fixed needle (` C (`) can no longer span a comment, so it degrades to a
+    skipped rewrite.
+  * NOT RULED OUT, a LEAK — literal content read as code, which is the silent
+    shape. AT LEAST THE FOLLOWING Lean lexical forms this scanner does not model
+    can produce one; the list is open-ended, and that is the whole point of the
+    refusal below. A RAW string literal (`r"a\"` is the two characters `a\`, not
+    an escape) is read here as an escape and runs on, so a following real
+    literal's content can be classified as code. An INTERPOLATION with a nested
+    literal (`s!"{f "y"}"`) closes the outer literal on the inner literal's
+    opening quote. A GUILLEMET IDENTIFIER carrying a quote — `«a"b»` is a legal
+    Lean identifier, `def «a"b» : Nat := 1` elaborates in 4.24.0 (measured) —
+    opens a literal on that quote. All three parse in 4.24.0 (measured), and all
+    three leak IDENTICALLY through `resolveSpecText`:
+
+        resolveSpecText [pointDecl] [] "theorem t : x = r\"a\\\" ++ \"Point (1)\""
+          → "theorem t : x = r\"a\\\" ++ \"Point.Point (1)\""
+        resolveSpecText [pointDecl] [] "theorem t : x = s!\"{f \"Point (1)\"}\""
+          → "theorem t : x = s!\"{f \"Point.Point (1)\"}\""
+        resolveSpecText [pointDecl] [] "theorem t : «a\"b» = 1 ∧ label = \"Point (1)\""
+          → "theorem t : «a\"b» = 1 ∧ label = \"Point.Point (1)\""
+
+    An earlier version of this comment said there were TWO such forms and that
+    "the fix is another state, not another hedge". The third one (found by the M4
+    gate review, measured above) is the counter-evidence: the family is not
+    bounded by a form the author happens to have thought of, so adding a state
+    per discovery cannot terminate, and the NEXT undiscovered form would be
+    silent exactly like these three were. So the fix is NEITHER a state nor a
+    hedge: `desyncCapableSpecForms` below DETECTS these forms in user-authored
+    spec text and `Main.lean` REFUSES the module — a scanner that cannot be
+    complete is made to fail loud on the inputs it cannot classify. None of the
+    three occurs in any corpus module that transpiles (the one that carries one,
+    `examples/haskell/SpecInterp.hs`, is a MUST-FAIL fixture for this refusal),
+    and a desync cannot cross `@lean` blocks — `Main.lean` resolves each block
+    separately — so the refusal is per block.
+-/
+
+/-- The scanner's lexical state. `block d` means `d + 1` block-comment openers are
+    unclosed, so the closer needs no `Nat` subtraction: it matches `0` (close) or
+    `d + 1` (pop). That is the whole of the nesting machinery, and it is why the
+    scanner stays a plain recursion over the character list. -/
+private inductive LexState where
+  | code
+  | str
+  | line
+  | block (depth : Nat)
+
+/-- Is this state's text copied VERBATIM, i.e. never handed to a rewrite? Every
+    state but `code` is: a string literal's content and a comment's content are
+    both text the passes must not touch. -/
+private def LexState.verbatim : LexState → Bool
+  | .code => false
+  | _     => true
+
+/-- The scanner of the section header. `st` is the state, `acc` the segment built
+    so far; a state change flushes `acc` and starts a fresh segment.
+
+    STRUCTURAL on the character list, and deliberately so: Lean accepts it with no
+    `termination_by` (`litScan._sunfold` exists in the environment, the marker of
+    structural recursion rather than well-founded), which is what keeps it
+    KERNEL-REDUCIBLE — the `#guard`s pinning it, and the `rfl` controls beside
+    them, depend on that, and `partial` would kill both.
+
+    Every recursive call is on a TAIL of the matched list, including the two that
+    LOOK like they rebuild one: `'\'' :: c :: '\'' :: rest` binds the tail
+    `c :: '\'' :: rest`, so the "this apostrophe was not a delimiter, rescan from
+    the next character" branches pass a subterm, not a construction. The
+    block-comment DEPTH never enters the termination argument at all — it is a
+    plain `Nat` in the state, matched as `0` or `d + 1`, so nesting costs the proof
+    nothing. (A variant that read the apostrophe's tail with a NESTED `match` was
+    measured to lose structural recursion — "failed to eliminate recursive
+    application" — and with it the kernel reduction; hence this shape.) -/
+private def litScan : List Char → LexState → String → List (Bool × String)
+  | [], st, acc => [(st.verbatim, acc)]
+  -- STRING: an escape pair is copied whole, so `\"` does not close and the `"`
+  -- after a `\\` is not mistaken for an escaped quote.
+  | '\\' :: c :: rest, .str, acc => litScan rest .str ((acc.push '\\').push c)
+  | '"'  :: rest,      .str, acc => (true, acc.push '"') :: litScan rest .code ""
+  -- LINE COMMENT: to end of line, the newline included in the comment segment.
+  | '\n' :: rest, .line, acc => (true, acc.push '\n') :: litScan rest .code ""
+  -- BLOCK COMMENT: Lean nests, so an opener pushes and a closer pops.
+  | '/' :: '-' :: rest, .block d, acc =>
+    litScan rest (.block (d + 1)) ((acc.push '/').push '-')
+  | '-' :: '/' :: rest, .block 0, acc =>
+    (true, (acc.push '-').push '/') :: litScan rest .code ""
+  | '-' :: '/' :: rest, .block (d + 1), acc =>
+    litScan rest (.block d) ((acc.push '-').push '/')
+  -- CODE: a quote opens a literal; `--` and a block opener start a comment.
+  | '"'  :: rest,       .code, acc => (false, acc) :: litScan rest .str  "\""
+  | '-' :: '-' :: rest, .code, acc => (false, acc) :: litScan rest .line "--"
+  | '/' :: '-' :: rest, .code, acc => (false, acc) :: litScan rest (.block 0) "/-"
+  -- CODE: a CHAR literal, in both quote-bearing spellings — `'"'` written by hand
+  -- and `'\"'` written by the emitter — but only where the opening quote cannot
+  -- be an identifier's trailing apostrophe (`x'`). Otherwise, and for any longer
+  -- escape (`'\x00'`), the quote alone is copied and the scan resumes at the next
+  -- character, which is what leaves those classified as code.
+  | '\'' :: '\\' :: c :: '\'' :: rest, .code, acc =>
+    if acc.isEmpty || !isIdentish acc.back then
+      litScan rest .code ((((acc.push '\'').push '\\').push c).push '\'')
+    else
+      litScan ('\\' :: c :: '\'' :: rest) .code (acc.push '\'')
+  | '\'' :: c :: '\'' :: rest, .code, acc =>
+    if (acc.isEmpty || !isIdentish acc.back) && c != '\\' && c != '\'' then
+      litScan rest .code (((acc.push '\'').push c).push '\'')
+    else
+      litScan (c :: '\'' :: rest) .code (acc.push '\'')
+  | c :: rest, st, acc => litScan rest st (acc.push c)
+
+/-- `src` split into alternating CODE (`false`) and VERBATIM (`true`) segments in
+    source order. A VERBATIM segment is a string literal (its quotes included) or
+    a COMMENT (its delimiters included, and for a `--` comment its newline).
+    Concatenating the second components reproduces `src` exactly (pinned in
+    `Tests/Unit.lean`). See the section header for the state machine. -/
+def litSegments (src : String) : List (Bool × String) :=
+  litScan src.data .code ""
+
+/-! ### The refusal that replaces the last hedge
+
+`litScan` models four of Lean's lexical states and Lean has more, so on
+USER-AUTHORED spec text it can DESYNC — see the section header above for the two
+directions and the three MEASURED leak forms (a raw string, an interpolation with
+a nested literal, a guillemet identifier carrying a quote). The leak direction is
+silent: literal content read as code, so a ctor name INSIDE a string literal gets
+rewritten and the theorem is about a different string than the one written.
+
+THE DECISION: detect and refuse, not one more state. Three forms with the same
+signature were found one at a time, two of them by review, and each was
+"the last one" until the next; a per-form state is a fix for the forms already
+found and no fix at all for the next. So the forms are detected here and
+`Main.lean` refuses the module before anything is written.
+
+WHY THIS IS NOT CIRCULAR (detecting a desync with the scanner that desyncs).
+`litSegments` is CORRECT on all text preceding the FIRST desync-capable form —
+that is what the differential fuzz established for the four states it does model
+— so the first such form is always observed in a correctly-classified position,
+and one hit is enough to refuse. What happens to text AFTER the first hit does
+not matter: the block is already refused.
+
+The one thing this does NOT detect is a form sitting after a MASK-direction
+degradation (an unterminated string literal or block comment classifies the tail
+as verbatim, so a form in that tail is invisible here). That needs no detection:
+the tail is copied verbatim, so no rewrite is made there at all, and the
+unterminated delimiter is a Lean syntax error on the very block that carries it.
+
+The detection is FORM-shaped, not consequence-shaped: it fires on the form
+whether or not the block also mentions a local constructor. Two reasons. The ctor
+set is a property of the MODULE, so the same block text would refuse in one module
+and pass in another, and adding a constructor elsewhere in the file could flip a
+passing property to refused — not a rule a user can hold in their head. And
+deciding whether a block mentions a ctor in a position that MATTERS means deciding
+which occurrences are inside a literal, which is the exact question the desync
+makes the scanner answer wrongly; a test built on that answer inherits the error.
+(A crude ctor-substring test avoids the circularity but not the module-dependence,
+and it would still refuse every hazardous block this one does.)
+-/
+
+/-- Characters that continue a Lean identifier for the purposes of the two
+    OPENER tests below: `isIdentish` plus `!` and `?`, which Lean admits inside a
+    name (`Option.get!`, `List.get?`). This is what makes `get!"x"` and `f r"x"`
+    the only false positives of those tests rather than every `get! "x"` and
+    `f r "x"` in ordinary spec text: with a SPACE the code segment ends in the
+    space, and without one the text IS the Lean spelling of the hazardous form. -/
+private def isNameChar (c : Char) : Bool :=
+  isIdentish c || c == '!' || c == '?'
+
+/-- Does this CODE segment end in the opener of a RAW string literal, i.e. is the
+    string literal that follows it `r"…"` / `r#"…"#` rather than `"…"`? Trailing
+    `#`s are dropped first (`r#"hi"#` elaborates in 4.24.0 — measured), and the
+    `r` must start a token, so `numerator"`, `Foo.r"` and `xr"` do not match. -/
+private def rawStringOpener (code : String) : Bool :=
+  match code.data.reverse.dropWhile (· == '#') with
+  | ['r']         => true
+  | 'r' :: c :: _ => !isNameChar c
+  | _             => false
+
+/-- Does this CODE segment end in the prefix of an INTERPOLATED string literal
+    (`s!"…"`, `m!"…"`, `f!"…"`)? The `!` must be adjacent to the following quote
+    AND preceded by a name character: a bare `!"…"` is `not` applied to a
+    literal, which is no interpolation and desyncs nothing. -/
+private def interpolationOpener (code : String) : Bool :=
+  match code.data.reverse with
+  | '!' :: c :: _ => isNameChar c
+  | _             => false
+
+/-- Is a GUILLEMET identifier split across this CODE segment's boundary? In
+    well-formed Lean every `«` in code position has its `»` in the same code
+    position, so an imbalance means the scanner ended the segment INSIDE the
+    identifier — which is exactly the desync, and it covers every hazardous
+    payload at once: the measured `«a"b»`, and equally `«a--b»` or a `«…»` name
+    carrying a block-comment opener, neither of which was ever measured.
+
+    ITS ONE KNOWN FALSE POSITIVE, stated rather than papered over: a guillemet
+    CHAR LITERAL (`c = '«'`). `litScan` copies a simple char literal into the
+    code segment, so the count is 1/0 and this fires — on text that desyncs
+    NOTHING. Measured absent from the corpus (0 of its 197 spec blocks), and no
+    carve-out is made for it: the test would have to know which `'` is a
+    delimiter and which is an identifier's trailing tick, which is the same
+    lexical guessing this whole refusal exists to stop. A property that needs
+    that character can spell it `Char.ofNat 171`. -/
+private def guillemetSplit (code : String) : Bool :=
+  (code.data.filter (· == '«')).length != (code.data.filter (· == '»')).length
+
+/-- The three form names, spelled once so the guards, the refusal message and
+    this detector cannot drift apart. -/
+def rawStringFormName      : String := "raw string literal (`r\"…\"`)"
+def interpolationFormName  : String := "string interpolation (`s!\"…\"`)"
+def guillemetFormName      : String := "guillemet identifier (`«…»`)"
+
+/-- Every desync-capable Lean lexical form in one block of user-authored spec
+    text, by name, in a stable order and deduplicated. `[]` means `litSegments`
+    classifies this text with the four states it does model, so the ctor rewrite
+    is safe on it; a non-empty result is a REFUSAL (`Main.lean`).
+
+    Reads `litSegments`' own segmentation, which is what keeps it honest about
+    context: a `r"` or `s!"` or `«` sitting inside a real string literal or
+    inside a COMMENT is in a VERBATIM segment, desyncs nothing (a literal's
+    escapes are tracked; a comment's content is skipped wholesale) and is NOT
+    reported. The `startsWith "\""` test is load-bearing for the same reason —
+    comments are verbatim segments too, and without it `x = r-- note` would
+    refuse. -/
+def desyncCapableSpecForms (src : String) : List String :=
+  let segs := litSegments src
+  -- The two OPENER forms straddle a segment boundary: `litScan` puts the opening
+  -- `"` at the START of the literal segment, so the `r` / `s!` is the TAIL of the
+  -- preceding code segment. Hence the pairwise walk rather than a substring scan.
+  let openers := (segs.zip (segs.drop 1)).flatMap fun ((v1, s1), (v2, s2)) =>
+    if v1 || !v2 || !(s2.startsWith "\"") then []
+    else (if rawStringOpener s1 then [rawStringFormName] else [])
+      ++ (if interpolationOpener s1 then [interpolationFormName] else [])
+  -- The guillemet form is INSIDE a code segment, and its tell is the imbalance.
+  let guillemets :=
+    if segs.any (fun (v, s) => !v && guillemetSplit s) then [guillemetFormName] else []
+  dedup (openers ++ guillemets)
+
+/-- The refusal message for one spec block, naming the block by its HASKELL
+    source line range (the only coordinate a user can act on — the Lean file does
+    not exist yet), every form found, and the remedy.
+
+    A REFUSAL rather than a warning, unlike the emitter-side degradations that
+    only cost a skipped rewrite: this one is the SILENT direction. The theorem
+    would elaborate, `blaster` would print `✅ Valid`, and the property proved
+    would be about `"Point.Point (1)"` — a string the user never wrote. -/
+def specTextDesyncError (hsStart hsEnd : Nat) (forms : List String) : String :=
+  let formList := String.intercalate ", " forms
+  s!"spec text uses a lexical form the constructor rewrite cannot scan: \
+{formList}\n" ++
+  s!"  In the `@lean` block at {hsStart}-{hsEnd} of the source module.\n" ++
+  s!"  The name-resolution pass that qualifies a user constructor (`Point` →\n" ++
+  s!"  `Point.Point`) is a TEXT rewrite guarded by a scanner that masks string\n" ++
+  s!"  literals and comments. That scanner models four of Lean's lexical states;\n" ++
+  s!"  the form above is one it does NOT model, and on it the mask DESYNCS — the\n" ++
+  s!"  content of a following string literal is read as code and rewritten. That\n" ++
+  s!"  is the silent-wrong direction: `\"Point (1)\"` becomes\n" ++
+  s!"  `\"Point.Point (1)\"`, the theorem elaborates, and it proves a property of a\n" ++
+  s!"  string you did not write. So transpilation is refused instead.\n" ++
+  s!"  Remedy: rewrite the property without the raw string / interpolation /\n" ++
+  s!"  guillemet identifier — or, if the form is what the property is ABOUT, keep\n" ++
+  s!"  every constructor name of this module out of the string literals in it.\n" ++
+  s!"  Ordinary literals and comments in spec text are fine and stay verbatim;\n" ++
+  s!"  only these forms are refused."
+
+/-- Apply `f` to every CODE segment of `src`, copying string literals AND COMMENTS
+    verbatim. THE guard on every bare-identifier rewrite: `f` never sees literal
+    or comment content, so it cannot rewrite it. (The name predates the comment
+    states; read "outside literals" as "outside every verbatim span".)
+
+    Behaviour-preserving on code, and the reason is worth stating rather than
+    assuming. No needle of pass 3 contains a `"`, a `-` or a `/` (`| C `, `(C)`,
+    ` C (`, `(C (`), so no legitimate match can span a code/verbatim boundary; and
+    `replaceCtorAppsCode`'s boundary tests degenerate at a segment edge exactly as
+    they did at a quote character — at a segment START `acc.isEmpty` makes
+    `leftOK` true, which is what a preceding `"`, newline or `/` (none
+    `isIdentish`) gave; at a segment END the following text is empty, making
+    `appOK` false, which is what a following `"`, `-` or `/` (none `isArgStart`)
+    gave. -/
+def mapOutsideLiterals (f : String → String) (src : String) : String :=
+  String.join ((litSegments src).map fun (isLit, s) => if isLit then s else f s)
+
+/-- THE RAW, LITERAL-UNAWARE rewrite. NOT for callers — use `replaceCtorApps`,
+    which is this restricted to code segments. It stays public for one reason: the
+    tests pin the silent-wrong behaviour it still has (the literal `"Point (1)"`
+    becoming `"Point.Point (1)"`) directly against the wrapper's, so the fix is
+    visible as a contrast rather than asserted.
+
+    Boundary-aware rewrite of `bare` → `qual` at every APPLICATION-position
     occurrence: identifier boundaries on both sides (so `mkPoint` and an
     already-qualified `Point.Point` are left alone) and an argument following
     (`isArgStart`). This is what covers a ctor applied to a *literal*
     argument — `Rect (Point 0 0) 1 1` — which the fixed needles in
     `resolveUserCtors` cannot express: they all require a `(` immediately
     after the ctor name. -/
-def replaceCtorApps (bare qual : String) (src : String) : String :=
+def replaceCtorAppsCode (bare qual : String) (src : String) : String :=
   match src.splitOn bare with
   | []              => src
   | first :: pieces =>
@@ -3566,6 +4228,13 @@ def replaceCtorApps (bare qual : String) (src : String) : String :=
         go more (acc ++ repl ++ next)
     go pieces first
 
+/-- `replaceCtorAppsCode` over the CODE segments of `src` only — the same
+    application-position rewrite, with string-literal content left alone. THE name
+    every caller uses: reaching for the raw one reintroduces the silent hole
+    documented above. -/
+def replaceCtorApps (bare qual : String) (src : String) : String :=
+  mapOutsideLiterals (replaceCtorAppsCode bare qual) src
+
 /-- Qualify user-defined data constructors in any position where Lean's
     elaborator would otherwise be ambiguous (type vs. ctor under the same
     name). The recognised call-shapes are:
@@ -3577,7 +4246,11 @@ def replaceCtorApps (bare qual : String) (src : String) : String :=
                                                   argument (`replaceCtorApps`)
 
     Type annotations like `(x : T)` or `→ T →` match none of these, so they
-    remain `T` and resolve to the type. -/
+    remain `T` and resolve to the type.
+
+    ALL FIVE REWRITES (the four needles and `replaceCtorApps`) see only the CODE
+    segments of `mapOutsideLiterals`: a ctor name inside a Lean string literal is
+    left alone, because rewriting it changes a VALUE rather than a name. -/
 def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     d.ctors.foldl (init := s) fun s c =>
@@ -3588,7 +4261,11 @@ def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
         , (s!"({bareCtor})",   s!"({qualCtor})")
         , (s!" {bareCtor} (",  s!" {qualCtor} (")
         , (s!"({bareCtor} (",  s!"({qualCtor} (") ]
-      let s := rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
+      -- Both halves skip string-literal content (`mapOutsideLiterals`): the four
+      -- needles here, and `replaceCtorApps` internally.
+      let s := mapOutsideLiterals
+        (fun code => rules.foldl (init := code) fun c (needle, repl) =>
+          c.replace needle repl) s
       replaceCtorApps bareCtor qualCtor s
 
 /-! ### The imported-type manifest (`EXT_TYPES_MANIFEST`)
