@@ -191,6 +191,69 @@ Development Host.)
   `Maybe`/`Either` eliminators
   (`maybe fromMaybe isJust isNothing either`). Local recursive `where`/`let`
   helpers emit as Lean `let rec` (structural recursion only).
+- **Strings and `Char`.** Haskell `String` and `[Char]` both transpile to Lean
+  `List Char` — including the bare `String` *synonym*, which Core keeps in
+  binder types. **String literals work.** Core spells a literal
+  `GHC.CString.unpackCString# "lit"#` for a pure-ASCII literal and
+  `GHC.CString.unpackCStringUtf8#` for one containing any non-ASCII character;
+  both map to `String.toList`, so a literal's Lean image is a genuine
+  `List Char` and the whole mapped list library composes with it. Quotes,
+  backslashes and C0 control characters are escaped on emission (`\n`/`\t`/`\r`
+  by name, the rest `\xNN`); non-ASCII is written raw into the UTF-8 output.
+  NUL is faithful: GHC encodes it as modified UTF-8's overlong `C0 80`, which
+  the shim repairs, so `"a\0b"` is 3 characters. `Char` literals work in both
+  value and pattern position (`classify 'a' = 1`). The mapped `Char` surface is
+  equality, ordering and `compare` (the ordinary `Ord` path), `ord`
+  (→ `(fun c => (c.toNat : Int))`) and `isDigit` (→ `Char.isDigit`). Fixtures:
+  `examples/haskell/StringBasics.hs`, `examples/haskell/CharOps.hs`. The gaps,
+  all of them loud:
+  - **`Data.Char` is not the name to look for.** Core records names from where
+    a thing is *defined*, and `Data.Char` is a re-export module, so the
+    mappable surface arrives as `GHC.Base.ord`, `GHC.Unicode.isDigit`,
+    `GHC.Unicode.isAlpha`, `GHC.Char.chr` and so on. `Data.Char.*` is a
+    0-occurrence spelling — worth knowing when reading a dump or a build error.
+  - **Six Unicode functions are deliberately unmapped**: `isAlpha`, `isUpper`,
+    `isLower`, `toUpper`, `toLower`, `isSpace`. Lean v4.24 is ASCII-only for
+    *all* of them while Haskell is Unicode-aware (`isAlpha 'é'` is `True` in
+    Haskell, `false` in Lean; `isSpace` differs on `\v`, `\f` and NBSP), so
+    mapping any of them would compile and answer differently — the
+    silent-wrong category. A faithful version needs `base`'s general-category
+    tables. `isDigit` is mapped precisely because it is the one that agrees
+    (both sides test ASCII 48–57, so the Unicode digit `'٥'` U+0665 is `False`
+    on both).
+  - **`chr` is unmapped.** A Haskell `Char` spans `[0, 0x10FFFF]` *including*
+    the 2048 surrogate code points; a Lean `Char` excludes them. So `chr 0xD800`
+    is a defined Haskell value with no Lean image, and no total Lean function is
+    faithful — this is silent-wrongness, not the project's usual ⊥-refinement
+    tradeoff. `ord` maps and `chr` does not, which is not an inconsistency:
+    every *Lean* `Char` has a faithful Haskell image, so the gap enters only
+    through construction.
+  - **A literal containing a lone surrogate is refused by name**, rather than
+    silently becoming U+FFFD. `String` and `Char` get separate messages
+    carrying separate evidence, because the string case is a byte-encoding fact
+    and the char case is not:
+
+    ```
+    string literal not representable: bytes `78 ed a0 80 79` in bind `lone`
+    char literal not representable: code point `U+D800` in bind `lone`
+    ```
+
+    Transpilation exits nonzero and writes no `.lean`. Must-fail fixtures:
+    `examples/haskell/StringSurrogate.hs`, `examples/haskell/CharSurrogate.hs`.
+    NUL is *not* this case.
+  - **`min`/`max` at `Char` fail loud** with `failed to synthesize Min Char` /
+    `Max Char`: v4.24 has no such instance. The mapping itself is right at every
+    type that does have one, so this is a `lake build` failure rather than a
+    transpiler bug, and no instance is added. Every other binder the `Ord`
+    recipe asks for does synthesize at `Char`, which is why equality and
+    ordering work.
+  - **`Char` ranges are safe only by accident.** `['a'..'e']` transpiles (rc=0)
+    to `Hs.enumFromTo 'a' 'e'` and then fails loud at `lake build` only because
+    that helper is monomorphic on `Int` (`GhcCoreToLean/Runtime.lean:20`):
+    `'a' has type Char but is expected to have type Int`. Anyone generalising
+    `Hs.enumFromTo` over an `Enum`-like class would silently route a `Char`
+    range through Haskell's `chr`-based `Enum Char` — exactly the unfaithful
+    direction above. Pin this before generalising.
 - `error`/`undefined` are ⊥ on their whole domain, so they lower to Lean
   `default` (a total, sound bottom). The partial list/`Maybe` functions are ⊥
   on only *part* of their domain, so each lowers to a total Lean form that is
@@ -431,3 +494,20 @@ Development Host.)
   quantified over element variables (`sumList [a] = a`) or over a list whose
   shape the statement fixes (`pairUp xs [] = []`). Concrete-value properties
   also close with `by decide`.
+- **Verification caveat at `Char` and `List Char`** (a solver limit, not a
+  transpiler one — the milestone's deliverable is transpile fidelity). `Char`
+  *scalars* verify well: equality, ordering, `compare` and a `Nat → Char → Nat`
+  round-trip under a `n < 128` precondition are all `✅ Valid`
+  (`examples/haskell/CharOps.hs`, five `blaster` theorems). Concrete `List Char`
+  goals verify too (`['h','i'].length = 2`). But a goal quantified over a
+  **symbolic** `List Char` fails under bare `by blaster` with
+  `Inductive datatype with instance parameters not supported: 'BitVec`
+  (measured on four goal shapes), and so does anything forcing `Char`'s
+  `val : UInt32` representation (`c.toNat < 0x110000`). Wrapping the goal in
+  `induction` rescues *some* of these but not all: it closes
+  `(cs ++ ['!']).length = cs.length + 1` in both branches, yet on
+  `StringBasics`'s own `shout_len` it closes `nil` and hits the same `BitVec`
+  error in `cons` — which is why that fixture proves it by `simp`. So string
+  properties should prefer `rfl`/`simp`. `by decide` is not an alternative at
+  `Char`: it cannot quantify over it at all (`failed to synthesize Decidable
+  (∀ (c : Char), …)`), though concrete `Char` data decides fine.
