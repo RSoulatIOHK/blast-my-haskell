@@ -124,24 +124,106 @@ partial def emitType : GHCType → String
   | .tyLit (.nat n)  => toString n
   | .tyLit (.str s)  => s!"\"{s}\""
 
-/-! ## Literal emission -/
+/-! ## Literal emission
+
+    STRING AND CHAR LITERAL ESCAPING (M4 Task 2). Both payloads used to be
+    interpolated RAW, which was harmless only while the shim discarded them and
+    every string arrived as the placeholder `<bs>`. With real bytes flowing, a
+    literal containing `"` or a newline emits unparseable Lean: MEASURED on
+    `quoted = "say \"hi\"\n"`, whose emitted `("say "hi"\n")` was a SYNTAX error
+    (`16:43: unexpected identifier; expected ')', ',' or ':'`) that fired
+    *instead of* the unknown-identifier error the mapping was supposed to produce
+    — see the `M4 Task 1` block in `Tests/Unit.lean`.
+
+    ESCAPING, NOT `Char.ofNat`. The alternative was to sidestep quoting by
+    emitting char literals as `Char.ofNat n`. Rejected because it buys nothing:
+    `emitLiteralPattern` must emit a real char literal (`Char.ofNat n` is not a
+    pattern — Lean answers "Invalid pattern: Expected a constructor or constant
+    marked with `[match_pattern]`"), so an escaper is needed for the pattern
+    position regardless, and having two different spellings of a `Char` literal
+    depending on position is strictly worse than one.
+
+    WHAT IS ESCAPED, and what deliberately is not: the two quotes, the backslash,
+    and the C0 control characters (`\n`/`\t`/`\r` by name, the rest as `\xNN`) —
+    all verified accepted by the v4.24 parser in BOTH literal positions. Non-ASCII
+    is emitted RAW: the generated file is UTF-8, `'é'`/`'💩'` are valid Lean
+    literals, and `\uXXXX` cannot spell a non-BMP character anyway. That also
+    settles Task 1's handoff about a U+FFFD "arriving from a non-UTF-8 literal":
+    post-refusal (see `unrepresentableStringLiterals`) a U+FFFD in an emitted
+    literal is always a genuine user U+FFFD, and it emits raw like any other
+    non-ASCII character. -/
+
+/-- One character, escaped for a Lean string or char literal. Both quotes are
+    escaped in both positions: `\"` and `\'` are accepted inside either literal
+    form, so one escaper serves both and there is no position-dependent variant to
+    get wrong. -/
+private def escapeLitChar (c : Char) : String :=
+  match c with
+  | '\\' => "\\\\"
+  | '"'  => "\\\""
+  | '\'' => "\\'"
+  | '\n' => "\\n"
+  | '\t' => "\\t"
+  | '\r' => "\\r"
+  | c    =>
+    let n := c.toNat
+    if n < 0x20 || n == 0x7F then
+      let hex := (Nat.toDigits 16 n).asString
+      s!"\\x{if hex.length == 1 then "0" ++ hex else hex}"
+    else String.singleton c
+
+/-- A Lean string literal (quotes included) for `s`. -/
+def escapeStringLit (s : String) : String :=
+  "\"" ++ s.foldl (fun acc c => acc ++ escapeLitChar c) "" ++ "\""
+
+/-- A Lean char literal (quotes included) for `c`. -/
+def escapeCharLit (c : Char) : String :=
+  "'" ++ escapeLitChar c ++ "'"
 
 def emitLiteral : Literal → String
   | .litInt n    => s!"({n} : Int)"
   | .litWord n   => s!"({n} : Nat)"
   | .litFloat f  => s!"({f} : Float)"
   | .litDouble f => s!"({f} : Float)"
-  | .litString s => s!"\"{s}\""
-  | .litChar c   => s!"'{c}'"
+  | .litString s => escapeStringLit s
+  -- Unreachable in a module that emits at all: `Main.lean` refuses the program
+  -- before emission (`unrepresentableStringLiterals`). Kept LOUD rather than
+  -- plausible — an undefined identifier — so that a future caller who emits
+  -- without running the refusal gets a `lake build` failure naming the bytes
+  -- instead of a silently-wrong string.
+  | .litStringUnrepresentable hex => s!"(GHCCore.unrepresentableStringLiteral \"{hex}\")"
+  | .litChar c   => escapeCharLit c
   | .litLabel l  => s!"GHCCore.foreignLabel \"{l}\""
 
+/-- Literal in PATTERN position (a `LitAlt` alternative).
+
+    THE `.litString` ARM FAILS LOUD, and that is a change of kind, not of text. A
+    Haskell string literal is a `[Char]`, so against the `List Char` scrutinee
+    that `unpackCString#` now produces, `"hi"` is a type error at best; before
+    this task it emitted a `String` pattern that could only ever be ill-typed.
+
+    IS `LitAlt (MachStr …)` REACHABLE? Not from a string pattern in ordinary
+    Haskell: GHC's `tidyLitPat` expands a SHORT `HsString` pattern into a
+    cons-chain of `Char` patterns and routes a long one through `eqString`, so
+    `case s of "hi" -> …` never becomes a literal alternative. But `hsLitKey` maps
+    `HsStringPrim` (an `Addr#` literal pattern, `"hi"#` under `MagicHash`) to
+    `LitString`, and `matchLiterals` builds `LitAlt` from `hsLitKey` — so it
+    cannot be RULED OUT, only called exotic. Measured negatively: `LitChar` ×0 and
+    zero value-position `LitString` in any of 35 dumps, i.e. the arm is entirely
+    unobserved either way. Under "cannot rule it out ⇒ fail loud" it emits an
+    undefined pattern head, which Lean rejects with "Invalid pattern: Expected a
+    constructor or constant marked with `[match_pattern]`" (verified).
+
+    `.litChar` in pattern position is fine and stays a real literal: `'c'` against
+    a `Char` scrutinee is exactly right. -/
 def emitLiteralPattern : Literal → String
   | .litInt n    => toString n
   | .litWord n   => toString n
   | .litFloat f  => toString f
   | .litDouble f => toString f
-  | .litString s => s!"\"{s}\""
-  | .litChar c   => s!"'{c}'"
+  | .litString s => s!"(GHCCore.unsupportedStringPattern {escapeStringLit s})"
+  | .litStringUnrepresentable hex => s!"(GHCCore.unrepresentableStringLiteral \"{hex}\")"
+  | .litChar c   => escapeCharLit c
   | .litLabel _  => "_"
 
 /-! ## Var emission -/
@@ -3515,6 +3597,93 @@ def malformedNewtypeWarning (n : Name) : String :=
   s!"  data type. GHC has already erased its value level, so the generated Lean is\n" ++
   s!"  expected to FAIL to typecheck (identity bodies against a one-field\n" ++
   s!"  inductive). This indicates a corrupt or out-of-date decl sidecar."
+
+/-! ## Unrepresentable string literals
+
+    THE SOUNDNESS CORE OF M4 TASK 2. Mapping `unpackCString#` turns a string
+    literal from a loud unknown identifier into a value Lean believes, so any
+    literal whose bytes did not survive the trip is no longer merely wrong — it is
+    SILENTLY wrong: wrong `length`, wrong content, compiles fine.
+
+    GHC writes literals in MODIFIED UTF-8, which deviates from the standard in
+    exactly two ways (`utf8EncodeChar`, GHC 9.2.7): the overlong NUL `C0 80`, and
+    3-byte encodings of lone surrogates. It is NOT CESU-8 — a supplementary
+    character gets standard 4-byte UTF-8 (measured: `"\128169"` decodes to `💩`
+    correctly) — so this must not become a blanket refusal of non-ASCII.
+
+    THE SPLIT (this is why the coarse "any lossy decode" predicate was not the
+    refusal criterion):
+    * U+0000 IS A LEGAL LEAN `Char`. The shim now decodes `C0 80` back to a real
+      NUL (`undoOverlongNul`), so `"a\0b"` transpiles FAITHFULLY as three
+      characters. Refusing it would have declined Haskell that has a perfect Lean
+      image, and it would have done so permanently.
+    * U+D800–DFFF IS NOT A LEAN `Char` AT ALL (plan correction 3: Haskell's `Char`
+      spans [0,0x10FFFF] including the 2048 surrogates; Lean's excludes them). No
+      decoder can help, so this is the residue that must REFUSE.
+
+    WHY THE FLAG COMES FROM THE SHIM. The predicate is `encodeUtf8 (decodeUtf8With
+    lenientDecode bs) /= bs` over the NUL-repaired bytes — and the BYTES ARE GONE
+    after JSON, so Lean cannot recompute it. The shim therefore emits
+    `"unrepresentable": "<hex>"` and this pass reads it. And the refusal lives
+    HERE rather than as a `die` in the shim because the shim cannot know whether a
+    literal reaches emission: a shim-level death would crash modules whose only
+    such literal sits in a dropped `$tr`/`$cshowsPrec`/error-collapsed bind, i.e.
+    modules that transpile fine today. `Ratio` is that module — 54 `LitString`s,
+    9 of them in real user binds' `error` messages — and it must stay green.
+
+    SCOPE, stated honestly. `Main.lean` runs this over the FILTERED, post-`Lower`
+    binds, so junk binds cannot trigger it. Binds dropped LATER, at emission (the
+    `error`→`default` collapse discards a bottom's whole application, message
+    included), are still in the walked set: a lone surrogate inside an `error`
+    string would refuse a module that would have emitted fine. That is a
+    conservative refusal — loud, never silent-wrong — and it is preferred to
+    mirroring the collapse here, which would duplicate emission logic in a
+    validator and could then disagree with it. -/
+
+/-- Every `.litStringUnrepresentable` hex payload in an expression, including
+    literals in PATTERN position (a `LitAlt` alternative) — `emitLiteralPattern`
+    would put the same unrepresentable payload in the output. -/
+private partial def unrepStringsInExpr : Expr → List String
+  | .lit (.litStringUnrepresentable hex) => [hex]
+  | .app f a          => unrepStringsInExpr f ++ unrepStringsInExpr a
+  | .lam _ b          => unrepStringsInExpr b
+  | .cast e           => unrepStringsInExpr e
+  | .tick e           => unrepStringsInExpr e
+  | .let_ bnd b       =>
+    (match bnd with
+     | .nonRec _ e => unrepStringsInExpr e
+     | .rec_ ps    => ps.flatMap (fun p => unrepStringsInExpr p.2))
+      ++ unrepStringsInExpr b
+  | .case_ scr _ _ alts =>
+    unrepStringsInExpr scr ++
+      alts.flatMap (fun (.mk con _ rhs) =>
+        (match con with
+         | .litAlt (.litStringUnrepresentable hex) => [hex]
+         | _ => []) ++ unrepStringsInExpr rhs)
+  | _                 => []
+
+/-- `(owner bind, hex bytes)` for every string literal with no faithful Lean
+    image. The owner is the TOP-LEVEL bind the literal sits under, which is what
+    the refusal names: it is the only thing that points a user at their source. -/
+def unrepresentableStringLiterals (p : Program) : List (Name × String) :=
+  p.binds.flatMap fun b =>
+    match b with
+    | .nonRec v e => (unrepStringsInExpr e).map fun h => (v.name, h)
+    | .rec_ ps    => ps.flatMap fun (v, e) => (unrepStringsInExpr e).map fun h => (v.name, h)
+
+/-- The refusal message for one `unrepresentableStringLiterals` pair. -/
+def unrepresentableStringLiteralError (owner : Name) (hex : String) : String :=
+  s!"string literal not representable: bytes `{hex}` in bind `{owner}`\n" ++
+  s!"  GHC writes string literals in MODIFIED UTF-8, and these bytes decode to a\n" ++
+  s!"  LONE SURROGATE (U+D800–DFFF) or are not valid UTF-8 even after the overlong\n" ++
+  s!"  NUL (`C0 80`) is repaired. A Haskell `Char` spans [0,0x10FFFF] INCLUDING the\n" ++
+  s!"  2048 surrogates; a Lean `Char` excludes them, so this literal has no Lean\n" ++
+  s!"  value at all — not a different one. Emitting it would put U+FFFD replacement\n" ++
+  s!"  characters in the output: a plausible-looking string of the wrong length and\n" ++
+  s!"  the wrong content, which compiles. So transpilation is refused instead.\n" ++
+  s!"  Remedy: remove the surrogate from the literal (`\\55296` and friends), or\n" ++
+  s!"  represent the text as the byte/code-point list you actually mean.\n" ++
+  s!"  Note: NUL is NOT this case — `\"a\\0b\"` transpiles faithfully as 3 chars."
 
 /-- Characters that continue (or qualify) a Lean identifier. A ctor-name
     occurrence flanked by one of these is part of a LONGER name — `mkPoint`,

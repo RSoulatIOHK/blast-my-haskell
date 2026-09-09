@@ -274,6 +274,25 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for (c, m) in unmapped do
         IO.eprintln s!"error: {Emit.unmappedOperatorMethodError c m}"
       return 1
+    -- Refuse a string literal whose GHC bytes have NO Lean image: a lone
+    -- surrogate (or bytes still invalid after the shim repairs modified UTF-8's
+    -- overlong NUL). M4 Task 2 mapped `unpackCString#`, which is what makes this
+    -- necessary — before the mapping such a literal failed loud as an unknown
+    -- identifier, and after it the U+FFFD-bearing lenient decode would be a
+    -- plausible-looking string of the wrong length that COMPILES. See Emit's
+    -- "Unrepresentable string literals" section for the NUL-faithful /
+    -- surrogate-refuse split and for why the flag has to come from the shim.
+    --
+    -- Independent of the four checks above (nothing here reads class or instance
+    -- data), so its position among them is not load-bearing — but it is on
+    -- `userProg`, i.e. the post-filter, post-`Lower` binds that actually reach
+    -- emission, so a lossy literal in a dropped `$tr`/`$cshowsPrec` bind cannot
+    -- refuse a module that transpiles fine today (`Ratio` is that module).
+    let unrepLits := Emit.unrepresentableStringLiterals userProg
+    if !unrepLits.isEmpty then
+      for (owner, hex) in unrepLits do
+        IO.eprintln s!"error: {Emit.unrepresentableStringLiteralError owner hex}"
+      return 1
     -- Name every instance `emitInstanceUser` is about to SKIP, and the method
     -- that costs it. Not a refusal (the skip is already loud at `lake build`, as
     -- `failed to synthesize`, and refusing would newly reject modules whose

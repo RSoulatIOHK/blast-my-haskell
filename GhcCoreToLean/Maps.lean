@@ -57,6 +57,32 @@ def valueMap : String → Option String
   -- moves, NOT a live `++` path (observed: 0 occurrences at pass-0000).
   | "GHC.Base.build"   => some "(fun g => g List.cons List.nil)"
   | "GHC.Base.augment" => some "(fun g xs => g List.cons xs)"
+  -- String literals (M4 Task 2). Core spells `"hi" :: String` as
+  -- `GHC.CString.unpackCString# "hi"#`, so the literal's Lean image is a Lean
+  -- STRING literal (see `Emit.escapeStringLit`) and the unpacker's image is the
+  -- `String → List Char` that turns it into the `[Char]` Haskell means.
+  -- `String.toList` is LOAD-BEARING: a bare `"hi"` elaborates as `String`, which
+  -- is not `List Char`, so dropping the conversion would be an ill-typed term
+  -- wherever a Haskell `String` is used as a list.
+  --
+  -- BOTH unpackers are REQUIRED, not one plus a hedge. Measured on the pipeline's
+  -- GHC 9.2.7: the plain variant appears only for a PURE-ASCII literal, and
+  -- `unpackCStringUtf8#` for every non-ASCII one (`"caf\233"`, `"\255"`,
+  -- `"\128169"`, and — before the shim repaired it — `"a\0b"`). Mapping only the
+  -- plain one would fail loud on every accented string. Both take the same image:
+  -- the byte-level difference between them is the shim's business, and by the time
+  -- a payload reaches here it is already a decoded Lean `String` (or the module
+  -- was refused — see `Emit.unrepresentableStringLiterals`).
+  --
+  -- OBSERVED NAMES ONLY, with the negatives recorded: `GHC.CString.unpackCString#`
+  -- and `GHC.CString.unpackCStringUtf8#` are the two spellings in the dumps (the
+  -- bare `unpackCString#` was NOT observed). `unpackAppendCString#` and
+  -- `unpackFoldrCString#` — the RULE-introduced fusion forms — are 0-occurrence
+  -- across every dump measured, exactly like `GHC.Base.augment` above, so they are
+  -- deliberately absent rather than guessed at: a literal `++` still arrives as
+  -- `List.append (String.toList "…")` at pass-0000.
+  | "GHC.CString.unpackCString#"     => some "String.toList"
+  | "GHC.CString.unpackCStringUtf8#" => some "String.toList"
   | "GHC.Base.map"                => some "List.map"
   | "GHC.List.filter"             => some "List.filter"
   | "GHC.List.reverse"            => some "List.reverse"
@@ -250,6 +276,15 @@ def typeConMap : String → List String → Option String
   | "GHC.Prim.Word#", [] => some "Nat"
   | "Bool",    []     => some "Bool"
   | "Char",    []     => some "Char"
+  -- Core keeps the SYNONYM in binder types (`{"tag":"TyCon","name":"String"}`),
+  -- so a `String`-typed def needs this arm as well as the `[] [Char]` one below:
+  -- without it a `String` binder emitted `(GHCCore.tyConOpaque "String")` while
+  -- its BODY emitted a `List Char`. Only the bare spelling is observed; a
+  -- qualified `GHC.Base.String` was NOT seen in any dump and is not guessed at.
+  -- Same exposure as the `Int`/`Bool` arms: a user type of that name would be
+  -- hijacked here, which is why the roadmap's builtin-name arms stay a fixed,
+  -- observed list.
+  | "String",  []     => some "List Char"
   | "Char#",   []     => some "Char"
   | "GHC.Prim.Char#", [] => some "Char"
   | "()",      []     => some "Unit"

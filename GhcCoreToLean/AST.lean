@@ -36,6 +36,19 @@ inductive Literal where
   | litFloat  : Float → Literal
   | litDouble : Float → Literal
   | litString : String → Literal
+  /-- A string literal whose GHC bytes have NO faithful Lean image, carrying the
+      HEX of those bytes (`"78 ed a0 80 79"`) rather than any decoded text.
+
+      GHC writes string literals in MODIFIED UTF-8. Of its two deviations from
+      standard UTF-8 the shim repairs one (the overlong NUL `C0 80`, since U+0000
+      is a legal Lean `Char`) and cannot repair the other: a lone surrogate
+      U+D800–DFFF is not a Lean `Char` at all, so there is nothing to decode it
+      to. The shim flags such a literal (`"unrepresentable"` in the JSON) and
+      `Main.lean` REFUSES the module before emission — see
+      `Emit.unrepresentableStringLiterals`. The payload is the evidence, not a
+      value: the lenient decode of those bytes is exactly the plausible-looking
+      wrong string this constructor exists to keep out of the output. -/
+  | litStringUnrepresentable : String → Literal
   | litChar   : Char → Literal
   | litLabel  : String → Literal
 deriving Repr, Inhabited

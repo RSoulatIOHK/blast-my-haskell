@@ -11,8 +11,11 @@ import qualified Data.Aeson.KeyMap           as AKM
 import qualified Data.Map.Strict             as Map
 import           Data.Map.Strict             (Map)
 import qualified Data.Text                   as T
-import           Data.Text.Encoding          (decodeUtf8With)
+import           Data.Text.Encoding          (decodeUtf8With, encodeUtf8)
 import           Data.Text.Encoding.Error    (lenientDecode)
+import qualified Data.ByteString             as BS
+import           Data.Word                   (Word8)
+import           Numeric                     (showHex)
 import           System.Environment          (getArgs)
 import           System.Exit                 (die)
 import qualified Codec.Serialise             as Ser
@@ -330,19 +333,45 @@ convertLit = \case
   --
   -- Decoded with a *replacement* decoder, not `decodeUtf8`, because GHC's
   -- payload is MODIFIED UTF-8: measured, `"a\0b"` arrives as `0xC0 0x80` for the
-  -- NUL and `"x\55296y"` as a 3-byte CESU sequence for the surrogate, neither of
-  -- which standard UTF-8 accepts. `decodeUtf8` throws on those, which inside
-  -- `transpile.sh` is a crashed transpile of an otherwise fine module; lenient
-  -- decoding yields U+FFFD instead.
+  -- NUL and `"x\55296y"` as a 3-byte encoding of the lone surrogate, neither of
+  -- which standard UTF-8 accepts. (Modified UTF-8, NOT CESU-8: a non-BMP
+  -- character still gets standard 4-byte UTF-8 — measured, `"\128169"` decodes to
+  -- a correct U+1F4A9 — so nothing here may reject non-BMP literals.)
+  -- `decodeUtf8` throws on those, which inside `transpile.sh` is a crashed
+  -- transpile of an otherwise fine module; lenient decoding yields U+FFFD instead.
   --
-  -- That replacement is LOSSY (`"a\0b"`, 3 chars, decodes to 4 code points), and
-  -- it is inert only for as long as no literal reaches emission — see the "M4
-  -- Task 1" block in `GhcCoreToLean/Tests/Unit.lean`. Whoever maps
-  -- `unpackCString#`/`unpackCStringUtf8#` on the Lean side owns making the lossy
-  -- case fail loud; the test is `encodeUtf8 (decodeUtf8With lenientDecode bs)
-  -- /= bs`.
-  MachStr bs    -> object [ "tag" .= ("LitString" :: T.Text)
-                          , "value" .= decodeUtf8With lenientDecode bs ]
+  -- M4 TASK 2 SPLIT THE LOSSY CASE IN TWO. Modified UTF-8 deviates from standard
+  -- UTF-8 in exactly two places (GHC 9.2.7 `utf8EncodeChar`): the overlong NUL
+  -- `C0 80`, and 3-byte encodings of lone surrogates. They have DIFFERENT correct
+  -- remedies, so one blanket refusal was the wrong shape:
+  --   * U+0000 is a perfectly legal Lean `Char`, so `undoOverlongNul` decodes
+  --     `C0 80` back to a real NUL and `"a\0b"` transpiles FAITHFULLY (3 chars).
+  --   * U+D800–DFFF does not exist in Lean at all, so it cannot be decoded to
+  --     anything — the literal is flagged `unrepresentable` and the Lean side
+  --     REFUSES the module (`Emit.unrepresentableStringLiterals`, wired in
+  --     `Main.lean`). Flagged, not `die`d: the shim cannot know whether the
+  --     literal reaches emission, and dying here would crash modules whose only
+  --     such literal sits in a dropped `$tr`/`$cshowsPrec`/error-collapsed bind.
+  --
+  -- The FLAG PREDICATE is the one audited in the "M4 Task 1" Unit.lean block —
+  -- `encodeUtf8 (decodeUtf8With lenientDecode bs) /= bs`, sound in both
+  -- directions as a lossiness test — applied to the NUL-repaired bytes, so it now
+  -- fires on exactly the residue: lone surrogates and any other byte sequence
+  -- that is not valid standard UTF-8. It is still computable ONLY here (the bytes
+  -- are gone after JSON), which is why the flag is part of the schema.
+  --
+  -- SCHEMA. `unrepresentable` is present iff the literal has no faithful Lean
+  -- image, and its value is the hex of the ORIGINAL bytes (what GHC actually
+  -- produced) so the refusal can name the evidence. `value` still carries the
+  -- lenient decode: it is what the U+FFFD-bearing literal WOULD have been
+  -- believed to be, and it is never emitted, because the flag refuses first.
+  MachStr bs    ->
+    let repaired = undoOverlongNul bs
+        decoded  = decodeUtf8With lenientDecode repaired
+        lossy    = encodeUtf8 decoded /= repaired
+    in object ( [ "tag"   .= ("LitString" :: T.Text)
+                , "value" .= decoded ]
+             ++ [ "unrepresentable" .= hexBytes bs | lossy ] )
   MachNullAddr  -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= (0 :: Integer) ]
   MachInt n     -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]
   MachInt64 n   -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]
@@ -354,3 +383,24 @@ convertLit = \case
   LitInteger n  -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]
   LitNatural n  -> object [ "tag" .= ("LitWord"   :: T.Text), "value" .= n ]
   LitRubbish    -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= (0 :: Integer) ]
+
+-- | Decode modified UTF-8's overlong NUL (`C0 80`) back to a real `00` byte.
+--
+-- Byte-exact and safe to do by a two-byte scan: `0xC0` is not a legal byte
+-- ANYWHERE in standard UTF-8 (lead bytes start at `0xC2`, continuation bytes at
+-- `0x80`), so it cannot occur inside a valid sequence, and GHC's encoder emits
+-- it for nothing but a NUL. The result is therefore standard UTF-8 whenever the
+-- original was modified-UTF-8-with-NULs, and is left untouched otherwise.
+undoOverlongNul :: BS.ByteString -> BS.ByteString
+undoOverlongNul = BS.pack . go . BS.unpack
+  where
+    go :: [Word8] -> [Word8]
+    go (0xC0 : 0x80 : rest) = 0x00 : go rest
+    go (b : rest)           = b : go rest
+    go []                   = []
+
+-- | Space-separated lowercase hex, for naming the bytes of a literal that has no
+-- Lean image (`"x\55296y"` -> `78 ed a0 80 79`).
+hexBytes :: BS.ByteString -> T.Text
+hexBytes = T.unwords . map (T.pack . pad2 . flip showHex "") . BS.unpack
+  where pad2 h = if length h < 2 then '0' : h else h

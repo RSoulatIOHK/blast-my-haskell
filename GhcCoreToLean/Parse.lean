@@ -86,7 +86,15 @@ def parseLiteral (j : Lean.Json) : Except String Literal := do
     .ok (.litDouble n)
   | "LitString" => do
     let s ← j.getObjValAs? String "value"
-    .ok (.litString s)
+    -- The shim sets `unrepresentable` — to the hex of the literal's raw GHC
+    -- bytes — exactly when its modified-UTF-8 payload has no faithful Lean image
+    -- (a lone surrogate, or bytes that are not valid UTF-8 even after the
+    -- overlong-NUL repair). ABSENT is the normal case and means `value` is
+    -- faithful, NUL included. The field is read as a String, so its presence is
+    -- the flag and its content is the evidence the refusal names.
+    match j.getObjValAs? String "unrepresentable" with
+    | .ok hex   => .ok (.litStringUnrepresentable hex)
+    | .error _  => .ok (.litString s)
   | "LitChar"   => do
     let s ← j.getObjValAs? String "value"
     match s.data with
