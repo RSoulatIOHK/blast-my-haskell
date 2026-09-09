@@ -927,8 +927,8 @@ def mkPartialBind (nm : String) : Bind :=
 -- `"Point.Point (1)".toList` — type-correct, compiles, silently wrong, and no
 -- longer confined to hand-authored spec text. M4 Task 3 closed it: both
 -- `replaceCtorApps` and the four needles now run only over the CODE segments of
--- `Emit.mapOutsideLiterals` (state machine in `Emit.lean`'s "Literal-aware
--- scanning" header; guards and the measured pre-fix output in the "M4 Task 3"
+-- `Emit.mapOutsideLiterals` (state machine in `Emit.lean`'s "Literal- and
+-- comment-aware scanning" header; guards and the measured pre-fix output in the "M4 Task 3"
 -- section at the end of this file; `examples/haskell/StringCtorClash.hs` is the
 -- e2e fixture).
 --
@@ -7044,7 +7044,7 @@ def unrepMsg : String := unrepresentableStringLiteralError "lone" "78 ed a0 80 7
 #guard (unrepMsg.splitOn "LONE SURROGATE").length == 2
 #guard (unrepMsg.splitOn "NUL is NOT this case").length == 2
 
-/-! ## M4 Task 3 — the ctor rewrites skip string literals
+/-! ## M4 Task 3 — the ctor rewrites skip string literals AND comments
 
 Pass 3 (`resolveUserCtors` + `replaceCtorApps`) is the ONLY textual pass whose
 needles are BARE identifiers. Passes 1, 2 and 4 key off
@@ -7054,9 +7054,12 @@ inside a Lean string literal, so they are self-protecting by construction
 fill, which rewrites map TEMPLATES, not emitted source). Pass 3 was therefore the
 one place a rewrite could land INSIDE a literal, and the M2-era hedge above ("THE
 HEDGE, AND WHY IT DID NOT HOLD", in the M2 Task 1 records) held only while no
-Haskell string literal could reach the emitter at all. Tasks 1 and 2 made literals real; this task makes the rewrites
-literal-aware (`Emit.mapOutsideLiterals`, and the state machine documented in the
-"Literal-aware scanning" section header there).
+Haskell string literal could reach the emitter at all. Tasks 1 and 2 made literals
+real; this task makes the rewrites literal- and COMMENT-aware
+(`Emit.mapOutsideLiterals`, and the four-state machine documented in the "Literal-
+and comment-aware scanning" section header there). The comment half arrived a
+commit later, after review found the leak it closes; its own records are in the
+"second pass" subsection below.
 
 MEASURED AT THE PARENT COMMIT (3664d3f) on `examples/haskell/StringCtorClash.hs`
 — transpile rc=0, and with the pins removed `lake build` rc=0 too, i.e. FULLY
@@ -7077,9 +7080,10 @@ would have been green on silently-wrong output. Hence `label.length = 9` and the
 explicit `['P', 'o', …]` spelling in the fixture.
 -/
 
--- THE SCANNER, segment by segment. `false` is code, `true` is a string literal
--- (quotes included). The last case is the whole point: the scanner RESUMES, so
--- the ` ++ Point (1)` after each literal is still code.
+-- THE SCANNER, segment by segment. `false` is code, `true` is VERBATIM — a string
+-- literal (quotes included) or a comment (delimiters included; see the "second
+-- pass" subsection below for those). The last case is the whole point: the scanner
+-- RESUMES, so the ` ++ Point (1)` after each literal is still code.
 #guard litSegments "a \"lit\" b"
        == [(false, "a "), (true, "\"lit\""), (false, " b")]
 -- An escaped quote does NOT end the literal (Task 2's escaping, first direction).
@@ -7106,10 +7110,14 @@ explicit `['P', 'o', …]` spelling in the fixture.
 -- payload and the surrounding quotes then change no state.
 #guard litSegments "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)"
        == [(false, "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)")]
--- DEGRADATION, both fail-loud: an unterminated literal classifies the tail as
--- literal, so rewrites there are SKIPPED (Lean: "function expected at Point"),
--- never made wrongly. Unreachable from emitter output — every quote it writes
--- comes from `escapeStringLit`/`escapeCharLit` in balanced pairs.
+-- DEGRADATION, both of THESE fail-loud (the two that are NOT are enumerated in
+-- the "second pass" subsection below): an unterminated literal classifies the
+-- tail as literal, so rewrites there are SKIPPED (Lean: "function expected at
+-- Point"), never made wrongly. Unreachable from emitter output — of the six sites in
+-- `Emit.lean` that write a `"`, five write BALANCED delimiters, and the sixth
+-- (`escapeCharLit '"'`, which is `'\"'` — exactly ONE quote, the file's only
+-- odd-quote emitter site) is covered by the escaped-char-literal arm, pinned
+-- below.
 #guard litSegments "f (Point 1) ++ \"unterminated Point (1)"
        == [(false, "f (Point 1) ++ "), (true, "\"unterminated Point (1)")]
 #guard litSegments "" == [(false, "")]
@@ -7120,7 +7128,12 @@ explicit `['P', 'o', …]` spelling in the fixture.
 #guard (["a \"lit\" b", "\"say \\\"hi\\\"\" ++ Point (1)", "\"x\\\\\" ++ Point (1)",
          "['\"'] ++ Point (1)", "x' ++ \"Point (1)\"", "c == '\\\"' && Point (1)",
          "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)", "",
-         "f (Point 1) ++ \"unterminated Point (1)", "\"\"", "\\", "'"]).all
+         "f (Point 1) ++ \"unterminated Point (1)", "\"\"", "\\", "'",
+         -- the comment shapes, same property (added with the second pass)
+         "-- a \" b\nf (Point 1) ++ \"Point (1)\"", "/- /- \"x -/ -/ Point (1)",
+         "-- one \" quote\nPoint (1)", "x -- y", "x /- y", "x -/ y", "x-y",
+         "f (Point 1) ++ /- unterminated Point (1)", "--", "/-", "-/", "\n",
+         "s \\\"Point (1)\""]).all
        fun s => String.join ((litSegments s).map (·.2)) == s
 
 -- THE FIX AS A CONTRAST, not an assertion: the raw pass still rewrites inside a
@@ -7177,10 +7190,153 @@ explicit `['P', 'o', …]` spelling in the fixture.
          "((Prod.mk) ((String.toList) (\"Point (1)\"))) (((Point) (n)) (n))"
        == "((Prod.mk) ((String.toList) (\"Point (1)\"))) (((Point.Point) (n)) (n))"
 
--- `mapOutsideLiterals` itself: `f` sees only code segments, and never literal
--- content. Marking each segment `f` receives makes that visible directly.
+-- `mapOutsideLiterals` itself: `f` sees only code segments, and never literal or
+-- comment content. Marking each segment `f` receives makes that visible directly.
 #guard mapOutsideLiterals (fun c => "<" ++ c ++ ">") "a \"b\" c"
        == "<a >\"b\"< c>"
 #guard mapOutsideLiterals id "any \"text\" at all" == "any \"text\" at all"
+#guard mapOutsideLiterals (fun c => "<" ++ c ++ ">") "a -- b\nc"
+       == "<a >-- b\n<c>"
+
+/-! ### M4 Task 3, SECOND PASS — the scanner tracks Lean COMMENTS
+
+Review found that the first version of `Emit.litScan` modelled string and char
+literals but NO comments, and that Lean comments are reachable in the text it
+scans: `shim/spec-plugin/GhcSpecDump.hs` lexes with `rawTokStream = True` and
+copies a `{- @lean … -}` body verbatim, the `lean` quasi-quoter does the same for
+a `[lean| … |]` block, and `Main.lean:401` hands the result to `resolveSpecText`.
+So the mask leaked, and the leak was SILENT rather than fail-loud: a comment
+carrying an ODD number of `"` opened a spurious literal, that literal closed on
+the OPENING quote of the next REAL literal, and the real literal's contents landed
+in a CODE segment and were rewritten.
+
+MEASURED at `37140d0` (the parent), through `resolveSpecText`, both comment forms.
+The `segs` line is the evidence: `Point (1)` — the content of the REAL literal —
+was classified `false`, i.e. CODE.
+
+    in : -- the label is "Point (1)
+         theorem t : label = "Point (1)".toList := by rfl
+    out: -- the label is "Point (1)
+         theorem t : label = "Point.Point (1)".toList := by rfl
+    segs: [(false, -- the label is ), (true, "Point (1)
+          theorem t : label = "), (false, Point (1)), (true, ".toList := by rfl)]
+
+    in : /- note: "Point -/ theorem t : label = "Point (1)".toList := by rfl
+    out: /- note: "Point -/ theorem t : label = "Point.Point (1)".toList := by rfl
+    segs: [(false, /- note: ), (true, "Point -/ theorem t : label = "),
+          (false, Point (1)), (true, ".toList := by rfl)]
+
+Latent, not observed: 1 of the corpus's 162 spec blocks comments at all
+(`examples/haskell/DefaultMethods.hs`, six `--` lines) and those carry no quote —
+but spec text is USER-AUTHORED, so a commented theorem block is ordinary.
+
+DIFFERENTIAL FUZZ against an independent Python model of the same four-state
+lexer, comparing a per-character VERBATIM bitmap: 307,286 inputs over four
+alphabets (`" \ ' x (` to length 7; `" \ ' x - ⏎` to 6; `" \ ' x / -` to 6;
+`" - / ⏎ x` to 7), ZERO divergences and ZERO round-trip failures. The same model
+against the PRE binary reports 9,697 / 14,067 / 24,020 divergences on the three
+comment-bearing alphabets, including the `--"⏎"…` leak family below, so the
+harness demonstrably reports.
+
+E2E: `examples/haskell/SpecComment.hs`, five spec blocks. At `37140d0` it does not
+build — three errors, one per hazard, and the generated diff shows the inversion
+exactly: the literal was rewritten (`"Point.Point (1)".toList`) while the real
+ctor application beside it was NOT (`Point 1 2` left bare → "Function expected at
+Point"). Now: transpile rc=0, elaborates with 0 errors, 5 theorems green.
+-/
+
+-- THE MEASURED LEAK, both forms, pinned as the fixed shape.
+#guard resolveSpecText [pointDecl] []
+         "-- the label is \"Point (1)\ntheorem t : label = \"Point (1)\".toList := by rfl"
+       == "-- the label is \"Point (1)\ntheorem t : label = \"Point (1)\".toList := by rfl"
+#guard resolveSpecText [pointDecl] []
+         "/- note: \"Point -/ theorem t : label = \"Point (1)\".toList := by rfl"
+       == "/- note: \"Point -/ theorem t : label = \"Point (1)\".toList := by rfl"
+
+-- A `--` comment with an ODD quote count, then a real literal that must NOT be
+-- rewritten and code that MUST be — the three-way discrimination in one string.
+-- The comment is one verbatim segment, its NEWLINE included.
+#guard litSegments "-- a \" b\nf (Point 1) ++ \"Point (1)\""
+       == [(false, ""), (true, "-- a \" b\n"), (false, "f (Point 1) ++ "),
+           (true, "\"Point (1)\""), (false, "")]
+#guard resolveUserCtors [pointDecl] "-- a \" b\nf (Point 1) ++ \"Point (1)\""
+       == "-- a \" b\nf (Point.Point 1) ++ \"Point (1)\""
+
+-- NESTED block comments. Lean nests these (`/- -/` inside `/- -/` elaborates
+-- clean, measured in 4.24.0), so the state carries a depth: the inner opener
+-- pushes, the first closer pops to depth 1, the second closes. The `"` inside
+-- changes no literal state, and the code after the comment is still rewritten.
+#guard litSegments "/- /- \"x -/ -/ Point (1)"
+       == [(false, ""), (true, "/- /- \"x -/ -/"), (false, " Point (1)")]
+#guard resolveUserCtors [pointDecl] "/- /- \"x -/ -/ Point (1)"
+       == "/- /- \"x -/ -/ Point.Point (1)"
+
+-- Neither comment opener is special INSIDE a string literal...
+#guard litSegments "\"-- not a comment\" ++ Point (1)"
+       == [(false, ""), (true, "\"-- not a comment\""), (false, " ++ Point (1)")]
+#guard litSegments "\"/- not a comment\" ++ Point (1)"
+       == [(false, ""), (true, "\"/- not a comment\""), (false, " ++ Point (1)")]
+-- ...and a `"` is not a delimiter inside a comment. Both directions are Lean's
+-- own lexing, and both had to be pinned: getting either backwards desyncs the
+-- scanner on ordinary text.
+#guard litSegments "-- one \" quote\nPoint (1)"
+       == [(false, ""), (true, "-- one \" quote\n"), (false, "Point (1)")]
+
+-- `-` and `/` that are NOT comment starts: subtraction, division, a negative
+-- literal argument and an unspaced `x-y`. One character of the pair is not
+-- enough, and nothing here changes state.
+#guard litSegments "a - b / c ++ (x - -1) ++ Point (1)"
+       == [(false, "a - b / c ++ (x - -1) ++ Point (1)")]
+#guard litSegments "x-y" == [(false, "x-y")]
+-- ...against the two that ARE (a comment running to EOF is the tail).
+#guard litSegments "x -- y" == [(false, "x "), (true, "-- y")]
+#guard litSegments "x /- y" == [(false, "x "), (true, "/- y")]
+-- A block CLOSER in code position is not a token this scanner reacts to: at
+-- depth 0 there is nothing to close, and in Lean it is a syntax error anyway.
+#guard litSegments "x -/ y" == [(false, "x -/ y")]
+
+-- DEGRADATION, the loud direction: an unterminated block comment classifies the
+-- tail as verbatim, so rewrites there are SKIPPED, never made wrongly.
+#guard litSegments "f (Point 1) ++ /- unterminated Point (1)"
+       == [(false, "f (Point 1) ++ "), (true, "/- unterminated Point (1)")]
+
+-- THE SAME ROOT CAUSE, footnote: the OUTSIDE `\` arm used to be unconditional,
+-- but `\` is a real Lean token (`SDiff` — `#eval "abc" \ "b"` parses), so it read
+-- the `\"` below as an ESCAPED QUOTE and the literal's contents as CODE.
+-- Measured pre-fix: `s \"Point.Point (1)"`. It is now the escaped-CHAR-literal
+-- arm (`'` `\` c `'`), which fires only where the backslash is inside a char
+-- literal, so the `\` here is code and the literal after it is a literal.
+#guard litSegments "s \\\"Point (1)\""
+       == [(false, "s \\"), (true, "\"Point (1)\""), (false, "")]
+#guard resolveSpecText [pointDecl] [] "theorem t : (label, s \\\"Point (1)\") = x"
+       == "theorem t : (label, s \\\"Point (1)\") = x"
+-- ...and both quote-bearing spellings of a char literal still classify as code,
+-- as do the LONGER escapes that match neither char arm (`'\x00'` is hand-written
+-- corpus text, `Generated/StringBasics.lean:54`).
+#guard litSegments "c == '\\\"' && Point (1)" == [(false, "c == '\\\"' && Point (1)")]
+#guard litSegments "['\"'] ++ Point (1)" == [(false, "['\"'] ++ Point (1)")]
+#guard litSegments "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)"
+       == [(false, "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)")]
+
+-- THE TWO RESIDUAL LEAKS, pinned as KNOWN rather than argued away — this is the
+-- silent direction, and it is still open. A RAW string literal (`r"a\"` is the
+-- two characters `a\`, not an escape) and an INTERPOLATION with a nested literal
+-- (`s!"{f "y"}"`) are Lean lexical forms this scanner does not model; both parse
+-- in 4.24.0 (measured) and both still rewrite inside the literal. Neither occurs
+-- anywhere in the corpus. The fix for them is a fifth and sixth state, not a
+-- hedge; these guards go RED the moment one is added, which is the point.
+#guard resolveSpecText [pointDecl] [] "theorem t : x = r\"a\\\" ++ \"Point (1)\""
+       == "theorem t : x = r\"a\\\" ++ \"Point.Point (1)\""
+#guard resolveSpecText [pointDecl] [] "theorem t : x = s!\"{f \"Point (1)\"}\""
+       == "theorem t : x = s!\"{f \"Point.Point (1)\"}\""
+
+-- KERNEL REDUCTION, the property `partial` would have cost: every `#guard` above
+-- and this `rfl` need `litScan` to reduce, and it does because it is STRUCTURAL on
+-- the character list — `litScan._sunfold` exists in the environment (the marker of
+-- structural rather than well-founded recursion), and the block-comment DEPTH is a
+-- plain `Nat` in the state, matched as `0` or `d + 1`, so nesting never enters the
+-- termination argument.
+example : litSegments "/- /- \"x -/ -/z"
+        = [(false, ""), (true, "/- /- \"x -/ -/"), (false, "z")] := by rfl
 
 end GhcCoreToLean.Tests

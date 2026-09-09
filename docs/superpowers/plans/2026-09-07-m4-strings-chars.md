@@ -63,7 +63,7 @@ Edit → `lake build GhcCoreToLean` (guards) → (shim changed? `cd shim && caba
 
 **Files:** `shim/Main.hs`; `GhcCoreToLean/Tests/Unit.lean` (observation block).
 
-Current, [shim/Main.hs:324](../../../shim/Main.hs) — the *only* lossy arm in `convertLit`:
+Current, [shim/Main.hs:368](../../../shim/Main.hs) — the *only* lossy arm in `convertLit` (the `MachStr bs ->` case; `:324` was accurate when this plan was written and drifted as Task 1's explanation grew):
 ```haskell
   MachStr _     -> object [ "tag" .= ("LitString" :: T.Text), "value" .= ("<bs>" :: T.Text) ]
 ```
@@ -103,7 +103,7 @@ Two changes that MUST land together (either alone is broken):
 
 - [ ] **Step 1:** Reproduce it — a fixture with a data type `Point` and a string literal containing `Point (1)`. Confirm the rewrite fires and is silent (quote pre-state).
 - [ ] **Step 2:** Fix by skipping rewrites inside string literals (a literal-aware scan in `replaceCtorApps` and the four needles in `resolveUserCtors`, `Emit.lean:3545`/`3581-3592`). Watch the interaction with Task 2's escaping — an escaped `\"` inside a literal must not end the literal for the scanner. Guards both directions (rewrites outside literals still fire; inside literals never).
-- [ ] **Step 3:** Update the stale comment at `Unit.lean:915-926` (its premise is now false) and the stale `shim/Main.hs:291` ref at `:921` (the arm is at `:324`). Promote the probe to a committed fixture if it's ordinary Haskell.
+- [ ] **Step 3:** Update the stale comment at `Unit.lean:915-926` (its premise is now false) and the stale `shim/Main.hs:291` ref at `:921` (the arm is at `:368`). Promote the probe to a committed fixture if it's ordinary Haskell.
 - [ ] **Step 4: Commit** (`fix(strings): ctor rewrites skip string literals (silent-wrong once literals are real)`).
 
 ### Task 4: `Char` operations
