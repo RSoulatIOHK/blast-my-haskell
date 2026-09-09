@@ -905,27 +905,41 @@ def mkPartialBind (nm : String) : Bind :=
 -- For every shape the fixtures exercise, fix (B) is loud in both directions —
 -- a false positive puts a TERM where a type is expected (`BEq Point.Point`), a
 -- false negative leaves a type where a function is expected, both elaboration
--- errors — EXCEPT inside a hand-written string literal, the one silent-rewrite
--- hedge below.
+-- errors — EXCEPT inside a string literal, the one silent-rewrite exposure,
+-- hedged here at M2 time and CLOSED by M4 Task 3 (below).
 --
--- KNOWN HEDGE (the single non-loud exposure): the rewrite is textual, so a ctor
--- name followed by args inside a hand-written STRING LITERAL in a spec block is
--- rewritten too — `"s = \"Point 1\""` becomes `Point.Point 1` inside the
--- literal. That is pre-existing exposure of the ` Ctor (` needle as well, not
--- new to `replaceCtorApps`. No fixture emits a `LitString` outside the dropped
--- `$tr`/`$tc` binds (6 there, see the census above), and no Haskell string
--- literal can reach the emitter at all — the AIRTIGHT reason is upstream of
--- `valueMap`: the shim DISCARDS string payloads entirely (`shim/Main.hs:291`
--- emits `"value": "<bs>"` for `MachStr`), so a string literal cannot round-trip
--- regardless of what the maps do. (Belt and braces: Core spells the literal
--- `unpackCString# "…"#` and `unpackCString#` has no `valueMap` arm, so outside
--- the `error`/`undefined` spine — where the whole application collapses to
--- `default` — it would emit as a loud unknown identifier anyway. And note the
--- narrower claim: the string TYPE is mapped — `String` is `[Char]` in Core,
--- which `typeConMap` sends to `List Char`. It is literal PRODUCTION that cannot
--- compile today, not String-typed code in general.) So the residual risk is a
--- hand-authored literal in theorem text — rare, and reviewable in the spec
--- block itself.
+-- THE HEDGE, AND WHY IT DID NOT HOLD (updated by M4 Task 3 — the text below used
+-- to argue this was airtight; the argument's premise is now FALSE). The rewrite
+-- is textual, so a ctor name followed by args inside a STRING LITERAL was
+-- rewritten too — `"s = \"Point 1\""` became `Point.Point 1` inside the literal.
+-- That was pre-existing exposure of the ` Ctor (` needle as well, not new to
+-- `replaceCtorApps`. At M2 time no fixture emitted a `LitString` outside the
+-- dropped `$tr`/`$tc` binds (6 there, see the census above), and the reason given
+-- for hedging rather than fixing sat upstream of `valueMap`: the shim DISCARDED
+-- string payloads entirely (it emitted `"value": "<bs>"` for `MachStr`), so a
+-- string literal could not round-trip regardless of what the maps did.
+--
+-- M4 TASK 1 REPLACED THAT ARM WITH THE LITERAL'S REAL BYTES
+-- (`shim/Main.hs:368`, the `MachStr bs ->` case — the `:291` this comment used
+-- to cite was accurate when written, verified at `70f651a`, and drifted as Task
+-- 1's own explanation grew) and M4 TASK 2 mapped `unpackCString#`. From
+-- that moment a Haskell literal `"Point (1)"` emitted as
+-- `"Point.Point (1)".toList` — type-correct, compiles, silently wrong, and no
+-- longer confined to hand-authored spec text. M4 Task 3 closed it: both
+-- `replaceCtorApps` and the four needles now run only over the CODE segments of
+-- `Emit.mapOutsideLiterals` (state machine in `Emit.lean`'s "Literal-aware
+-- scanning" header; guards and the measured pre-fix output in the "M4 Task 3"
+-- section at the end of this file; `examples/haskell/StringCtorClash.hs` is the
+-- e2e fixture).
+--
+-- Two M2-era observations that are still TRUE and worth keeping: Core spells the
+-- literal `unpackCString# "…"#`, so before Task 2 gave `unpackCString#` a
+-- `valueMap` arm a literal outside the `error`/`undefined` spine — where the
+-- whole application collapses to `default` — emitted as a loud unknown
+-- identifier; and the string TYPE was mapped from the start (`String` is
+-- `[Char]` in Core, which `typeConMap` sends to `List Char`), so it was literal
+-- PRODUCTION that could not compile at M2 time, not String-typed code in
+-- general.
 
 def pointDecl : DataDecl :=
   {name := "Point", kind := "data",
@@ -7029,5 +7043,144 @@ def unrepMsg : String := unrepresentableStringLiteralError "lone" "78 ed a0 80 7
 #guard (unrepMsg.splitOn "bytes `78 ed a0 80 79` in bind `lone`").length == 2
 #guard (unrepMsg.splitOn "LONE SURROGATE").length == 2
 #guard (unrepMsg.splitOn "NUL is NOT this case").length == 2
+
+/-! ## M4 Task 3 — the ctor rewrites skip string literals
+
+Pass 3 (`resolveUserCtors` + `replaceCtorApps`) is the ONLY textual pass whose
+needles are BARE identifiers. Passes 1, 2 and 4 key off
+`(GHCCore.tyConOpaque "X")`, whose own quote delimiters cannot appear unescaped
+inside a Lean string literal, so they are self-protecting by construction
+(audited: the only other `String.replace` in `Emit.lean` is the `{t}` template
+fill, which rewrites map TEMPLATES, not emitted source). Pass 3 was therefore the
+one place a rewrite could land INSIDE a literal, and the M2-era hedge above ("THE
+HEDGE, AND WHY IT DID NOT HOLD", in the M2 Task 1 records) held only while no
+Haskell string literal could reach the emitter at all. Tasks 1 and 2 made literals real; this task makes the rewrites
+literal-aware (`Emit.mapOutsideLiterals`, and the state machine documented in the
+"Literal-aware scanning" section header there).
+
+MEASURED AT THE PARENT COMMIT (3664d3f) on `examples/haskell/StringCtorClash.hs`
+— transpile rc=0, and with the pins removed `lake build` rc=0 too, i.e. FULLY
+SILENT:
+
+    def label : List Char :=          -- Haskell: label = "Point (1)"
+      (String.toList) ("Point.Point (1)")
+    def needles : List Char :=
+      (String.toList) ("| Point.Point y (Point.Point) x Point.Point (1) (Point.Point (1))")
+    theorem esc_then_ctor : ("\"Point.Point (1)\"".toList, …
+
+THE TRAP THAT SHAPES THE PINS. A theorem comparing the transpiled literal against
+a HAND-WRITTEN copy of itself (`label = "Point (1)".toList`) still PASSED before
+the fix, because the rewrite hit both sides equally. Measured pre-fix: the build
+failed at exactly the five code-point/length pins and at NONE of the four
+self-referential ones — a fixture written only in the self-referential shape
+would have been green on silently-wrong output. Hence `label.length = 9` and the
+explicit `['P', 'o', …]` spelling in the fixture.
+-/
+
+-- THE SCANNER, segment by segment. `false` is code, `true` is a string literal
+-- (quotes included). The last case is the whole point: the scanner RESUMES, so
+-- the ` ++ Point (1)` after each literal is still code.
+#guard litSegments "a \"lit\" b"
+       == [(false, "a "), (true, "\"lit\""), (false, " b")]
+-- An escaped quote does NOT end the literal (Task 2's escaping, first direction).
+#guard litSegments "\"say \\\"hi\\\"\" ++ Point (1)"
+       == [(false, ""), (true, "\"say \\\"hi\\\"\""), (false, " ++ Point (1)")]
+-- A literal ENDING in an escaped BACKSLASH ends at the next quote (Task 2's
+-- escaping, second direction — the case a naive "skip the char after a
+-- backslash" gets wrong, running the literal on to the end of the file).
+#guard litSegments "\"x\\\\\" ++ Point (1)"
+       == [(false, ""), (true, "\"x\\\\\""), (false, " ++ Point (1)")]
+-- A raw `"` inside a CHAR literal does not open a string literal. This is real
+-- corpus text, not a hypothetical: `Generated/StringBasics.lean:44,48`.
+#guard litSegments "['\"'] ++ Point (1)" == [(false, "['\"'] ++ Point (1)")]
+#guard litSegments "theorem quoted_val : quoted = ['s', 'a', 'y', ' ', '\"', 'h', 'i', '\"', '\\n'] := by rfl"
+       == [(false, "theorem quoted_val : quoted = ['s', 'a', 'y', ' ', '\"', 'h', 'i', '\"', '\\n'] := by rfl")]
+-- An identifier's trailing apostrophe is NOT a delimiter (Lean allows `x'`), so
+-- the literal after it is still found.
+#guard litSegments "x' ++ \"Point (1)\""
+       == [(false, "x' ++ "), (true, "\"Point (1)\""), (false, "")]
+-- The EMITTER's spelling of a double-quote char literal is `'\"'` (`escapeLitChar`
+-- escapes both quotes in both positions), which the OUTSIDE escape rule covers.
+#guard litSegments "c == '\\\"' && Point (1)" == [(false, "c == '\\\"' && Point (1)")]
+-- Escaped char literals need no arm of their own: the escape rule steps over the
+-- payload and the surrounding quotes then change no state.
+#guard litSegments "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)"
+       == [(false, "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)")]
+-- DEGRADATION, both fail-loud: an unterminated literal classifies the tail as
+-- literal, so rewrites there are SKIPPED (Lean: "function expected at Point"),
+-- never made wrongly. Unreachable from emitter output — every quote it writes
+-- comes from `escapeStringLit`/`escapeCharLit` in balanced pairs.
+#guard litSegments "f (Point 1) ++ \"unterminated Point (1)"
+       == [(false, "f (Point 1) ++ "), (true, "\"unterminated Point (1)")]
+#guard litSegments "" == [(false, "")]
+
+-- ROUND-TRIP: concatenating the segments is the identity on every case above.
+-- This is what makes `mapOutsideLiterals` safe to run over arbitrary emitted
+-- text — it can only change what `f` changes.
+#guard (["a \"lit\" b", "\"say \\\"hi\\\"\" ++ Point (1)", "\"x\\\\\" ++ Point (1)",
+         "['\"'] ++ Point (1)", "x' ++ \"Point (1)\"", "c == '\\\"' && Point (1)",
+         "['\\n', '\\x00', '\\\\', '\\''] ++ Point (1)", "",
+         "f (Point 1) ++ \"unterminated Point (1)", "\"\"", "\\", "'"]).all
+       fun s => String.join ((litSegments s).map (·.2)) == s
+
+-- THE FIX AS A CONTRAST, not an assertion: the raw pass still rewrites inside a
+-- literal (this is the silent-wrong line, kept executable), the wrapped one does
+-- not, and both agree on ordinary code.
+#guard replaceCtorAppsCode "Point" "Point.Point" "\"Point (1)\"" == "\"Point.Point (1)\""
+#guard replaceCtorApps     "Point" "Point.Point" "\"Point (1)\"" == "\"Point (1)\""
+#guard replaceCtorApps     "Point" "Point.Point" "f (Point 1)"
+       == replaceCtorAppsCode "Point" "Point.Point" "f (Point 1)"
+
+-- INSIDE a literal, NONE of the five rewrites fire — the four fixed needles
+-- (`| C `, `(C)`, ` C (`, `(C (`) and `replaceCtorApps`. One literal carrying all
+-- four, which is what `needles` in the fixture is.
+#guard resolveUserCtors [pointDecl]
+         "\"| Point y (Point) x Point (1) (Point (1))\""
+       == "\"| Point y (Point) x Point (1) (Point (1))\""
+#guard resolveSpecText [pointDecl] [] "\"| Point y (Point) x Point (1) (Point (1))\""
+       == "\"| Point y (Point) x Point (1) (Point (1))\""
+
+-- OUTSIDE a literal, ALL FIVE still fire — the direction a fix like this breaks
+-- silently if it is only tested one way.
+#guard resolveUserCtors [pointDecl] "| Point ds_1 ds_2 =>" == "| Point.Point ds_1 ds_2 =>"
+#guard resolveUserCtors [pointDecl] "((Point) (x_1)) (y_2)" == "((Point.Point) (x_1)) (y_2)"
+#guard resolveUserCtors [pointDecl] "f (Point (1)) 2" == "f (Point.Point (1)) 2"
+#guard resolveUserCtors [pointDecl] "eq (Point 1 2)" == "eq (Point.Point 1 2)"
+#guard resolveUserCtors [pointDecl] "[Point 1 2]" == "[Point.Point 1 2]"
+-- ...and the boundary negatives are unaffected by the scan (`Point` is a
+-- substring of `mkPoint`, and a type annotation is not an application).
+#guard resolveUserCtors [pointDecl] "mkPoint 1 2 = (p : Point)"
+       == "mkPoint 1 2 = (p : Point)"
+
+-- THE ESCAPE BOUNDARIES, each followed by real code that must still be
+-- rewritten — the "scanner resumes" property at the rewrite level rather than
+-- the segment level. Pre-fix every one of these rewrote inside the literal.
+#guard resolveUserCtors [pointDecl] "f \"Point (1)\" (Point 1 2)"
+       == "f \"Point (1)\" (Point.Point 1 2)"
+#guard resolveUserCtors [pointDecl] "f \"\\\"Point (1)\\\"\" (Point 1 2)"
+       == "f \"\\\"Point (1)\\\"\" (Point.Point 1 2)"
+#guard resolveUserCtors [pointDecl] "f \"Point (1)\\\\\" (Point 1 2)"
+       == "f \"Point (1)\\\\\" (Point.Point 1 2)"
+-- A ctor name flanked by escaped quotes INSIDE one literal: the `\"` is content,
+-- not a boundary, so nothing here is code.
+#guard resolveUserCtors [pointDecl] "\"x\\\"Point (1)\\\"y\""
+       == "\"x\\\"Point (1)\\\"y\""
+-- A ctor name SPANNING an escape is invisible to a textual needle either way
+-- (`Poi\x6et` is `Point` only after Lean decodes it) — recorded because it is the
+-- one shape the fix does not need to handle: no rewrite is the safe direction.
+#guard resolveUserCtors [pointDecl] "\"Poi\\x6et (1)\"" == "\"Poi\\x6et (1)\""
+-- Two literals with code between and after them — the multi-segment case.
+#guard resolveUserCtors [pointDecl] "(\"Point (1)\", Point 1 2, \"Point (2)\", Point 3 4)"
+       == "(\"Point (1)\", Point.Point 1 2, \"Point (2)\", Point.Point 3 4)"
+-- The emitted shape end-to-end, exactly as `StringCtorClash.lean` has it.
+#guard resolveUserCtors [pointDecl]
+         "((Prod.mk) ((String.toList) (\"Point (1)\"))) (((Point) (n)) (n))"
+       == "((Prod.mk) ((String.toList) (\"Point (1)\"))) (((Point.Point) (n)) (n))"
+
+-- `mapOutsideLiterals` itself: `f` sees only code segments, and never literal
+-- content. Marking each segment `f` receives makes that visible directly.
+#guard mapOutsideLiterals (fun c => "<" ++ c ++ ">") "a \"b\" c"
+       == "<a >\"b\"< c>"
+#guard mapOutsideLiterals id "any \"text\" at all" == "any \"text\" at all"
 
 end GhcCoreToLean.Tests

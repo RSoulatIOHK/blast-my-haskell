@@ -3244,6 +3244,11 @@ single identifier occurrence, so none can span the `\n\n` between two pieces.
 Pass 4 must run last, and pass 1 must have reached every section before it, or a
 local type still spelled opaque gets rewritten to `M.T` for its OWN module `M`.
 
+PASS 3 IS ALSO THE ONLY PASS WHOSE NEEDLES ARE BARE IDENTIFIERS — 1, 2 and 4 all
+match `(GHCCore.tyConOpaque "X")`, whose own quotes cannot occur unescaped inside
+a Lean string literal — so it is the only one that needs to know where the string
+literals are. See "Literal-aware scanning" below for the scan and the audit.
+
 Newtype erasure (pass 2) adds two constraints of its own, both live:
 
 * Passes 1 and 3 take `keptTypeDecls`, NOT `p.typeDecls`. Pass 1 on the full set
@@ -3709,14 +3714,139 @@ private def isIdentish (c : Char) : Bool :=
 private def isArgStart (c : Char) : Bool :=
   c == '(' || c == '[' || c == '⟨' || c.isDigit
 
-/-- Boundary-aware rewrite of `bare` → `qual` at every APPLICATION-position
+/-! ### Literal-aware scanning (pass 3's one silent hole, closed)
+
+M4 TASK 3. Pass 3 is the ONLY pass in the pipeline above whose needles are BARE
+identifiers. Passes 1, 2 and 4 all key off `(GHCCore.tyConOpaque "X")`, and that
+needle carries its own `"` delimiters: a Lean string literal spells an inner
+quote `\"`, so the needle cannot match inside one. They are self-protecting by
+construction (audited, M4 Task 3 — the only other `String.replace` in this file is
+the `{t}` template fill in `Maps`-driven signature emission, which rewrites map
+TEMPLATES, not emitted source). Pass 3 had no such protection: it is a plain text
+rewrite, so a ctor name followed by an argument INSIDE a string literal was
+rewritten too. That was documented as a hedge while its premise held — no Haskell
+string literal could reach the emitter at all — and M4 Task 2 destroyed the
+premise: `"Point (1)"` emitted as `"Point.Point (1)".toList`, type-correct,
+compiles, SILENTLY WRONG (measured before the fix, `rc=0` on both transpile and
+`lake build`).
+
+THE SCANNER (exact state machine; two states, two characters of lookahead):
+
+    OUTSIDE                                    IN-LITERAL
+    `"`       → open literal, go IN-LITERAL      `"`     → close, go OUTSIDE
+    `\` c     → copy both, stay OUTSIDE          `\` c   → copy both, stay IN
+    `'` c `'` → copy all three, stay OUTSIDE     any c   → copy, stay IN
+                (only when c ∉ { `\`, `'` } and the
+                 opening `'` does not continue an
+                 identifier — see `isIdentish`)
+    any c     → copy, stay OUTSIDE
+
+Why each arm exists:
+
+* `\` c IN-LITERAL is what makes Task 2's escaping safe, in BOTH of its
+  directions: `"say \"hi\""` must not end at the first `\"`, and `"x\\"` must end
+  at the quote that follows the escaped BACKSLASH rather than reading `\"` as an
+  escape and running past the end of the literal. Quote-counting gets the first
+  wrong; quote-counting plus a naive "skip the char after a backslash" gets the
+  second wrong. The state machine tracks escape state, so both hold.
+* `\` c OUTSIDE exists for exactly one shape, and it is emitter-produced: a
+  double-quote CHAR literal is spelled `'\"'` (`escapeLitChar` escapes both quote
+  characters in both literal positions), and that `"` must not open a string.
+* The `'` c `'` arm covers the HAND-WRITTEN spelling of that same hazard.
+  `['"']` and `['s', 'a', 'y', ' ', '"', …]` are real corpus text
+  (`Generated/StringBasics.lean:44,48`), where a raw `"` sits inside a char
+  literal. It is deliberately NOT a third scanner state: Lean allows `'` inside
+  identifiers (`x'`, `ds'`), so treating every apostrophe as a delimiter would
+  desync the scanner on ordinary code — the exact mistake this arm is shaped to
+  avoid. Requiring a non-identifier character BEFORE the quote and a closing
+  quote exactly two characters later makes it fire on char literals and never on
+  `x'`. An ESCAPED char literal (`'\n'`, `'\x00'`, `'\''`) needs no arm at all:
+  the OUTSIDE `\` c rule steps over the payload, and the bare quotes around it
+  then change no state.
+
+BOTH RESIDUAL DEGRADATIONS ARE FAIL-LOUD, which is why this shape was chosen over
+a full Lean lexer. An UNTERMINATED literal classifies the tail as literal, and a
+spurious literal opened by a raw `"` that no arm above covers classifies the text
+up to the next quote as literal — in both cases rewrites are SKIPPED, and a
+skipped ctor rewrite is Lean's "function expected at Point", never a wrong value.
+No arm can cause a rewrite the literal-unaware code would not have made, so
+nothing here is silent.
+
+REACHABILITY OF THOSE TWO CASES, enumerated rather than assumed. Every site in
+this file that writes a `"` into the OUTPUT is one of six: `escapeStringLit` and
+`escapeCharLit` (balanced, payload escaped — these are the literals this scan is
+about), and four RAW interpolations whose payload is a name, a hex string or a
+label: `(GHCCore.tyConOpaque "T")`, `(GHCCore.unrepresentableStringLiteral "hex")`
+(unreachable post-refusal), `GHCCore.foreignLabel "l"` and `emitType`'s
+`.tyLit (.str s)`. All six write BALANCED delimiters, so emitter output cannot
+desync the scanner. The last two interpolate without escaping, so a payload
+CONTAINING a raw quote or a trailing backslash would — but that same payload is a
+Lean SYNTAX error on the line that carries it, so the failure is loud before the
+scan matters, and both are unobserved in every generated file in the corpus.
+Hand-written spec text is copied verbatim and is the only other source of either
+case; it is resolved per `@lean` block, so a desync cannot cross blocks.
+-/
+
+/-- The scanner of the section header. `inLit` is the state, `acc` the segment
+    built so far; a state change flushes `acc` and starts a fresh segment.
+    Structural on the character list (NOT `partial`: the `#guard`s pinning it
+    need kernel reduction). -/
+private def litScan : List Char → Bool → String → List (Bool × String)
+  | [], inLit, acc => [(inLit, acc)]
+  -- IN-LITERAL: an escape pair is copied whole, so `\"` does not close and the
+  -- `"` after a `\\` is not mistaken for an escaped quote.
+  | '\\' :: c :: rest, true,  acc => litScan rest true  ((acc.push '\\').push c)
+  | '"'  :: rest,       true,  acc => (true, acc.push '"') :: litScan rest false ""
+  -- OUTSIDE: a quote opens a literal.
+  | '"'  :: rest,       false, acc => (false, acc) :: litScan rest true "\""
+  -- OUTSIDE: an unescaped one-character CHAR literal, but only where the opening
+  -- quote cannot be an identifier's trailing apostrophe (`x'`).
+  | '\'' :: c :: '\'' :: rest, false, acc =>
+    if (acc.isEmpty || !isIdentish acc.back) && c != '\\' && c != '\'' then
+      litScan rest false ((((acc.push '\'').push c).push '\''))
+    else
+      litScan (c :: '\'' :: rest) false (acc.push '\'')
+  -- OUTSIDE: an escape pair here too — the emitter spells a double-quote char
+  -- literal `'\"'`, whose quote must not open a string literal.
+  | '\\' :: c :: rest, false, acc => litScan rest false ((acc.push '\\').push c)
+  | c :: rest,          inLit, acc => litScan rest inLit (acc.push c)
+
+/-- `src` split into alternating CODE (`false`) and STRING-LITERAL (`true`)
+    segments in source order, the quotes belonging to the literal segment.
+    Concatenating the second components reproduces `src` exactly (pinned in
+    `Tests/Unit.lean`). See the section header for the state machine. -/
+def litSegments (src : String) : List (Bool × String) :=
+  litScan src.data false ""
+
+/-- Apply `f` to every CODE segment of `src`, copying string literals verbatim.
+    THE guard on every bare-identifier rewrite: `f` never sees literal content,
+    so it cannot rewrite it.
+
+    Behaviour-preserving outside literals, and the reason is worth stating rather
+    than assuming. No needle of pass 3 contains a `"` (`| C `, `(C)`, ` C (`,
+    `(C (`), so no legitimate match can span a code/literal boundary; and
+    `replaceCtorAppsCode`'s boundary tests degenerate at a segment edge exactly as
+    they did at a quote character — at a segment START `acc.isEmpty` makes
+    `leftOK` true, which is what a preceding `"` (not `isIdentish`) gave; at a
+    segment END the following text is empty, making `appOK` false, which is what a
+    following `"` (not `isArgStart`) gave. -/
+def mapOutsideLiterals (f : String → String) (src : String) : String :=
+  String.join ((litSegments src).map fun (isLit, s) => if isLit then s else f s)
+
+/-- THE RAW, LITERAL-UNAWARE rewrite. NOT for callers — use `replaceCtorApps`,
+    which is this restricted to code segments. It stays public for one reason: the
+    tests pin the silent-wrong behaviour it still has (the literal `"Point (1)"`
+    becoming `"Point.Point (1)"`) directly against the wrapper's, so the fix is
+    visible as a contrast rather than asserted.
+
+    Boundary-aware rewrite of `bare` → `qual` at every APPLICATION-position
     occurrence: identifier boundaries on both sides (so `mkPoint` and an
     already-qualified `Point.Point` are left alone) and an argument following
     (`isArgStart`). This is what covers a ctor applied to a *literal*
     argument — `Rect (Point 0 0) 1 1` — which the fixed needles in
     `resolveUserCtors` cannot express: they all require a `(` immediately
     after the ctor name. -/
-def replaceCtorApps (bare qual : String) (src : String) : String :=
+def replaceCtorAppsCode (bare qual : String) (src : String) : String :=
   match src.splitOn bare with
   | []              => src
   | first :: pieces =>
@@ -3740,6 +3870,13 @@ def replaceCtorApps (bare qual : String) (src : String) : String :=
         go more (acc ++ repl ++ next)
     go pieces first
 
+/-- `replaceCtorAppsCode` over the CODE segments of `src` only — the same
+    application-position rewrite, with string-literal content left alone. THE name
+    every caller uses: reaching for the raw one reintroduces the silent hole
+    documented above. -/
+def replaceCtorApps (bare qual : String) (src : String) : String :=
+  mapOutsideLiterals (replaceCtorAppsCode bare qual) src
+
 /-- Qualify user-defined data constructors in any position where Lean's
     elaborator would otherwise be ambiguous (type vs. ctor under the same
     name). The recognised call-shapes are:
@@ -3751,7 +3888,11 @@ def replaceCtorApps (bare qual : String) (src : String) : String :=
                                                   argument (`replaceCtorApps`)
 
     Type annotations like `(x : T)` or `→ T →` match none of these, so they
-    remain `T` and resolve to the type. -/
+    remain `T` and resolve to the type.
+
+    ALL FIVE REWRITES (the four needles and `replaceCtorApps`) see only the CODE
+    segments of `mapOutsideLiterals`: a ctor name inside a Lean string literal is
+    left alone, because rewriting it changes a VALUE rather than a name. -/
 def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
   decls.foldl (init := src) fun s d =>
     d.ctors.foldl (init := s) fun s c =>
@@ -3762,7 +3903,11 @@ def resolveUserCtors (decls : List DataDecl) (src : String) : String :=
         , (s!"({bareCtor})",   s!"({qualCtor})")
         , (s!" {bareCtor} (",  s!" {qualCtor} (")
         , (s!"({bareCtor} (",  s!"({qualCtor} (") ]
-      let s := rules.foldl (init := s) fun s (needle, repl) => s.replace needle repl
+      -- Both halves skip string-literal content (`mapOutsideLiterals`): the four
+      -- needles here, and `replaceCtorApps` internally.
+      let s := mapOutsideLiterals
+        (fun code => rules.foldl (init := code) fun c (needle, repl) =>
+          c.replace needle repl) s
       replaceCtorApps bareCtor qualCtor s
 
 /-! ### The imported-type manifest (`EXT_TYPES_MANIFEST`)
