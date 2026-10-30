@@ -109,6 +109,24 @@
       "evidence": ["GhcCoreToLean/Maps.lean", "examples/haskell/CharOps.hs", "README.md"]
     },
     {
+      "key": "feature:method-local-quantification",
+      "status": "refused",
+      "sourceBehavior": "A class method can quantify a type variable and constrain it independently of the class parameters.",
+      "leanImage": "The declaration plugin currently drops those binders, which could leave an unconstrained Lean implicit parameter.",
+      "domain": "No conservative domain for a method type with variables outside the class parameters.",
+      "refusal": "A residual method type variable outside the class parameters is rejected.",
+      "evidence": ["shim/decl-plugin/GhcDeclDump.hs", "GhcCoreToLean/Safety.lean", "GhcCoreToLean/Tests/Safety.lean", "tests/fixtures/verification/MethodLocalQuantifier.hs", "tests/fixtures/verification/MethodLocalContext.hs"]
+    },
+    {
+      "key": "feature:local-Eq-Ord-instances",
+      "status": "refused",
+      "sourceBehavior": "GHC permits Eq and Ord methods to disagree, and user-written tag primops can resemble derived instances.",
+      "leanImage": "Approximate mode models selected methods and derives or drops companions.",
+      "domain": "No conservative domain currently admitted for locally declared Eq or Ord instances.",
+      "refusal": "Every local Eq or Ord instance is rejected before lowering in conservative mode.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "GhcCoreToLean/Tests/Safety.lean", "examples/haskell/OrdHandwritten.hs"]
+    },
+    {
       "key": "feature:newtype-class-dispatch",
       "status": "conditional",
       "sourceBehavior": "Newtype representation can erase, but class selection depends on distinct source types and dictionaries.",

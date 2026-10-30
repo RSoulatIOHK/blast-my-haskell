@@ -22,6 +22,13 @@ private partial def typeUses (wanted : String) : GHCType → Bool
   | .forAll _ t => typeUses wanted t
   | _ => false
 
+private partial def typeVars : GHCType → List String
+  | .tyVar n => [n]
+  | .tyCon _ args => args.flatMap typeVars
+  | .tyApp a b | .tyFun a b => typeVars a ++ typeVars b
+  | .forAll n t => (typeVars t).filter (· != n)
+  | _ => []
+
 mutual
   private partial def exprUsesType (wanted : String) : Expr → Bool
     | .var v => typeUses wanted v.ty
@@ -189,9 +196,21 @@ def check (p : Program) : List Issue :=
   let issues := p.binds.flatMap bindIssues
     ++ p.typeDecls.flatMap (fun d => d.ctors.flatMap (fun c =>
       c.fields.flatMap (fun f => typeIssues s!"{d.name}.{f.name}" f.ty)))
-    ++ p.instances.flatMap (fun i => i.headTypes.flatMap (typeIssues i.dfunName))
+    ++ p.instances.flatMap (fun i =>
+      i.headTypes.flatMap (typeIssues i.dfunName) ++
+      (if ["Eq", "Ord"].contains i.className then
+        [{ code := "instance-method-fidelity", owner := i.dfunName,
+           detail := s!"local {i.className} instances may override methods that the Lean model derives or drops; instance origin and every method body must be preserved before conservative verification" }]
+       else []))
     ++ p.classDecls.flatMap (fun c => c.methods.flatMap (fun m =>
-      typeIssues s!"{c.name}.{m.name}" m.ty))
+      typeIssues s!"{c.name}.{m.name}" m.ty ++
+      (if m.hasUnsupportedSignature then
+        [{ code := "class-method-fidelity", owner := s!"{c.name}.{m.name}",
+           detail := "method-local quantifier or constraint was erased by the declaration plugin" }]
+       else []) ++
+      ((typeVars m.ty).eraseDups.filter (!c.tyVars.contains ·)).map (fun n =>
+        { code := "class-method-fidelity", owner := s!"{c.name}.{m.name}",
+          detail := s!"type variable {n} is not a class parameter; a method-local quantifier or constraint may have been erased by the declaration plugin" })))
   issues.foldl (fun acc i =>
     if acc.any (fun j => j.code == i.code && j.owner == i.owner && j.detail == i.detail)
     then acc else acc ++ [i]) []

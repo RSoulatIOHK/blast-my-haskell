@@ -2239,15 +2239,15 @@ def tagLocalDataDecl : DataDecl :=
 
         type ClassOpItem :: *
         type ClassOpItem = (GHC.Types.Var.Id, DefMethInfo)
-          	-- Defined in ‘GHC.Core.Class’
+            -- Defined in ‘GHC.Core.Class’
         type DefMethInfo :: *
         type DefMethInfo =
           GHC.Maybe.Maybe
             (GHC.Types.Name.Name, DefMethSpec GHC.Core.TyCo.Rep.Type)
-          	-- Defined in ‘GHC.Core.Class’
+            -- Defined in ‘GHC.Core.Class’
         type DefMethSpec :: * -> *
         data DefMethSpec ty = VanillaDM | GenericDM ty
-          	-- Defined in ‘GHC.Types.Basic’
+            -- Defined in ‘GHC.Types.Basic’
         classOpItems :: Class -> [ClassOpItem]
         classSCTheta :: Class -> [GHC.Core.TyCo.Rep.PredType]
         classTyVars :: Class -> [GHC.Types.Var.TyVar]

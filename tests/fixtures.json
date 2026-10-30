@@ -121,6 +121,16 @@
     "semantics": "approximate"
   },
   {
+    "id": "OrdHandwrittenConservative",
+    "source": "examples/haskell/OrdHandwritten.hs",
+    "expected": "unsupported",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "instance-method-fidelity"
+  },
+  {
     "id": "OrdInstance",
     "source": "examples/haskell/OrdInstance.hs",
     "expected": "no_properties",
@@ -415,6 +425,26 @@
     "expected": "proved",
     "accepted": true,
     "minTheorems": 8
+  },
+  {
+    "id": "verification/MethodLocalContext",
+    "source": "tests/fixtures/verification/MethodLocalContext.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "unsupported",
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "class-method-fidelity"
+  },
+  {
+    "id": "verification/MethodLocalQuantifier",
+    "source": "tests/fixtures/verification/MethodLocalQuantifier.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "unsupported",
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "class-method-fidelity"
   },
   {
     "id": "verification/UnsafeIntDivision",

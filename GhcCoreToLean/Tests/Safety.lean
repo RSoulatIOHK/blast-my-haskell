@@ -45,3 +45,33 @@ private def apply2 (f a b : Expr) : Expr := .app (.app f a) b
   (apply2 (.var lcmVar) (.var intVar) (.lit (.litMachineInt 2))))).isEmpty
 #guard (Safety.check (binding (.tyCon "Int" []) (.var lcmVar))).any
     (·.code == "partial-operation")
+
+-- GHC permits Eq (== versus /=) and Ord (compare versus <, <=, min, max)
+-- methods to disagree. The approximate emitter derives some companions, and
+-- its tag-primop heuristic can also mistake a hand-written compare for deriving.
+-- Conservative verification therefore refuses local instances of either class.
+private def withInstance (cls : String) : Program :=
+  { binds := [], typeDecls := [],
+    instances := [{ className := cls, headTypes := [.tyCon "T" []],
+                    dfunName := "$f" ++ cls ++ "T", dfunUnique := 10 }] }
+
+#guard (Safety.check (withInstance "Ord")).any
+    (·.code == "instance-method-fidelity")
+#guard (Safety.check (withInstance "Eq")).any
+    (·.code == "instance-method-fidelity")
+#guard (Safety.check (withInstance "Show")).isEmpty
+
+-- The sidecar currently drops method-local forall and constraint binders. A
+-- residual type variable would otherwise become Lean's implicit parameter.
+private def withClassMethod (result : GHCType) : Program :=
+  { binds := [], typeDecls := [], instances := [],
+    classDecls := [{ name := "C", tyVars := ["a"], supers := [], methods := [
+      { name := "method", ty := .tyFun (.tyVar "a") result }] }] }
+
+#guard (Safety.check (withClassMethod (.tyVar "b"))).any
+    (·.code == "class-method-fidelity")
+#guard (Safety.check (withClassMethod (.tyVar "a"))).isEmpty
+#guard (Safety.check { withClassMethod (.tyVar "a") with
+  classDecls := [{ name := "C", tyVars := ["a"], supers := [], methods := [
+    { name := "method", ty := .tyFun (.tyVar "a") (.tyVar "a"),
+      hasUnsupportedSignature := true }] }] }).any (·.code == "class-method-fidelity")

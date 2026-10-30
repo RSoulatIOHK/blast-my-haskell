@@ -277,7 +277,10 @@ def parseClassMethod (j : Lean.Json) : Except String ClassMethod := do
   let hasDefault ← match j.getObjVal? "hasDefault" with
     | .ok v    => v.getBool?
     | .error _ => .ok false
-  .ok { name, ty, hasDefault }
+  let hasUnsupportedSignature ← match j.getObjVal? "hasUnsupportedSignature" with
+    | .ok v    => v.getBool?
+    | .error _ => .ok false
+  .ok { name, ty, hasDefault, hasUnsupportedSignature }
 
 /-- Parse one class shape from the decl-plugin's `classDecls` channel:
     `{name, tyVars, supers, methods}`. All four keys are required — this channel
