@@ -361,7 +361,9 @@ def typeConMap : String → List String → Option String
 def dataConMap : String → Option String
   | "Just"    | "GHC.Maybe.Just"    => some "Option.some"
   | "Nothing" | "GHC.Maybe.Nothing" => some "Option.none"
-  | ":"       => some "List.cons"
+  -- GHC 9.2.7 retains the qualified constructor in value position for
+  -- source-written `(:)` in data-ordlist's recursive list functions.
+  | ":" | "GHC.Types.:" => some "List.cons"
   | "[]"      => some "List.nil"
   | "True"    => some "Bool.true"
   | "False"   => some "Bool.false"
