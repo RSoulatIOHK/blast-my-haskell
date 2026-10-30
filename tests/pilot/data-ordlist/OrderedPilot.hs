@@ -158,4 +158,21 @@ theorem sorted_insert (x : Int64) (xs : List Int64) :
       (insertSetBy.loop_2965 compare x xs) = true
   exact pairwise_to_sorted_loop _
     (pairwise_insert x xs (sorted_loop_to_pairwise xs h))
+
+theorem insert_idempotent_generic {α : Type} (cmp : α → α → Ordering)
+    (x : α) (xs : List α) (hself : cmp x x = Ordering.eq) :
+    insertSetBy.loop_2965 cmp x (insertSetBy.loop_2965 cmp x xs) =
+      insertSetBy.loop_2965 cmp x xs := by
+  induction xs with
+  | nil => simp [insertSetBy.loop_2965, hself]
+  | cons y ys ih =>
+      cases h : cmp x y with
+      | lt => simp [insertSetBy.loop_2965, h, hself]
+      | eq => simp [insertSetBy.loop_2965, h, hself]
+      | gt => simp [insertSetBy.loop_2965, h, ih]
+
+theorem insert_idempotent (x : Int64) (xs : List Int64) :
+    insertSetInt x (insertSetInt x xs) = insertSetInt x xs := by
+  simpa [insertSetInt, insertSetBy] using
+    insert_idempotent_generic compare x xs (by simp [compare, compareOfLessAndEq])
 -}
