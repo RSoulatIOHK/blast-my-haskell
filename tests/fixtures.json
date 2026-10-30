@@ -1,0 +1,459 @@
+[
+  {
+    "id": "Arithmetic",
+    "source": "examples/haskell/Arithmetic.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "BuiltinConstraints",
+    "source": "examples/haskell/BuiltinConstraints.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "CaseBinder",
+    "source": "examples/haskell/CaseBinder.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "CharOps",
+    "source": "examples/haskell/CharOps.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "CharSurrogate",
+    "source": "examples/haskell/CharSurrogate.hs",
+    "expected": "unsupported",
+    "semantics": "approximate",
+    "phase": "transpile"
+  },
+  {
+    "id": "DefaultMethods",
+    "source": "examples/haskell/DefaultMethods.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "Fib",
+    "source": "examples/haskell/Fib.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "FibComplex",
+    "source": "examples/haskell/FibComplex.hs",
+    "expected": "admitted",
+    "semantics": "approximate",
+    "reason": "The generated recursive definition admits termination."
+  },
+  {
+    "id": "ListBasics",
+    "source": "examples/haskell/ListBasics.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "ListLibrary",
+    "source": "examples/haskell/ListLibrary.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "ListLiterals",
+    "source": "examples/haskell/ListLiterals.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "LocalRec",
+    "source": "examples/haskell/LocalRec.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "MultiParam",
+    "source": "examples/haskell/MultiParam.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "NewtypeBasic",
+    "source": "examples/haskell/NewtypeBasic.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "NewtypeInstances",
+    "source": "examples/haskell/NewtypeInstances.hs",
+    "expected": "unsupported",
+    "semantics": "approximate",
+    "phase": "transpile"
+  },
+  {
+    "id": "NumOrd",
+    "source": "examples/haskell/NumOrd.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "OperatorCommons",
+    "source": "examples/haskell/OperatorCommons.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "OperatorShadow",
+    "source": "examples/haskell/OperatorShadow.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "OrdHandwritten",
+    "source": "examples/haskell/OrdHandwritten.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "OrdHandwrittenConservative",
+    "source": "examples/haskell/OrdHandwritten.hs",
+    "expected": "unsupported",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "instance-method-fidelity"
+  },
+  {
+    "id": "OrdInstance",
+    "source": "examples/haskell/OrdInstance.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "OrdSectionOrder",
+    "source": "examples/haskell/OrdSectionOrder.hs",
+    "expected": "proved",
+    "semantics": "approximate"
+  },
+  {
+    "id": "PartialHead",
+    "source": "examples/haskell/PartialHead.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "PreludeNames",
+    "source": "examples/haskell/PreludeNames.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "Ratio",
+    "source": "examples/haskell/Ratio.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "MaxMinOverArithmetics",
+    "source": "examples/haskell/RatioSpec/MaxMinOverArithmetics.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "RecordClient",
+    "source": "examples/haskell/RecordClient.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "RecordOps",
+    "source": "examples/haskell/RecordOps.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "SpecComment",
+    "source": "examples/haskell/SpecComment.hs",
+    "expected": "proved",
+    "semantics": "approximate"
+  },
+  {
+    "id": "SpecInterp",
+    "source": "examples/haskell/SpecInterp.hs",
+    "expected": "unsupported",
+    "semantics": "approximate",
+    "phase": "transpile"
+  },
+  {
+    "id": "StringBasics",
+    "source": "examples/haskell/StringBasics.hs",
+    "expected": "proved",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "accepted": true
+  },
+  {
+    "id": "StringCtorClash",
+    "source": "examples/haskell/StringCtorClash.hs",
+    "expected": "proved",
+    "semantics": "approximate"
+  },
+  {
+    "id": "StringSurrogate",
+    "source": "examples/haskell/StringSurrogate.hs",
+    "expected": "unsupported",
+    "semantics": "approximate",
+    "phase": "transpile"
+  },
+  {
+    "id": "SuperClass",
+    "source": "examples/haskell/SuperClass.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "TupleBasics",
+    "source": "examples/haskell/TupleBasics.hs",
+    "expected": "no_properties",
+    "semantics": "approximate",
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "TupleTriple",
+    "source": "examples/haskell/TupleTriple.hs",
+    "expected": "proved",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "accepted": true
+  },
+  {
+    "id": "TwoClassesDistinctMethods",
+    "source": "examples/haskell/TwoClassesDistinctMethods.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "TwoClassesSameMethod",
+    "source": "examples/haskell/TwoClassesSameMethod.hs",
+    "expected": "error",
+    "semantics": "approximate",
+    "phase": "ghc"
+  },
+  {
+    "id": "UserClass",
+    "source": "examples/haskell/UserClass.hs",
+    "expected": "refuted",
+    "semantics": "approximate",
+    "phase": "lean",
+    "contains": "Goal was falsified",
+    "reason": "The committed property incorrectly adds 1 to total boxes."
+  },
+  {
+    "id": "UserClassEqWithEq",
+    "source": "examples/haskell/UserClassEqWithEq.hs",
+    "expected": "unsupported",
+    "semantics": "approximate",
+    "phase": "transpile"
+  },
+  {
+    "id": "UserClassNeq",
+    "source": "examples/haskell/UserClassNeq.hs",
+    "expected": "smt_valid",
+    "semantics": "approximate"
+  },
+  {
+    "id": "UserClassNeqWithEq",
+    "source": "examples/haskell/UserClassNeqWithEq.hs",
+    "expected": "unsupported",
+    "semantics": "approximate",
+    "phase": "transpile"
+  },
+  {
+    "id": "verification/PureInteger",
+    "source": "tests/fixtures/verification/PureInteger.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "proved",
+    "accepted": true,
+    "minTheorems": 1
+  },
+  {
+    "id": "verification/SmtInteger",
+    "source": "tests/fixtures/verification/SmtInteger.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "smt_valid",
+    "accepted": false
+  },
+  {
+    "id": "verification/Admitted",
+    "source": "tests/fixtures/verification/Admitted.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "admitted",
+    "accepted": false
+  },
+  {
+    "id": "verification/Assumed",
+    "source": "tests/fixtures/verification/Assumed.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "assumed",
+    "accepted": false
+  },
+  {
+    "id": "verification/Refuted",
+    "source": "tests/fixtures/verification/Refuted.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "refuted",
+    "accepted": false
+  },
+  {
+    "id": "verification/Empty",
+    "source": "tests/fixtures/verification/Empty.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "no_properties",
+    "accepted": false,
+    "reason": "Translation/elaboration fixture with no property annotations."
+  },
+  {
+    "id": "verification/NoTheorem",
+    "source": "tests/fixtures/verification/NoTheorem.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "no_theorem",
+    "accepted": false
+  },
+  {
+    "id": "verification/Overflow",
+    "source": "tests/fixtures/verification/Overflow.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "proved",
+    "accepted": true,
+    "minTheorems": 1
+  },
+  {
+    "id": "verification/InfinitePrefix",
+    "source": "tests/fixtures/verification/InfinitePrefix.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "unsupported",
+    "accepted": false,
+    "contains": "potentially-infinite",
+    "phase": "transpile"
+  },
+  {
+    "id": "verification/SmtTrusted",
+    "source": "tests/fixtures/verification/SmtInteger.hs",
+    "semantics": "conservative",
+    "trustSmt": true,
+    "expected": "smt_valid",
+    "accepted": true,
+    "minTheorems": 1
+  },
+  {
+    "id": "verification/PartialValue",
+    "source": "tests/fixtures/verification/PartialValue.hs",
+    "expected": "unsupported",
+    "semantics": "conservative",
+    "phase": "transpile",
+    "contains": "partial-operation",
+    "accepted": false
+  },
+  {
+    "id": "verification/ImplicitTypo",
+    "source": "tests/fixtures/verification/ImplicitTypo.hs",
+    "expected": "error",
+    "semantics": "conservative",
+    "phase": "lean",
+    "contains": "Unknown identifier",
+    "accepted": false
+  },
+  {
+    "id": "verification/left/Collision",
+    "source": "tests/fixtures/verification/left/Collision.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "proved",
+    "accepted": true,
+    "minTheorems": 1
+  },
+  {
+    "id": "verification/right/Collision",
+    "source": "tests/fixtures/verification/right/Collision.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "proved",
+    "accepted": true,
+    "minTheorems": 1
+  },
+  {
+    "id": "verification/Recursive",
+    "source": "tests/fixtures/verification/Recursive.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "admitted",
+    "accepted": false,
+    "contains": "sorryAx"
+  },
+  {
+    "id": "verification/IntExtended",
+    "source": "tests/fixtures/verification/IntExtended.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "proved",
+    "accepted": true,
+    "minTheorems": 7
+  },
+  {
+    "id": "verification/IntDivision",
+    "source": "tests/fixtures/verification/IntDivision.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "proved",
+    "accepted": true,
+    "minTheorems": 8
+  },
+  {
+    "id": "verification/MethodLocalContext",
+    "source": "tests/fixtures/verification/MethodLocalContext.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "unsupported",
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "class-method-fidelity"
+  },
+  {
+    "id": "verification/MethodLocalQuantifier",
+    "source": "tests/fixtures/verification/MethodLocalQuantifier.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "unsupported",
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "class-method-fidelity"
+  },
+  {
+    "id": "verification/UnsafeIntDivision",
+    "source": "tests/fixtures/verification/UnsafeIntDivision.hs",
+    "semantics": "conservative",
+    "trustSmt": false,
+    "expected": "unsupported",
+    "accepted": false,
+    "phase": "transpile",
+    "contains": "dynamic divisor"
+  }
+]

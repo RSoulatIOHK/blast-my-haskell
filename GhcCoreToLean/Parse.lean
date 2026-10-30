@@ -72,6 +72,9 @@ def parseVar (j : Lean.Json) : Except String Var := do
 def parseLiteral (j : Lean.Json) : Except String Literal := do
   let tag ← getTag j
   match tag with
+  | "LitMachineInt" => do
+    let n ← j.getObjValAs? Int "value"
+    .ok (.litMachineInt n)
   | "LitInt"    => do
     let n ← j.getObjValAs? Int "value"
     .ok (.litInt n)
@@ -86,12 +89,47 @@ def parseLiteral (j : Lean.Json) : Except String Literal := do
     .ok (.litDouble n)
   | "LitString" => do
     let s ← j.getObjValAs? String "value"
-    .ok (.litString s)
+    -- The shim sets `unrepresentable` — to the hex of the literal's raw GHC
+    -- bytes — exactly when its modified-UTF-8 payload has no faithful Lean image
+    -- (a lone surrogate, or bytes that are not valid UTF-8 even after the
+    -- overlong-NUL repair). ABSENT is the normal case and means `value` is
+    -- faithful, NUL included. PRESENCE is the flag and the content is the
+    -- evidence the refusal names. Presence is tested on the FIELD, not on a
+    -- successful String read: a type-coupled read (`getObjValAs? String`
+    -- alone) silently absorbs a present-but-non-String payload into
+    -- `.litString`, whose `value` still carries the U+FFFD replacement — i.e.
+    -- exactly the silent-wrong this channel exists to prevent. Unreachable
+    -- from today's shim (`hexBytes :: T.Text` is always a string), so this is
+    -- hardening against a future schema slip, not a live bug.
+    match j.getObjVal? "unrepresentable" with
+    | .error _ => .ok (.litString s)            -- field absent: faithful
+    | .ok v    => match v.getStr? with
+      | .ok hex  => .ok (.litStringUnrepresentable hex)
+      | .error _ => .error s!"LitString `unrepresentable` must be a hex String, got: {v}"
   | "LitChar"   => do
-    let s ← j.getObjValAs? String "value"
-    match s.data with
-    | [c] => .ok (.litChar c)
-    | _   => .error s!"LitChar value must be a single-character string, got: {s}"
+    -- Same `unrepresentable` channel as `LitString`, and read the same way:
+    -- the FIELD's presence is the flag, tested BEFORE `value` is touched. The
+    -- shim sets it exactly when the `Char` is a lone surrogate (U+D800–DFFF),
+    -- which Haskell's `Char` has and Lean's does not; the payload is the code
+    -- point (`"U+D800"`), not bytes, because a `Char`'s loss is not a
+    -- byte-encoding fact. ABSENT is the normal case and means `value` is
+    -- faithful.
+    --
+    -- ORDER IS THE POINT, not a live bug fix. `value` for a flagged literal is
+    -- `T.singleton`'s U+FFFD, which is a perfectly ordinary ONE-character
+    -- string — so the `[c]` read below would SUCCEED and quietly produce
+    -- `.litChar '\65533'`, the exact silent-wrong this channel exists to
+    -- prevent. Reading the flag first is what makes `value`'s content provably
+    -- irrelevant here rather than accidentally harmless.
+    match j.getObjVal? "unrepresentable" with
+    | .ok v    => match v.getStr? with
+      | .ok cp   => .ok (.litCharUnrepresentable cp)
+      | .error _ => .error s!"LitChar `unrepresentable` must be a code-point String, got: {v}"
+    | .error _ => do                            -- field absent: faithful
+      let s ← j.getObjValAs? String "value"
+      match s.data with
+      | [c] => .ok (.litChar c)
+      | _   => .error s!"LitChar value must be a single-character string, got: {s}"
   | "LitLabel"  => do
     let s ← j.getObjValAs? String "value"
     .ok (.litLabel s)
@@ -139,9 +177,28 @@ mutual
       let altsA ← (← getField j "alts").getArr?
       let alts  ← altsA.toList.mapM parseAlt
       .ok (.case_ scr bnd ty alts)
+    | "Coercion" => .ok .coercion
     | "Cast" => do
-      let e ← parseExpr (← getField j "expr")
-      .ok (.cast e)
+      -- LEGACY tag. ghc-dump has no `ECast` node (`Convert.hs`:
+      -- `Cast x _ -> cvtExpr x` erases the cast before we see it), so the only
+      -- producer this arm ever had was the pre-M2 shim's
+      -- `ECoercion -> {"tag":"Cast","expr":{}}` — whose empty `expr` this arm
+      -- could not parse, aborting the whole dump. So a payload-free shape
+      -- (`expr` missing, non-object, or with a non-string `tag`) DEGRADES to the
+      -- coercion atom instead of erroring: this tag has no other producer, and a
+      -- payload-free `Cast` is indistinguishable from a coercion token. A
+      -- *tagged* `expr` engages the normal parser and stays LOUD — an unknown
+      -- tag string, or a bad payload under a known tag, propagates its error —
+      -- so an older dump with a real nested expression keeps working. Exact
+      -- enumeration + guards: Tests/Unit.lean, "M2 Task 2 — coercion token".
+      match getField j "expr" with
+      | .error _ => .ok .coercion
+      | .ok ej   =>
+        match getTag ej with
+        | .error _ => .ok .coercion
+        | .ok _    => do
+          let e ← parseExpr ej
+          .ok (.cast e)
     | "Tick" => do
       let e ← parseExpr (← getField j "expr")
       .ok (.tick e)
@@ -210,8 +267,41 @@ def parseInstance (j : Lean.Json) : Except String Instance := do
   let dfunUnique ← j.getObjValAs? Nat    "dfunUnique"
   .ok { className, headTypes, dfunName, dfunUnique }
 
+/-- Parse one class method: `{name, type, hasDefault}`. `hasDefault` is
+    tolerated as absent (⇒ `false`) so a decls.json written by a pre-M3 plugin
+    still parses; a present-but-non-boolean value is a hard error, never a
+    silent `false`. -/
+def parseClassMethod (j : Lean.Json) : Except String ClassMethod := do
+  let name ← j.getObjValAs? String "name"
+  let ty   ← parseGHCType (← getField j "type")
+  let hasDefault ← match j.getObjVal? "hasDefault" with
+    | .ok v    => v.getBool?
+    | .error _ => .ok false
+  let hasUnsupportedSignature ← match j.getObjVal? "hasUnsupportedSignature" with
+    | .ok v    => v.getBool?
+    | .error _ => .ok false
+  .ok { name, ty, hasDefault, hasUnsupportedSignature }
+
+/-- Parse one class shape from the decl-plugin's `classDecls` channel:
+    `{name, tyVars, supers, methods}`. All four keys are required — this channel
+    is written by `GhcDeclDump.ppClass`, which always emits them, so a missing key
+    means a plugin/transpiler version skew and must fail loud rather than
+    default to "no type parameters" or "no superclasses". -/
+def parseClassDecl (j : Lean.Json) : Except String ClassDecl := do
+  let name     ← j.getObjValAs? String "name"
+  let tyVarsA  ← (← getField j "tyVars").getArr?
+  let tyVars   ← tyVarsA.toList.mapM (·.getStr?)
+  let supersA  ← (← getField j "supers").getArr?
+  let supers   ← supersA.toList.mapM (·.getStr?)
+  let methodsA ← (← getField j "methods").getArr?
+  let methods  ← methodsA.toList.mapM parseClassMethod
+  .ok { name, tyVars, supers, methods }
+
 /-- Parse either the legacy `{ binds: ... }` or the extended
-    `{ binds, typeDecls, instances }` shape. -/
+    `{ binds, typeDecls, instances, classDecls }` shape. Each decl channel is
+    optional in the same two ways — key absent, or key present as `null` (which
+    is what the shim's `mergeDecls` writes for a channel the plugin did not
+    produce) — and both mean the empty list. -/
 def parseProgram (j : Lean.Json) : Except String Program := do
   let binds      ← parseCoreProgram j
   let typeDecls  ← match j.getObjVal? "typeDecls" with
@@ -228,10 +318,36 @@ def parseProgram (j : Lean.Json) : Except String Program := do
         let arr ← ins.getArr?
         arr.toList.mapM parseInstance
     | .error _ => .ok []
-  .ok { binds, typeDecls, instances }
+  let classDecls ← match j.getObjVal? "classDecls" with
+    | .ok cds => match cds with
+      | .null => .ok []
+      | _ => do
+        let arr ← cds.getArr?
+        arr.toList.mapM parseClassDecl
+    | .error _ => .ok []
+  .ok { binds, typeDecls, instances, classDecls }
 
 def parseProgramFromString (s : String) : Except String Program := do
   let j ← Lean.Json.parse s
+  parseProgram j
+
+/-- The pipeline always passes a module name and therefore requires the shim's
+    versioned envelope. The two-argument manual CLI may still read old dumps
+    during migration, but any present version must be known. -/
+def parseVersionedProgramFromString (s : String) (expectedModule : Option String) :
+    Except String Program := do
+  let j ← Lean.Json.parse s
+  let version ← match j.getObjVal? "schemaVersion" with
+    | .ok value => value.getNat?
+    | .error _ => match expectedModule with
+      | some _ => .error "missing Core dump schemaVersion"
+      | none => .ok 1
+  if version != 1 then
+    .error s!"unsupported Core dump schemaVersion: {version}"
+  if let some expected := expectedModule then
+    let actual ← j.getObjValAs? String "module"
+    if actual != expected then
+      .error s!"Core dump module mismatch: expected {expected}, got {actual}"
   parseProgram j
 
 end GHCCore

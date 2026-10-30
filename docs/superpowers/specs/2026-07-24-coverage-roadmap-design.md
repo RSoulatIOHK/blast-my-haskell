@@ -220,11 +220,20 @@ documented "hand-written Ord modeled structurally" unsoundness-adjacent gap.
 
 ## M4 — Strings & Char
 
+> **SHIPPED, with corrections.** Several statements in the design below were
+> measured FALSE during implementation. Each is marked
+> **[CORRECTED — see Corrections]** inline; the measurements and what shipped
+> instead are in [Corrections (measured during implementation)](#corrections-measured-during-implementation)
+> at the end of this section. Read that block before treating anything here as
+> a specification of current behaviour.
+
 ### Shim fix (prerequisite)
 
 `shim/Main.hs` currently discards string-literal contents
 (`MachStr _ → "<bs>"`). Emit the actual bytes (UTF-8 decoded) in the JSON.
 Parse side (`Parse.lean`) gains the `LitString` case.
+**[CORRECTED — see Corrections: `Parse.lean` needed no work; and the `MachChar`
+arm was lossy too, which this section does not mention.]**
 
 ### String = `List Char`
 
@@ -240,14 +249,21 @@ Parse side (`Parse.lean`) gains the `LitString` case.
 - Char literals: shim/Parse `LitChar` case; the `C#` unwrapping already
   exists in `Lower`.
 - `Data.Char.ord` → `(fun c => (c.toNat : Int))`.
+  **[CORRECTED — the observed Core name is `GHC.Base.ord`; `Data.Char.ord` is
+  0-occurrence. The image is right.]**
 - `Data.Char.chr` — **partial** (⊥ outside valid code points): route through
   the bottom path (`Hs.chrD`: valid → `Char.ofNat`, invalid → `default`),
   not raw `Char.ofNat` (which silently yields `'\0'`-adjacent behavior).
+  **[CORRECTED — `Hs.chrD` is UNSOUND and was not implemented; `chr` is
+  unmapped/loud. Observed name is `GHC.Char.chr`.]**
 - Comparisons/equality on `Char` reuse the existing `decide`-wrapped Ord path.
+  **[CORRECTED — true for `==`/`<`/`<=`/`compare`, FALSE for `min`/`max`.]**
 - Small `Data.Char` predicate subset as demand requires: `isDigit`,
   `isAlpha`, `isSpace`, `isUpper`, `isLower`, `toUpper`, `toLower` — each only
   if Lean v4.24 has a semantics-matching counterpart (ASCII vs Unicode
   behavior verified per function; mismatch ⇒ `Hs.*` helper or unmapped/loud).
+  **[CORRECTED — the verified-matching subset is `{isDigit}` alone. The other
+  six are unmapped/loud, via this bullet's own escape hatch.]**
 
 ### Verification caveat (documented, not solved here)
 
@@ -255,11 +271,112 @@ Blaster's SMT encoding for `Char` may be weak or absent; string-heavy
 properties may need manual Lean proofs. The milestone's deliverable is
 **transpile fidelity** (fixtures compile, list-of-char properties with
 arithmetic content verify), not new solver power.
+**[CORRECTED — measured, and the split is sharper than "weak or absent": `Char`
+scalars verify, symbolic `List Char` does not.]**
 
 ### Fixtures
 
 `StringBasics.hs` (literals, ++, length property), `CharOps.hs`
 (ord/chr round-trip property with validity precondition).
+**[CORRECTED — `CharOps.hs` carries an `ord`-only `Nat → Char → Nat`
+round-trip; there is no `chr` to round-trip through. Three must-fail fixtures
+were added that this section does not anticipate: `StringSurrogate.hs`,
+`CharSurrogate.hs`, plus the ctor-rewrite regression fixture
+`StringCtorClash.hs`.]**
+
+### Corrections (measured during implementation)
+
+All measured on the pipeline's GHC 9.2.7 + Lean v4.24.0. These override the
+text above wherever they conflict. Full evidence, with quoted dumps and build
+output, is in the `/-! ## M4 Task 1..4 -/` blocks of
+`GhcCoreToLean/Tests/Unit.lean`.
+
+1. **`Parse.lean` needed no work.** Both the `LitString` and `LitChar` cases
+   already existed (`Parse.lean:87-94`), as did the `AST.Literal` constructors.
+   What *was* wrong sat in the shim: the `MachStr` arm discarded the payload
+   (`"<bs>"`), and — not anticipated by this spec at all — the `MachChar` arm
+   was **also lossy**, because `text-1.2.5.0`'s `T.singleton` applies `safe`
+   and turns a surrogate into U+FFFD. Both are fixed. Parse *did* gain new
+   work the spec did not foresee: reading the shim's new `unrepresentable`
+   flag, flag-first, so a flagged literal's U+FFFD `value` can never be
+   mistaken for a faithful one.
+2. **The mappable `Data.Char` subset is `{isDigit}`, not seven.** The spec
+   assumed the hazard was that Haskell's `isDigit` is ASCII-only while
+   `isAlpha` is Unicode-aware. Measured on both sides, the mismatch set is the
+   *complement*: Lean v4.24 is ASCII-only for **all** of them, so `isDigit` is
+   the only agreement (both test ASCII 48–57) and the other six are
+   silent-wrong if mapped — `isAlpha 'é'` is `True` in Haskell and `false` in
+   Lean; likewise `isUpper 'É'`, `isLower 'é'`, `toUpper 'é'`, `toLower 'É'`;
+   `isSpace` differs on `\v`, `\f`, NBSP. Unmapped and loud.
+3. **`Hs.chrD` is unsound; `chr` is unmapped.** A Haskell `Char` spans
+   `[0, 0x10FFFF]` *including* the 2048 surrogates and a Lean `Char` excludes
+   them, so `chr 0xD800` — `'\55296'` in Haskell — is a **defined** value with
+   no Lean image. The spec's recipe would map it to `default`, i.e. a defined
+   value to a *different* defined value: silent-wrong, not the project's
+   permitted ⊥-refinement. Only `n < 0` and `n ≥ 0x110000` are genuinely ⊥.
+   `chr` was also **not** registered in `isPartialDefaultName` — that flag only
+   affects defs with free type variables, so it is a no-op for a monomorphic
+   `Int → Char`. The asymmetry with `ord` is principled: every *Lean* `Char`
+   has a faithful Haskell image, so the gap enters only through construction.
+4. **`min`/`max` at `Char` fail loud** — `failed to synthesize Min Char` /
+   `Max Char`, reproduced. No such instance exists in v4.24. The mapping
+   (`Min.min`/`Max.max`) is correct at every type that has the instance and
+   stays; nothing is added for `Char`. Every *other* binder in
+   `classConMap "Ord"` does synthesize at `Char`, plus `Inhabited Char`.
+5. **The real Core name prefixes are `GHC.*`, never `Data.Char.*`.** Observed:
+   `GHC.Base.ord`, `GHC.Unicode.isDigit`, `GHC.Unicode.{isAlpha,isUpper,
+   isLower,isSpace,toUpper,toLower}`, `GHC.Char.chr`, `GHC.Classes.{min,max}`,
+   and both unpackers as `GHC.CString.unpackCString#` /
+   `GHC.CString.unpackCStringUtf8#`. `Data.Char.*` is a re-export module and
+   Core names come from where a thing is *defined*, so every `Data.Char.*` key
+   is 0-occurrence — a `== none` pin on one protects nothing. (`GHC.Base.chr`
+   was never observed and never probed; it is recorded as unprobed, not as a
+   negative.)
+6. **Blaster's actual `Char` / `List Char` capability.** Better than this
+   spec's caveat for scalars, and goal-dependent — not simply absent — for
+   lists:
+   - `Char` **scalars verify**: `==`, `<`, `<=`, `compare`, `toNat`, and a
+     `Nat → Char → Nat` round-trip under `n < 128` (including the `Nat → Int`
+     coercion `ord`'s image introduces). `CharOps.hs` ships five `blaster`
+     theorems, all `✅ Valid`.
+   - **Concrete** `List Char` goals verify (`['h','i'].length = 2`).
+   - A **symbolic** `List Char` goal fails under bare `blaster` with
+     `Inductive datatype with instance parameters not supported: 'BitVec`
+     (measured on four shapes), as does anything forcing `Char`'s
+     `val : UInt32` (`c.toNat < 0x110000`).
+   - **`induction` + `blaster` is goal-dependent**, which is a third amendment
+     to this item rather than a restatement: it closes
+     `(cs ++ ['!']).length = cs.length + 1` in *both* branches, but on
+     `StringBasics`'s own `shout_len` it closes `nil` and hits the same
+     `BitVec` error in `cons`. So the fixture proves that one by `simp`.
+   - `decide` cannot quantify over `Char` at all
+     (`failed to synthesize Decidable (∀ (c : Char), …)`), though concrete
+     `Char` data decides fine.
+7. **Two hazards this spec does not mention, both silent, both fixed.** Real
+   literal bytes made them live simultaneously. (a) `Emit` interpolated
+   literals with **no escaping**, harmless only while every payload was the
+   literal `<bs>`; a `"` or newline produced unparseable Lean. (b) The
+   `resolveUserCtors`/`replaceCtorApps` rewrites are **textual**, so a
+   constructor name inside a string literal was rewritten — `"Point (1)"`
+   became `"Point.Point (1)"`. Both are closed, the second by a
+   literal- and comment-aware scanner (`StringCtorClash.hs`).
+8. **A lone-surrogate literal is refused rather than emitted**, per correction
+   3, with separate `String` and `Char` messages carrying separate evidence
+   (bytes vs code point). U+0000 is **supported faithfully**: GHC writes
+   modified UTF-8, whose overlong NUL `C0 80` the shim repairs, so `"a\0b"` is
+   3 characters. The refusal runs in `Main.lean` on `userProg` — deliberately
+   not in the shim, which cannot know whether a literal reaches emission.
+9. **`typeConMap "String" [] = some "List Char"` was needed.** The spec's
+   "already falls out of `typeConMap` `List` + `Char`" covers `[Char]` but not
+   the bare `String` synonym, which Core keeps in binder types — without the
+   arm a `String` binder got a `tyConOpaque "String"` signature over a
+   `List Char` body.
+10. **`Char` ranges are safe only by accident.** `['a'..'e']` transpiles to
+    `Hs.enumFromTo 'a' 'e'` and fails loud at `lake build` solely because that
+    helper is monomorphic on `Int`. Generalising it over an `Enum`-like class
+    would silently route a `Char` range through Haskell's `chr`-based
+    `Enum Char` — the unfaithful direction of correction 3. Pin before
+    generalising.
 
 ---
 
