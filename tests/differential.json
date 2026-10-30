@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "seed": 20260910,
+  "suites": [
+    {
+      "module": "PureInteger",
+      "source": "tests/fixtures/verification/PureInteger.hs",
+      "operations": [
+        {"function": "inc", "arguments": ["integer"], "result": "integer", "vectors": [[-1361129467683753853853498429727072845824], [-18446744073709551616], [-1], [0], [1], [18446744073709551616], [1361129467683753853853498429727072845824]]}
+      ]
+    },
+    {
+      "module": "PureCore",
+      "source": "tests/differential/PureCore.hs",
+      "operations": [
+        {"function": "isNegative", "arguments": ["integer"], "result": "bool", "vectors": [[-1361129467683753853853498429727072845824], [-1], [0], [1], [1361129467683753853853498429727072845824]]},
+        {"function": "duo", "arguments": ["integer"], "result": "integer-list", "vectors": [[-18446744073709551616], [-1], [0], [1], [18446744073709551616]]},
+        {"function": "chooseSmaller", "arguments": ["integer", "integer"], "result": "integer", "vectors": [[-1361129467683753853853498429727072845824, 1], [-1, 0], [0, 0], [1, -1], [1, 1361129467683753853853498429727072845824]]}
+      ]
+    },
+    {
+      "module": "ImportClient",
+      "source": "tests/differential/ImportClient.hs",
+      "operations": [
+        {"function": "fromBase", "arguments": ["integer"], "result": "integer", "vectors": [[-1361129467683753853853498429727072845824], [-1], [0], [1], [1361129467683753853853498429727072845824]]},
+        {"function": "belowBase", "arguments": ["integer"], "result": "bool", "vectors": [[-1], [0], [6], [7], [8]]}
+      ]
+    },
+    {
+      "module": "Overflow",
+      "source": "tests/fixtures/verification/Overflow.hs",
+      "operations": [
+        {"function": "inc", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "dec", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "twice", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "neg", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "absInt", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "isLess", "arguments": ["int64", "int64"], "result": "bool", "boundaries": true, "randomCases": 16}
+      ]
+    },
+    {
+      "module": "IntDivision",
+      "source": "tests/fixtures/verification/IntDivision.hs",
+      "operations": [
+        {"function": "quotByTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "remByTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "divByTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "modByTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "divByNegTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "modByNegTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 12},
+        {"function": "divModByTwo", "arguments": ["int64"], "result": "int64-pair", "boundaries": true, "randomCases": 12},
+        {"function": "quotRemByTwo", "arguments": ["int64"], "result": "int64-pair", "boundaries": true, "randomCases": 12}
+      ]
+    },
+    {
+      "module": "IntExtended",
+      "source": "tests/fixtures/verification/IntExtended.hs",
+      "operations": [
+        {"function": "intGcd", "arguments": ["int64", "int64"], "result": "int64", "boundaries": true, "randomCases": 16},
+        {"function": "intLcmByTwo", "arguments": ["int64"], "result": "int64", "boundaries": true, "randomCases": 16},
+        {"function": "intRange", "arguments": ["int64", "int64"], "result": "int64-list", "vectors": [[-3, -1], [0, 0], [1, 3], [3, 1], [9223372036854775805, 9223372036854775807]]},
+        {"function": "intToInteger", "arguments": ["int64"], "result": "integer", "boundaries": true, "randomCases": 12},
+        {"function": "integerToInt", "arguments": ["integer"], "result": "int64", "vectors": [[-36893488147419103233], [-18446744073709551616], [-9223372036854775809], [-9223372036854775808], [-1], [0], [1], [9223372036854775807], [9223372036854775808], [18446744073709551616], [36893488147419103233]]},
+        {"function": "intToIntegerViaIntegral", "arguments": ["int64"], "result": "integer", "boundaries": true, "randomCases": 12},
+        {"function": "integerToIntViaIntegral", "arguments": ["integer"], "result": "int64", "vectors": [[-36893488147419103233], [-18446744073709551616], [-9223372036854775809], [-9223372036854775808], [-1], [0], [1], [9223372036854775807], [9223372036854775808], [18446744073709551616], [36893488147419103233]]}
+      ]
+    }
+  ]
+}

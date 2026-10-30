@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "policy": "conservative",
+  "claim": "lean-model",
+  "translationCertified": false,
+  "entryStatus": {
+    "guarded": "Implemented conservative mapping with explicit gate; source correspondence remains unproved.",
+    "conditional": "Only a narrow observed use is currently accepted; wider source behavior is not established.",
+    "refused": "Known mismatch or missing domain proof causes conservative refusal."
+  },
+  "entries": [
+    {
+      "key": "type:Integer",
+      "status": "guarded",
+      "sourceBehavior": "Unbounded mathematical integers.",
+      "leanImage": "Int",
+      "domain": "Terminating pure computations in the supported Core fragment.",
+      "refusal": "Unsupported Core or translation warning; no independent correspondence proof exists.",
+      "evidence": ["tests/fixtures/verification/PureInteger.hs", "GhcCoreToLean/Maps.lean"]
+    },
+    {
+      "key": "type:Bool",
+      "status": "guarded",
+      "sourceBehavior": "True and False constructors.",
+      "leanImage": "Bool",
+      "domain": "Terminating pure computations in the supported Core fragment.",
+      "refusal": "Unsupported Core or translation warning.",
+      "evidence": ["tests/fixtures/verification/PureInteger.hs", "GhcCoreToLean/Maps.lean"]
+    },
+    {
+      "key": "type:finite-ADT-list-tuple",
+      "status": "conditional",
+      "sourceBehavior": "Finite constructor trees; finite lists and tuples are observed componentwise.",
+      "leanImage": "Inductive constructors, List, and products with related fields.",
+      "domain": "Finite values with supported field types and no required lazy or bottom observation.",
+      "refusal": "Unsupported field type; potentially infinite generator; other unmodeled Core may fail translation.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "examples/haskell/TupleTriple.hs"]
+    },
+    {
+      "key": "type:Int64-target",
+      "status": "guarded",
+      "sourceBehavior": "Haskell Int on a measured 64-bit target: signed wrapping arithmetic and comparisons.",
+      "leanImage": "Int64",
+      "domain": "GHC target reports intBits = 64; supported Int operations only.",
+      "refusal": "Non-64-bit target or unsupported machine number type.",
+      "evidence": ["scripts/pipeline.py", "tests/fixtures/verification/Overflow.hs", "tests/differential.json"]
+    },
+    {
+      "key": "operation:Int-division",
+      "status": "guarded",
+      "sourceBehavior": "quot/rem truncate toward zero; div/mod floor; zero divisor fails; minBound / -1 overflows.",
+      "leanImage": "Hs.quotInt64, Hs.remInt64, Hs.divInt64, Hs.modInt64, and pair helpers.",
+      "domain": "Statically nonzero divisor and no possible minBound / -1 case.",
+      "refusal": "Zero or dynamic divisor; possible minBound / -1 overflow.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "GhcCoreToLean/Runtime.lean", "tests/fixtures/verification/IntDivision.hs", "tests/fixtures/verification/UnsafeIntDivision.hs", "tests/differential.json"]
+    },
+    {
+      "key": "operation:Int-range",
+      "status": "guarded",
+      "sourceBehavior": "Finite ascending [lo .. hi] on 64-bit Int.",
+      "leanImage": "Hs.enumFromToInt64",
+      "domain": "Finite ordinary range; actual construction must fit available resources.",
+      "refusal": "Potentially infinite enumFrom or enumFromThen variants.",
+      "evidence": ["GhcCoreToLean/Runtime.lean", "GhcCoreToLean/Safety.lean", "tests/differential.json"]
+    },
+    {
+      "key": "operation:stepped-enum",
+      "status": "refused",
+      "sourceBehavior": "[a,b..c] can be infinite when stride is zero and c >= a; finite prefixes remain observable.",
+      "leanImage": "Approximate mode has Hs.enumFromThenTo; its zero-stride fallback is not faithful.",
+      "domain": "No conservative domain currently admitted.",
+      "refusal": "enumFromThenTo, enumFromThen, enumFrom, iterate, repeat, and cycle are rejected.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "GhcCoreToLean/Runtime.lean", "tests/fixtures/verification/InfinitePrefix.hs"]
+    },
+    {
+      "key": "operation:partial-list-maybe",
+      "status": "refused",
+      "sourceBehavior": "head, tail, last, init, (!!), maximum, minimum, and fromJust fail outside their defined domains.",
+      "leanImage": "Some approximate mappings use total defaults; these do not encode source failure.",
+      "domain": "No checked domain-condition mechanism currently admitted.",
+      "refusal": "Named partial operation is rejected even at an apparently safe call site.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "GhcCoreToLean/Maps.lean", "tests/fixtures/verification/PartialValue.hs"]
+    },
+    {
+      "key": "type:Word-floats-other-machine",
+      "status": "refused",
+      "sourceBehavior": "Machine width, floating-point rounding, and exceptional values are observable.",
+      "leanImage": "Approximate mode has mappings; no conservative relation is declared.",
+      "domain": "No conservative domain currently admitted.",
+      "refusal": "Word, Float, Double, Int8/16/32/64, Word8/16/32/64 and primitive variants in checked types.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "GhcCoreToLean/Maps.lean"]
+    },
+    {
+      "key": "type:Char-String",
+      "status": "conditional",
+      "sourceBehavior": "Haskell Char includes surrogate code points; String is a finite list of Char.",
+      "leanImage": "Lean Char and List Char only for representable code points.",
+      "domain": "Representable characters and mapped operations with tested behavior; no lone surrogate.",
+      "refusal": "A surrogate literal is rejected; unsupported Unicode operations must not silently map to different predicates.",
+      "evidence": ["shim/Main.hs", "GhcCoreToLean/Parse.lean", "examples/haskell/CharSurrogate.hs", "examples/haskell/StringSurrogate.hs", "examples/haskell/StringBasics.hs"]
+    },
+    {
+      "key": "operation:Unicode-predicates",
+      "status": "conditional",
+      "sourceBehavior": "The observed GHC isDigit is ASCII 0-9; other Unicode predicates can differ from Lean Char predicates.",
+      "leanImage": "GHC.Unicode.isDigit maps to Char.isDigit; other divergent predicates have no mapped image.",
+      "domain": "The observed isDigit mapping on representable Char values.",
+      "refusal": "isAlpha, isUpper, isLower, isSpace, isControl, isPrint and chr are not conservatively claimed.",
+      "evidence": ["GhcCoreToLean/Maps.lean", "examples/haskell/CharOps.hs", "README.md"]
+    },
+    {
+      "key": "feature:method-local-quantification",
+      "status": "refused",
+      "sourceBehavior": "A class method can quantify a type variable and constrain it independently of the class parameters.",
+      "leanImage": "The declaration plugin currently drops those binders, which could leave an unconstrained Lean implicit parameter.",
+      "domain": "No conservative domain for a method type with variables outside the class parameters.",
+      "refusal": "A residual method type variable outside the class parameters is rejected.",
+      "evidence": ["shim/decl-plugin/GhcDeclDump.hs", "GhcCoreToLean/Safety.lean", "GhcCoreToLean/Tests/Safety.lean", "tests/fixtures/verification/MethodLocalQuantifier.hs", "tests/fixtures/verification/MethodLocalContext.hs"]
+    },
+    {
+      "key": "feature:local-Eq-Ord-instances",
+      "status": "refused",
+      "sourceBehavior": "GHC permits Eq and Ord methods to disagree, and user-written tag primops can resemble derived instances.",
+      "leanImage": "Approximate mode models selected methods and derives or drops companions.",
+      "domain": "No conservative domain currently admitted for locally declared Eq or Ord instances.",
+      "refusal": "Every local Eq or Ord instance is rejected before lowering in conservative mode.",
+      "evidence": ["GhcCoreToLean/Safety.lean", "GhcCoreToLean/Tests/Safety.lean", "examples/haskell/OrdHandwritten.hs"]
+    },
+    {
+      "key": "feature:newtype-class-dispatch",
+      "status": "conditional",
+      "sourceBehavior": "Newtype representation can erase, but class selection depends on distinct source types and dictionaries.",
+      "leanImage": "Current lowering erases type and dictionary arguments, with emitter recovery for some observed cases.",
+      "domain": "Only cases translated without warnings and satisfying current collision/instance refusals; no general source correspondence claim.",
+      "refusal": "Known ambiguous identities, unsupported instances, or emitted Lean errors must fail; other erasure risks remain open.",
+      "evidence": ["GhcCoreToLean/Lower.lean", "GhcCoreToLean/Emit.lean", "README.md"]
+    }
+  ]
+}

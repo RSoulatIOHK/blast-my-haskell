@@ -5,8 +5,13 @@ import GhcCoreToLean.Parse
 import GhcCoreToLean.Maps
 import GhcCoreToLean.Lower
 import GhcCoreToLean.Emit
+import GhcCoreToLean.Runtime
+import GhcCoreToLean.Safety
+import GhcCoreToLean.Audit
 import GhcCoreToLean.Spike.Fib
 import GhcCoreToLean.Spike.FibEmitted
 import GhcCoreToLean.Spike.FibFromShim
 import GhcCoreToLean.Spike.FibComplexFromShim
 import GhcCoreToLean.Tests.Unit
+import GhcCoreToLean.Tests.Schema
+import GhcCoreToLean.Tests.Safety
