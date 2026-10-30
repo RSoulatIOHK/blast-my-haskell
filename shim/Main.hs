@@ -121,7 +121,9 @@ addAlt (Alt _ bndrs rhs) env =
 
 convertModule :: Env -> T.Text -> SModule -> Value
 convertModule env modName m = object
-  [ "binds" .= map (convertTopBinding env modName) (moduleTopBindings m) ]
+  [ "schemaVersion" .= (1 :: Int)
+  , "module" .= modName
+  , "binds" .= map (convertTopBinding env modName) (moduleTopBindings m) ]
 
 convertTopBinding :: Env -> T.Text -> STopBinding -> Value
 convertTopBinding env modName = \case
@@ -413,8 +415,8 @@ convertLit = \case
                 , "value" .= decoded ]
              ++ [ "unrepresentable" .= hexBytes bs | lossy ] )
   MachNullAddr  -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= (0 :: Integer) ]
-  MachInt n     -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]
-  MachInt64 n   -> object [ "tag" .= ("LitInt"    :: T.Text), "value" .= n ]
+  MachInt n     -> object [ "tag" .= ("LitMachineInt" :: T.Text), "value" .= n ]
+  MachInt64 n   -> object [ "tag" .= ("LitMachineInt" :: T.Text), "value" .= n ]
   MachWord n    -> object [ "tag" .= ("LitWord"   :: T.Text), "value" .= n ]
   MachWord64 n  -> object [ "tag" .= ("LitWord"   :: T.Text), "value" .= n ]
   MachFloat r   -> object [ "tag" .= ("LitFloat"  :: T.Text), "value" .= (fromRational r :: Double) ]

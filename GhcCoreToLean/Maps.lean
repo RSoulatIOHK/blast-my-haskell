@@ -16,6 +16,10 @@ def valueMap : String → Option String
   | "GHC.Real.rem"  | "rem"  => some "Int.tmod"
   | "GHC.Real.div"  | "div"  => some "Int.fdiv"
   | "GHC.Real.mod"  | "mod"  => some "Int.fmod"
+  | "$GhcCoreToLean.quotInt64" => some "Hs.quotInt64"
+  | "$GhcCoreToLean.remInt64" => some "Hs.remInt64"
+  | "$GhcCoreToLean.divInt64" => some "Hs.divInt64"
+  | "$GhcCoreToLean.modInt64" => some "Hs.modInt64"
   -- Haskell's comparison operators return `Bool`. Lean 4's `≤`/`<`/etc. return
   -- `Prop`, so we wrap them in `decide` to get Bool back. `==` is already Bool
   -- via the `BEq` instance, so it does not need wrapping.
@@ -104,6 +108,7 @@ def valueMap : String → Option String
   -- CONSTRUCTION — i.e. through `chr`, which is why `ord` maps and `chr` cannot.
   -- Haskell `ord` returns `Int`, so the result is coerced like `length`/`gcd`.
   | "GHC.Base.ord" => some "(fun c => (c.toNat : Int))"
+  | "$GhcCoreToLean.ordInt64" => some "(fun c => Int64.ofNat c.toNat)"
   -- `isDigit` is the ONE `Data.Char` predicate that AGREES on both sides: Haskell
   -- `GHC.Unicode.isDigit` and Lean v4.24 `Char.isDigit` both test ASCII 48..57
   -- only. Pinned in both languages by `CharOps.hs`, including the ARABIC-INDIC
@@ -116,13 +121,19 @@ def valueMap : String → Option String
   -- Int ranges (Enum dict is erased by Lower). `enumFrom`/`enumFromThen`
   -- (infinite) are intentionally NOT mapped — loud fail.
   | "GHC.Enum.enumFromTo"     => some "Hs.enumFromTo"
+  | "$GhcCoreToLean.enumFromToInt64" => some "Hs.enumFromToInt64"
   | "GHC.Enum.enumFromThenTo" => some "Hs.enumFromThenTo"
   -- Int-indexed list ops. Haskell clamps negative counts to "empty/unchanged";
   -- `Int.toNat` clamps negatives to 0 — the semantics match exactly.
   | "GHC.List.take"      => some "(fun n xs => List.take n.toNat xs)"
   | "GHC.List.drop"      => some "(fun n xs => List.drop n.toNat xs)"
+  | "$GhcCoreToLean.takeInt64" => some "(fun n xs => List.take n.toNatClampNeg xs)"
+  | "$GhcCoreToLean.dropInt64" => some "(fun n xs => List.drop n.toNatClampNeg xs)"
   | "GHC.List.splitAt"   => some "Hs.splitAt"
+  | "$GhcCoreToLean.splitAtInt64" => some "Hs.splitAtInt64"
   | "GHC.List.replicate" => some "(fun n x => List.replicate n.toNat x)"
+  | "$GhcCoreToLean.replicateInt64" =>
+      some "(fun n x => List.replicate n.toNatClampNeg x)"
   -- Zip family. Eta-wrapped for arity legibility ONLY — these lambdas are
   -- definitionally equal to the bare names and pin nothing; arg order is
   -- pinned by the (· - ·) guards in Tests/Unit.lean, the only thing that
@@ -139,6 +150,7 @@ def valueMap : String → Option String
   -- Haskell `length` returns `Int`; Lean `List.length` returns `Nat`. Coerce
   -- to `Int` (like `gcd`/`lcm`) so it composes with Int arithmetic.
   | "Data.Foldable.length" | "GHC.List.length"  => some "(fun xs => (List.length xs : Int))"
+  | "$GhcCoreToLean.lengthInt64" => some "(fun xs => Int64.ofNat (List.length xs))"
   | "Data.Foldable.null"   | "GHC.List.null"    => some "List.isEmpty"
   -- `GHC.Base.foldr` is the third alternative because list COMPREHENSIONS
   -- desugar through it, not through the Foldable method: `[2*x | x <- xs]`
@@ -224,13 +236,21 @@ def valueMap : String → Option String
   | "GHC.Num.fromInteger"   => some "id"
   | "GHC.Real.toInteger"    => some "id"
   | "GHC.Real.fromIntegral" => some "id"
+  | "$GhcCoreToLean.fromIntegerInt64" => some "Int64.ofInt"
+  | "$GhcCoreToLean.toIntegerInt64" => some "Int64.toInt"
+  | "$GhcCoreToLean.int64ToInteger" => some "Int64.toInt"
+  | "$GhcCoreToLean.integerToInt64" => some "Int64.ofInt"
   | "GHC.Num.signum"        => some "(fun a => if a < 0 then -1 else if a > 0 then 1 else 0)"
   -- divMod floors (fdiv/fmod); quotRem truncates (tdiv/tmod). Returns a pair.
   | "GHC.Real.divMod"       => some "(fun a b => (Int.fdiv a b, Int.fmod a b))"
   | "GHC.Real.quotRem"      => some "(fun a b => (Int.tdiv a b, Int.tmod a b))"
+  | "$GhcCoreToLean.divModInt64" => some "Hs.divModInt64"
+  | "$GhcCoreToLean.quotRemInt64" => some "Hs.quotRemInt64"
   -- Lean `Int.gcd`/`Int.lcm` return `Nat`; Haskell returns the numeric type.
   | "GHC.Real.gcd"          => some "(fun a b => (Int.gcd a b : Int))"
   | "GHC.Real.lcm"          => some "(fun a b => (Int.lcm a b : Int))"
+  | "$GhcCoreToLean.gcdInt64" => some "Hs.gcdInt64"
+  | "$GhcCoreToLean.lcmInt64" => some "Hs.lcmInt64"
   | "GHC.Classes.compare"   => some "compare"
   -- Unboxed Int# primops. Arithmetic maps to boxed ops (I#/Int# both → Int);
   -- comparisons mirror the GHC.Classes.* `decide`-wrapped Bool forms.
@@ -297,6 +317,10 @@ def typeConMap : String → List String → Option String
   | "Int",     []     => some "Int"
   | "Int#",    []     => some "Int"
   | "GHC.Prim.Int#", [] => some "Int"
+  -- Internal marker introduced by `Lower.machineInts` in conservative mode.
+  -- It cannot collide with a Haskell source name because `$` is not legal in
+  -- an ordinary Haskell type constructor.
+  | "$GhcCoreToLean.Int64", [] => some "Int64"
   | "Integer", []     => some "Int"
   | "Word",    []     => some "Nat"
   | "Word#",   []     => some "Nat"
@@ -416,4 +440,3 @@ def isUnwrappingDataCon : String → Bool
   | _                     => false
 
 end GHCCore.Maps
-

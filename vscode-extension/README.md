@@ -1,69 +1,121 @@
 # GHC Core → Lean Verifier (VS Code extension)
 
-Runs the spike's GHC→Lean pipeline on the active `.hs` file, opens the
-generated `.lean` invisibly so the Lean LSP processes it, then mirrors
-Lean's diagnostics (✅ Valid, ❌ Falsified + counterexample, errors)
-back to the original `.hs` as inline underlines on the corresponding
-`{- @lean ... -}` annotation. Hovering on the annotation shows the
-full Lean output (incl. counterexamples) in a popover.
+Verify Haskell `{- @lean ... -}` annotations through the audited CLI. The
+extension waits for a completed `verify.sh --json` result, then shows per-block
+CodeLens, gutter icons, and hover details in the original Haskell documents.
+It does not use the Lean language server to decide whether verification passed.
 
-## Architecture
+## Build and use
 
-```
-.hs file
-  ↓ command "Verify @lean annotations via Blaster"
-transpile.sh
-  ↓
-.lean file + .lean.map.json (source map: .hs line ranges ↔ .lean line ranges)
-  ↓ (extension opens .lean — Lean4 LSP picks it up)
-Lean LSP diagnostics (per-line, on the .lean URI)
-  ↓ (extension maps each diagnostic back to its source .hs block)
-inline diagnostics + hover on the original .hs annotation
-```
-
-The source map is what makes the round trip work: `transpile.sh` writes
-`${OUT}.map.json` next to the emitted `.lean`, with one entry per
-`{- @lean ... -}` block recording `[startLine, endLine]` in both files.
-
-## Setup
+From the repository root:
 
 ```bash
+lake build GhcCoreToLean ghccoretolean
+(cd shim && cabal build)
 cd vscode-extension
-npm install
-npm run compile
+npm ci
+npm test
+npx @vscode/vsce package --no-dependencies --skip-license
+code --install-extension ghccoretolean-vscode-0.5.3.vsix --force
 ```
 
-Then either:
+Reload the VS Code window after reinstalling. Open the repository as a trusted
+workspace, open `tests/fixtures/verification/PureInteger.hs`, and run
+**GHC Core → Lean: Verify @lean annotations** from the Command Palette. A
+successful check shows `✓ Proved · Lean model (conservative)`.
 
-- **From the repo**: open the project in VS Code, press `F5` to launch
-  an Extension Development Host with the extension loaded.
-- **Permanent install**: `vsce package` to make a `.vsix`, then
-  `code --install-extension ghccoretolean-vscode-0.1.0.vsix`.
+The active document is saved before verification. Save other modified Haskell
+documents first so imported sources match the editor. Use the notification's
+**Cancel** action to stop work. The notification shows the current stage and
+elapsed seconds; the output channel prints stage changes immediately and a
+heartbeat every 15 seconds during longer steps. **Clear Lean diagnostics** also cancels pending
+verification. Click a CodeLens to open the full run output.
 
-## Use
+The Lean4 extension is optional. The host running this extension needs Bash,
+Python, the pinned GHC/Lean toolchains, and built project binaries. Z3 is needed
+for Blaster tactics. Use macOS/Linux or a VS Code remote host such as a Linux
+dev container/WSL; native Windows execution is not tested. **Check Environment**
+reports prerequisites and build instructions.
 
-1. Open the workspace root in VS Code.
-2. Ensure the [Lean4 extension](https://marketplace.visualstudio.com/items?itemName=leanprover.lean4)
-   is installed — its LSP is what produces the underlying diagnostics.
-3. Open a `.hs` file with at least one `{- @lean ... -}` block.
-4. Command Palette → **GHC Core → Lean: Verify @lean annotations via Blaster**.
+## Read the results
+
+| Display | Meaning |
+|---|---|
+| Green `Proved · Lean model` | Audited theorem with only allowed standard axioms, in an accepted run |
+| Amber `SMT valid` | Solver-backed result; label states whether SMT trust is enabled or required |
+| Amber `Admitted` / `Assumed` | Depends on `sorryAx` / another additional axiom; never accepted |
+| Red `Refuted · Lean model` | Blaster refuted a property of the generated model |
+| Red `Verification error` / `Not verified` | Compilation, proof, or protocol failure; not a refutation claim |
+| Amber unsupported, missing theorem, or incomplete status | No accepted verification |
+
+Hover anywhere within an annotation for its theorem names, transitive axioms,
+semantic policy, and available Lean output/counterexample. Compiler errors
+outside annotations appear at the top of the corresponding Haskell document,
+with their original generated-code diagnostic retained. Failures in imports
+also produce a summary on the requested entry file.
+
+Every result concerns a **Lean model**. Translation correctness from Haskell
+is not certified. Approximate semantics can prove claims that are false in
+Haskell. A proved block in a run rejected for another property stays amber;
+SMT results stay amber even when explicitly accepted.
 
 ## Settings
 
-| key | default | meaning |
+Settings apply to the active Haskell file's workspace folder, including in
+multi-root workspaces.
+
+| Setting | Default | Meaning |
 |---|---|---|
-| `ghcCoreLean.scriptPath` | `transpile.sh` | path to the pipeline driver (relative to workspace root, or absolute) |
-| `ghcCoreLean.leanDiagnosticQuietMs` | `2000` | ms of LSP silence before considering diagnostics stable |
-| `ghcCoreLean.leanDiagnosticTimeoutMs` | `60000` | upper bound on the wait |
+| `ghcCoreLean.verifyScriptPath` | `verify.sh` | Audited driver, relative to the file's workspace folder or absolute |
+| `ghcCoreLean.semantics` | `conservative` | Refuse known approximations; `approximate` enables exploratory mappings |
+| `ghcCoreLean.trustSmt` | `false` | Explicitly accept Blaster results without proof reconstruction |
+| `ghcCoreLean.timeoutSeconds` | `600` | Whole-run deadline in seconds, greater than 0 and at most 86400 |
 
-## Known limitations
+For example, `SmtInteger.hs` reports SMT valid but unaccepted by default.
+Enabling `ghcCoreLean.trustSmt` accepts that model result, with its trust label
+still visible. `Admitted.hs` remains rejected with either setting. `Overflow.hs`
+is refused under conservative semantics.
 
-- Cold-start of `cabal build` + Lean LSP can be 1-2 minutes. Warm runs
-  are ~3-5 s. The command is manual on purpose — no auto-run on save.
-- Diagnostics are anchored to the **whole `@lean` block**, not to the
-  specific line within it that the Lean LSP flagged. The hover shows
-  the full text so the line is recoverable visually.
-- Multiple `@lean` blocks per file are supported, but if a single
-  Lean line lies outside any block it's silently ignored (this shouldn't
-  happen — the transpiler-emitted portion is below the blocks — but
-  surface as a TODO if it does).
+The old `scriptPath`, `leanDiagnosticQuietMs`, and `leanDiagnosticTimeoutMs`
+settings are deprecated and ignored. Set `verifyScriptPath` if the verifier is
+outside the workspace root. A custom driver must implement CLI schema version
+1, preserve the requested policy, and support SIGTERM cleanup. Point it at
+`verify.sh`; `transpile.sh` exports Lean files and is not a verification driver.
+
+## Completion and stale results
+
+The process must finish, output one valid JSON report, and agree with its
+reported acceptance through its exit code. The extension validates theorem
+statuses against their axiom lists and checks source hashes before publishing.
+Unsupported schemas, malformed/truncated output, and missing audits cannot
+become editor success markers.
+
+A new run cancels the previous run. Editing any Haskell buffer, changing a
+watched Haskell file, clearing diagnostics, or changing verification settings
+clears old results and invalidates pending results. Returned imported sources
+are watched even outside workspace folders. Invalidation is deliberately broad:
+unrelated Haskell edits also clear results. Verification is manual; save does
+not automatically trigger a new run.
+
+## Development and checks
+
+```bash
+npm test                 # protocol, subprocess, and mocked editor lifecycle tests
+npm run test:integration # real GHC → Lean runs through the extension runner
+npm run test:host        # installed VS Code, isolated profile and scratch sources
+```
+
+The integration checks require the project/toolchain builds above. They cover
+proved, trusted/untrusted SMT, admitted, refuted, unsupported, timeout, and
+cancelled runs. The editor tests exercise registered commands, hovers, CodeLens,
+source edits, imported-buffer changes, late completions, and source hashing at
+the VS Code API boundary. The host smoke test opens an isolated VS Code instance
+without Lean4 installed and checks proved/SMT/admitted CodeLens, assumption
+hovers, and edit invalidation against real CLI runs. It discovers the installed
+`code` executable; set `VSCODE_EXECUTABLE` to an explicit VS Code application
+executable if needed. Scratch data is deleted on success and retained for
+failure diagnosis.
+
+The CLI's semantic and proof policies are documented in the repository's
+`docs/verification.md`. The current driver synthesizes a
+small Cabal library; arbitrary Cabal project integration remains future work.

@@ -31,6 +31,11 @@ structure Var where
 deriving Repr, Inhabited
 
 inductive Literal where
+  /-- A GHC machine `Int#` literal (`MachInt`/`MachInt64`). Kept distinct from
+      `litInt`, which is an arbitrary-precision `LitInteger`: merging the two
+      made it impossible to model both Haskell `Int` overflow and `Integer`. -/
+  | litMachineInt : Int → Literal
+  /-- An arbitrary-precision GHC `LitInteger`, represented by Lean `Int`. -/
   | litInt    : Int → Literal
   | litWord   : Nat → Literal
   | litFloat  : Float → Literal

@@ -2,480 +2,336 @@ import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-
-interface Block { hs: [number, number]; lean: [number, number] }
-interface SourceMap {
-  haskellPath: string;
-  leanPath: string;
-  blocks: Block[];
-}
+import * as os from 'os';
+import { promisify } from 'util';
+import { createHash } from 'crypto';
+import { Block, ModuleResult, Policy, Report, Status, Tone, presentation } from './protocol';
+import { RunError, RunGate, runVerifier } from './runner';
 
 const channel = vscode.window.createOutputChannel('GHC Core → Lean');
-const diagCol = vscode.languages.createDiagnosticCollection('ghccoretolean');
-
-// Cache of "rich" per-block messages keyed by .hs URI then "startLine-endLine".
-// Used by the hover provider to render the full Lean diagnostic text
-// (incl. counterexamples) even when the inline diagnostic shows a short label.
-const richMessages = new Map<string, Map<string, string>>();
-
-// Per-block verification outcomes keyed by .hs URI, feeding the CodeLens
-// provider: the block's 1-based Haskell start line, pass/fail, and a one-line
-// detail (the counterexample/message, for failures).
-interface SpecOutcome { hsStart: number; ok: boolean; detail: string }
-const outcomesByUri = new Map<string, SpecOutcome[]>();
+const diagnostics = vscode.languages.createDiagnosticCollection('ghccoretolean');
 const codeLensEmitter = new vscode.EventEmitter<void>();
-
-// Gutter icon on the block's first line: green ✓ for ✅ Valid, red ✗ for
-// ❌ Falsified. The overview-ruler marker keeps the outcome visible when the
-// line is offscreen.
-const successDecoration = vscode.window.createTextEditorDecorationType({
-  gutterIconPath: vscode.Uri.file(path.join(__dirname, '..', 'media', 'pass.svg')),
-  gutterIconSize: 'contain',
-  overviewRulerColor: 'rgba(46, 204, 113, 0.7)',
-  overviewRulerLane: vscode.OverviewRulerLane.Right,
-});
-
-const failureDecoration = vscode.window.createTextEditorDecorationType({
-  gutterIconPath: vscode.Uri.file(path.join(__dirname, '..', 'media', 'fail.svg')),
-  gutterIconSize: 'contain',
-  overviewRulerColor: 'rgba(231, 76, 60, 0.7)',
-  overviewRulerLane: vscode.OverviewRulerLane.Right,
-});
-
-interface BlockDecorations {
-  success: vscode.DecorationOptions[];
-  failure: vscode.DecorationOptions[];
+const gate = new RunGate();
+let request = 0;
+let shuttingDown = false;
+let savedInputs = new Map<string, string>();
+let resultWatchers: vscode.Disposable[] = [];
+interface Annotation { range: vscode.Range; label: string; detail: string; tone: Tone }
+const annotations = new Map<string, Annotation[]>();
+const decorations = new Map<Tone, vscode.TextEditorDecorationType>();
+for (const [tone, icon, color] of [
+  ['success', 'pass.svg', 'rgba(46, 204, 113, 0.7)'],
+  ['warning', 'warning.svg', 'rgba(230, 170, 40, 0.7)'],
+  ['failure', 'fail.svg', 'rgba(231, 76, 60, 0.7)'],
+] as const) {
+  decorations.set(tone, vscode.window.createTextEditorDecorationType({
+    gutterIconPath: vscode.Uri.file(path.join(__dirname, '..', 'media', icon)),
+    gutterIconSize: 'contain', overviewRulerColor: color,
+    overviewRulerLane: vscode.OverviewRulerLane.Right,
+  }));
 }
 
-// Per-.hs-URI decoration state, so we can re-apply when the user switches
-// back to the editor (decorations are editor-scoped, not document-scoped).
-const decorationsByUri = new Map<string, BlockDecorations>();
-
-function classify(msg: string): 'success' | 'failure' | 'other' {
-  // `declaration uses 'blasterProven'` is blaster's SMT-verified marker — treat
-  // it as success (so it counts green and never posts a yellow Warning squiggle).
-  if (msg.includes('✅ Valid') || msg.includes('blasterProven')) return 'success';
-  if (msg.includes('❌ Falsified') || msg.toLowerCase().includes('falsified')) return 'failure';
-  return 'other';
+function markdown(detail: string): vscode.MarkdownString {
+  const md = new vscode.MarkdownString();
+  md.appendCodeblock(detail, 'text');
+  md.isTrusted = false;
+  return md;
 }
-
-function applyDecorations(uri: vscode.Uri): void {
-  const state = decorationsByUri.get(uri.toString());
-  for (const editor of vscode.window.visibleTextEditors) {
-    if (editor.document.uri.toString() !== uri.toString()) continue;
-    editor.setDecorations(successDecoration, state?.success ?? []);
-    editor.setDecorations(failureDecoration, state?.failure ?? []);
+function applyDecorations(editor: vscode.TextEditor): void {
+  const entries = annotations.get(editor.document.uri.toString()) ?? [];
+  for (const [tone, decoration] of decorations) {
+    editor.setDecorations(decoration, entries.filter(a => a.tone === tone).map(a => ({
+      range: new vscode.Range(a.range.start.line, 0, a.range.start.line, 0),
+      hoverMessage: markdown(a.detail),
+    })));
   }
 }
-
-function getScriptPath(): string {
-  const cfg = vscode.workspace.getConfiguration('ghcCoreLean');
-  const configured = cfg.get<string>('scriptPath') ?? 'transpile.sh';
-  if (path.isAbsolute(configured)) return configured;
-  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!ws) throw new Error('No workspace folder open.');
-  return path.join(ws, configured);
+function clearResults(): void {
+  diagnostics.clear(); annotations.clear(); codeLensEmitter.fire();
+  resultWatchers.forEach(w => w.dispose()); resultWatchers = [];
+  vscode.window.visibleTextEditors.forEach(applyDecorations);
 }
-
-function runPipeline(hsPath: string): Promise<string> {
-  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? path.dirname(hsPath);
-  return new Promise((resolve, reject) => {
-    const proc = cp.spawn('bash', [getScriptPath(), hsPath], { cwd: ws });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.on('data', (d) => (stdout += d.toString()));
-    proc.stderr.on('data', (d) => (stderr += d.toString()));
-    proc.on('error', (err) => reject(err));
-    proc.on('exit', (code) => {
-      channel.appendLine(`--- transpile.sh ${path.basename(hsPath)} (exit ${code}) ---`);
-      if (stdout) channel.appendLine(stdout);
-      if (stderr) channel.appendLine(stderr);
-      if (code !== 0) {
-        reject(new Error(`transpile.sh exit ${code}: ${stderr || stdout}`));
-        return;
-      }
-      // transpile.sh prints "wrote <path>.lean" for the entry module, last,
-      // after any dependency modules it also transpiled. Take the final match
-      // so we resolve the entry's output, not a dependency's.
-      const re = /wrote (\S+\.lean)/g;
-      let m: RegExpExecArray | null;
-      let last: string | undefined;
-      while ((m = re.exec(stdout)) !== null) last = m[1];
-      if (last) resolve(last);
-      else reject(new Error('transpile.sh succeeded but did not report an output path.'));
-    });
-  });
+function invalidate(reason?: string): void {
+  gate.invalidate(); clearResults();
+  if (reason) channel.appendLine(reason);
 }
-
-function readSourceMap(leanPath: string): SourceMap | null {
-  const mapPath = `${leanPath}.map.json`;
-  if (!fs.existsSync(mapPath)) return null;
+function isHaskell(uri: vscode.Uri): boolean { return uri.scheme === 'file' && uri.fsPath.endsWith('.hs'); }
+function sourceChanged(uri: vscode.Uri): void {
+  if (!shuttingDown && isHaskell(uri)) invalidate('Haskell inputs changed; previous results cleared. Run Verify again.');
+}
+async function diskChanged(uri: vscode.Uri): Promise<void> {
+  if (shuttingDown || !isHaskell(uri)) return;
+  const generation = gate.version;
+  let unchanged = false;
   try {
-    return JSON.parse(fs.readFileSync(mapPath, 'utf8')) as SourceMap;
-  } catch (e) {
-    channel.appendLine(`Failed to parse ${mapPath}: ${(e as Error).message}`);
-    return null;
-  }
+    const source = await fs.promises.realpath(uri.fsPath);
+    const hash = createHash('sha256').update(await fs.promises.readFile(source)).digest('hex');
+    unchanged = savedInputs.get(source) === hash;
+  } catch { /* Deleted or unreadable inputs invalidate results too. */ }
+  // Filesystem notifications can arrive after a save and after the next run
+  // starts. A notification for the bytes we just staged must not cancel it.
+  if (gate.current(generation) && !unchanged) sourceChanged(uri);
+}
+function settings(uri: vscode.Uri): Policy & { script: string; cwd: string; timeoutSeconds: number } {
+  const cfg = vscode.workspace.getConfiguration('ghcCoreLean', uri);
+  const cwd = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath;
+  if (!cwd) throw new RunError('error', 'Open the Haskell project in a workspace folder first.');
+  const configured = cfg.get<string>('verifyScriptPath', 'verify.sh');
+  const semantics = cfg.get<string>('semantics', 'conservative');
+  if (semantics !== 'conservative' && semantics !== 'approximate') throw new RunError('error', 'Invalid semantic policy.');
+  return { script: path.resolve(cwd, configured), cwd, semantics,
+    trustSmt: cfg.get<boolean>('trustSmt', false), timeoutSeconds: cfg.get<number>('timeoutSeconds', 600) };
+}
+function blockRange(doc: vscode.TextDocument, hs: [number, number]): vscode.Range {
+  if (hs[1] > doc.lineCount) throw new RunError('stale', 'Source ranges no longer match the document.');
+  return new vscode.Range(hs[0] - 1, 0, hs[1] - 1, doc.lineAt(hs[1] - 1).text.length);
+}
+function severity(tone: Tone): vscode.DiagnosticSeverity {
+  return tone === 'failure' ? vscode.DiagnosticSeverity.Error :
+    tone === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Information;
+}
+function putSummary(doc: vscode.TextDocument, label: string, detail: string, tone: Tone): void {
+  const d = new vscode.Diagnostic(new vscode.Range(0, 0, 0, doc.lineAt(0).text.length),
+    `${label}\n${detail}`, severity(tone));
+  d.source = 'GHC Core → Lean'; diagnostics.set(doc.uri, [...(diagnostics.get(doc.uri) ?? []), d]);
+}
+function diagnosticText(module: ModuleResult, block?: Block): string {
+  return module.diagnostics.filter(d => !d.data.startsWith('GHCCORE_AUDIT:') &&
+    (!block || (d.pos && d.pos.line >= block.lean[0] && d.pos.line <= block.lean[1])))
+    .map(d => d.data).join('\n');
+}
+function reportDetail(report: Report): string {
+  return `Run ${report.runId}\n${report.semantics} semantics; SMT trust ${report.trustSmt ? 'enabled' : 'disabled'}; ` +
+    `run accepted: ${report.accepted}\nTranslation from Haskell to Lean is not certified.\n` +
+    (report.detail ?? '');
 }
 
-/** Wait for the Lean LSP to publish a stable set of diagnostics for `uri`.
- *  Resolves once the diagnostic stream has been quiet for `quietMs`, or
- *  `totalMs` has elapsed overall. */
-function waitForLeanDiagnostics(
-  uri: vscode.Uri,
-  quietMs: number,
-  totalMs: number,
-): Promise<vscode.Diagnostic[]> {
-  return new Promise((resolve) => {
-    const start = Date.now();
-    let lastChange = Date.now();
-
-    const sub = vscode.languages.onDidChangeDiagnostics((e) => {
-      if (e.uris.some((u) => u.toString() === uri.toString())) {
-        lastChange = Date.now();
+function publish(report: Report, docs: Map<string, vscode.TextDocument>, entry: vscode.TextDocument): void {
+  const context = reportDetail(report);
+  for (const module of report.modules) {
+    const doc = docs.get(module.source)!;
+    const entries: Annotation[] = [];
+    const diags: vscode.Diagnostic[] = [];
+    for (const block of module.sourceMap.blocks) {
+      const prop = module.properties.find(p => p.hs[0] === block.hs[0] && p.hs[1] === block.hs[1]);
+      const text = diagnosticText(module, block);
+      // Failed modules have no audited properties. Only the block with the
+      // refutation diagnostic is labelled refuted; other blocks remain unchecked.
+      const state: Status = prop?.status ??
+        (module.status === 'refuted' && text.includes('Goal was falsified') ? 'refuted' : 'error');
+      const view = presentation(state, report);
+      const label = !prop && state !== 'refuted' ? 'Not verified · module failed' : view.label;
+      const detail = [label, context, ...(prop?.theorems ?? []).map(t =>
+        `${t.name}: ${t.status}\nAxioms: ${t.axioms.join(', ') || 'none'}`), text].filter(Boolean).join('\n\n');
+      const range = blockRange(doc, block.hs);
+      entries.push({ range, label, detail, tone: view.tone });
+      if (view.tone !== 'success') {
+        const d = new vscode.Diagnostic(range, label, severity(view.tone));
+        d.source = 'GHC Core → Lean'; diags.push(d);
       }
-    });
-
-    const tick = () => {
-      const now = Date.now();
-      const quiet = now - lastChange >= quietMs;
-      const timedOut = now - start >= totalMs;
-      if (quiet || timedOut) {
-        sub.dispose();
-        resolve(vscode.languages.getDiagnostics(uri));
-      } else {
-        setTimeout(tick, 250);
-      }
-    };
-    setTimeout(tick, quietMs);
-  });
+    }
+    // Preserve every compiler/solver error, including errors outside annotations.
+    for (const d of module.diagnostics) {
+      if (d.severity !== 'error' && d.severity !== 'warning') continue;
+      const block = module.sourceMap.blocks.find(b => d.pos && d.pos.line >= b.lean[0] && d.pos.line <= b.lean[1]);
+      const line = block && d.pos ? Math.min(block.hs[1] - 1, block.hs[0] + d.pos.line - block.lean[0]) : 0;
+      const range = new vscode.Range(line, 0, line, doc.lineAt(line).text.length);
+      const diag = new vscode.Diagnostic(range, d.data,
+        d.severity === 'error' ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning);
+      diag.source = block ? 'Lean' : 'Lean (generated code)'; diags.push(diag);
+    }
+    annotations.set(doc.uri.toString(), entries); diagnostics.set(doc.uri, diags);
+    if (module.stderr || module.detail || module.warnings) {
+      putSummary(doc, presentation(module.status, report).label,
+        [module.detail, module.stderr, module.warnings].filter(Boolean).join('\n'),
+        module.status === 'error' ? 'failure' : 'warning');
+    }
+  }
+  const view = presentation(report.status, report);
+  if (!report.accepted) putSummary(entry, view.label, context, view.tone);
+  codeLensEmitter.fire(); vscode.window.visibleTextEditors.forEach(applyDecorations);
+  channel.appendLine(`${view.label}; accepted=${report.accepted}; ${report.elapsedSeconds}s`);
+  if (report.detail) channel.appendLine(report.detail);
+  const reason = report.status === 'unsupported' && report.detail?.includes('[machine-number]')
+    ? ' Conservative semantics refuses machine numeric types such as Haskell Int. See ghcCoreLean.semantics in Settings.' : '';
+  void vscode.window.showInformationMessage(`GHC Core → Lean: ${view.label}; run ${report.accepted ? 'accepted' : 'not accepted'}.${reason}`);
 }
 
 async function verify(): Promise<void> {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    vscode.window.showWarningMessage('Open a .hs file first.');
-    return;
+  const doc = vscode.window.activeTextEditor?.document;
+  if (!doc || !isHaskell(doc.uri)) {
+    void vscode.window.showWarningMessage('Open a saved .hs file first.'); return;
   }
-  const doc = editor.document;
-  if (!doc.fileName.endsWith('.hs')) {
-    vscode.window.showWarningMessage(`Active file is not Haskell: ${doc.fileName}`);
-    return;
-  }
-
-  channel.show(true);
-  await doc.save();
-
-  let leanPath: string;
+  if (!vscode.workspace.isTrusted) return;
+  const ticket = ++request;
+  invalidate(); channel.show(true);
+  channel.appendLine(`Starting verification of ${doc.fileName}…`);
+  let generation: number | undefined;
   try {
-    leanPath = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'GHC Core → Lean: transpiling…' },
-      () => runPipeline(doc.fileName),
-    );
-  } catch (e) {
-    vscode.window.showErrorMessage(
-      `transpile.sh failed: ${(e as Error).message} — run "GHC Core → Lean: Check Environment".`);
-    return;
-  }
-
-  const map = readSourceMap(leanPath);
-  if (!map || map.blocks.length === 0) {
-    vscode.window.showInformationMessage('No [lean| … |] blocks found — nothing to verify.');
-    diagCol.delete(doc.uri);
-    richMessages.delete(doc.uri.toString());
-    return;
-  }
-
-  // Open the .lean file so the Lean LSP server starts processing it.
-  // We don't actually show it — opening the TextDocument is enough.
-  const leanUri = vscode.Uri.file(leanPath);
-  await vscode.workspace.openTextDocument(leanUri);
-
-  const cfg = vscode.workspace.getConfiguration('ghcCoreLean');
-  const quietMs = cfg.get<number>('leanDiagnosticQuietMs') ?? 2000;
-  const totalMs = cfg.get<number>('leanDiagnosticTimeoutMs') ?? 60000;
-
-  const leanDiags = await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: 'GHC Core → Lean: waiting for Lean LSP…',
-    },
-    () => waitForLeanDiagnostics(leanUri, quietMs, totalMs),
-  );
-
-  const hsDiags: vscode.Diagnostic[] = [];
-  const rich = new Map<string, string>();
-  // Per-block outcome aggregation. A block flips to 'failure' as soon as any
-  // diagnostic inside it is classified as failure; otherwise, if at least one
-  // success-classified diagnostic landed in it, the block is 'success'.
-  type Outcome = { kind: 'success' | 'failure'; block: Block };
-  const blockOutcomes = new Map<string, Outcome>();
-
-  for (const d of leanDiags) {
-    const leanLine = d.range.start.line + 1; // VS Code 0-based → 1-based
-    const block = map.blocks.find(
-      (b) => leanLine >= b.lean[0] && leanLine <= b.lean[1],
-    );
-    if (!block) continue;
-
-    const klass = classify(d.message);
-    const tag = severityLabel(d.severity);
-    const message = `${tag}${d.message}`;
-    const key = `${block.hs[0]}-${block.hs[1]}`;
-    // Hover/CodeLens text uses the raw Lean message (no ERROR:/WARNING: prefix —
-    // those are only for the Problems-panel diagnostic posted below).
-    rich.set(key, (rich.get(key) ?? '') + d.message.trim() + '\n');
-
-    if (klass === 'success') {
-      if (!blockOutcomes.has(key)) {
-        blockOutcomes.set(key, { kind: 'success', block });
-      }
-    } else if (klass === 'failure') {
-      blockOutcomes.set(key, { kind: 'failure', block });
+    if (doc.isDirty && !await doc.save()) throw new RunError('error', 'Could not save the active Haskell file.');
+    if (ticket !== request) return;
+    if (vscode.workspace.textDocuments.some(d => isHaskell(d.uri) && d.isDirty)) {
+      throw new RunError('error', 'Save the other modified Haskell documents before verification so imports match the editor.');
     }
-
-    // Non-Blaster diagnostics still flow to the Problems pane on the block's
-    // content range so the user can jump to them. Skip ✅ Valid since the
-    // green squiggle is the only signal we want for success.
-    if (klass !== 'success') {
-      // Map the specific Lean line back to the .hs line for the diagnostic
-      // anchor (Problems-pane jumping should land precisely, even though
-      // the squiggle covers the whole declaration).
-      const offsetInBlock = leanLine - block.lean[0];
-      const hsLine = block.hs[0] + 1 + offsetInBlock;
-      const lineIdx = Math.max(0, hsLine - 1);
-      const range = new vscode.Range(lineIdx, 0, lineIdx, Number.MAX_SAFE_INTEGER);
-
-      const sev = klass === 'failure' ? vscode.DiagnosticSeverity.Error : d.severity;
-      const diag = new vscode.Diagnostic(range, message, sev);
-      diag.source = 'lean';
-      hsDiags.push(diag);
+    const config = settings(doc.uri);
+    const source = await fs.promises.realpath(doc.uri.fsPath);
+    const snapshots = new Map<string, string>();
+    for (const open of vscode.workspace.textDocuments.filter(d => isHaskell(d.uri))) {
+      try {
+        const input = await fs.promises.realpath(open.uri.fsPath);
+        snapshots.set(input, createHash('sha256').update(await fs.promises.readFile(input)).digest('hex'));
+      } catch { /* Unrelated missing documents are not staged CLI inputs. */ }
     }
-  }
-
-  // Build decoration options per block — place a gutter icon on the block's
-  // *first* line only (a gutter icon renders once per line; decorating the
-  // whole range would put an icon on every line of the block).
-  const successRanges: vscode.DecorationOptions[] = [];
-  const failureRanges: vscode.DecorationOptions[] = [];
-  for (const [key, outcome] of blockOutcomes) {
-    // block.hs is 1-based; VS Code Range is 0-based.
-    const firstLine = Math.max(0, outcome.block.hs[0] - 1);
-    const gutterRange = new vscode.Range(firstLine, 0, firstLine, 0);
-    const hover = new vscode.MarkdownString();
-    hover.appendCodeblock((rich.get(key) ?? '').trim(), 'lean');
-    const opt: vscode.DecorationOptions = { range: gutterRange, hoverMessage: hover };
-    if (outcome.kind === 'success') successRanges.push(opt);
-    else failureRanges.push(opt);
-  }
-
-  diagCol.set(doc.uri, hsDiags);
-  richMessages.set(doc.uri.toString(), rich);
-  decorationsByUri.set(doc.uri.toString(), { success: successRanges, failure: failureRanges });
-  // Per-block outcomes for the CodeLens (✓ Valid / ✗ Falsified — counterexample).
-  const outcomes: SpecOutcome[] = [];
-  for (const [key, outcome] of blockOutcomes) {
-    const detail = formatCounterexample(rich.get(key) ?? '');
-    outcomes.push({ hsStart: outcome.block.hs[0], ok: outcome.kind === 'success', detail });
-  }
-  outcomesByUri.set(doc.uri.toString(), outcomes);
-  codeLensEmitter.fire();
-  applyDecorations(doc.uri);
-
-  channel.appendLine(
-    `Posted ${hsDiags.length} diagnostic(s) and ${successRanges.length}/${failureRanges.length} success/failure squiggles onto ${path.basename(doc.fileName)}.`,
-  );
-  if (hsDiags.length === 0 && successRanges.length === 0 && failureRanges.length === 0) {
-    vscode.window.showInformationMessage(
-      'No Lean diagnostics matched any [lean| … |] block — make sure the Lean4 extension is installed and Blaster is configured.',
-    );
-  }
-}
-
-// Extract just the counterexample variable bindings (`- x: 1` lines) from the
-// accumulated Lean diagnostic text, as a compact `x = 1, y = 2` one-liner for
-// the single-line CodeLens title. The full multi-line diagnostic stays on hover.
-function formatCounterexample(rich: string): string {
-  const binds: string[] = [];
-  for (const raw of rich.split('\n')) {
-    const line = raw.replace(/^(ERROR|WARNING|hint):\s*/i, '').trim();
-    const m = /^-\s*([^:]+):\s*(.+)$/.exec(line);
-    if (m) binds.push(`${m[1].trim()} = ${m[2].trim()}`);
-  }
-  return binds.join(', ');
-}
-
-function severityLabel(sev: vscode.DiagnosticSeverity): string {
-  switch (sev) {
-    case vscode.DiagnosticSeverity.Error: return 'ERROR: ';
-    case vscode.DiagnosticSeverity.Warning: return 'WARNING: ';
-    case vscode.DiagnosticSeverity.Information: return '';
-    case vscode.DiagnosticSeverity.Hint: return 'hint: ';
-    default: return '';
-  }
-}
-
-class AnnotationHoverProvider implements vscode.HoverProvider {
-  provideHover(
-    doc: vscode.TextDocument,
-    pos: vscode.Position,
-  ): vscode.ProviderResult<vscode.Hover> {
-    const rich = richMessages.get(doc.uri.toString());
-    if (!rich) return null;
-    const diags = diagCol.get(doc.uri) ?? [];
-    const hit = diags.find((d) => d.range.contains(pos));
-    if (!hit) return null;
-
-    const startLine = hit.range.start.line + 1;
-    const endLine = hit.range.end.line + 1;
-    const content = rich.get(`${startLine}-${endLine}`);
-    if (!content) return null;
-
-    const lines = content.trim().split('\n');
-    const goalLines = lines.filter((l) => l.trimStart().startsWith('⊢'));
-    const rest = lines.filter((l) => !l.trimStart().startsWith('⊢') && l.trim() !== '');
-    const md = new vscode.MarkdownString();
-    md.appendMarkdown('**Lean verification**\n\n');
-    if (rest.length) md.appendCodeblock(rest.join('\n'), 'lean');
-    if (goalLines.length) {
-      md.appendMarkdown('\n**Goal**\n\n');
-      md.appendCodeblock(goalLines.join('\n'), 'lean');
+    if (ticket !== request) return;
+    if (vscode.workspace.textDocuments.some(d => isHaskell(d.uri) && d.isDirty)) {
+      throw new RunError('stale', 'A Haskell document changed; save it and verify again.');
     }
-    md.isTrusted = false;
-    return new vscode.Hover(md, hit.range);
-  }
-}
-
-// CodeLens above each property: ✓ Valid, or ✗ Falsified with the counterexample.
-// Display-only (empty command). Refreshes when `verify` updates outcomes.
-class SpecCodeLensProvider implements vscode.CodeLensProvider {
-  onDidChangeCodeLenses = codeLensEmitter.event;
-  provideCodeLenses(doc: vscode.TextDocument): vscode.CodeLens[] {
-    const outcomes = outcomesByUri.get(doc.uri.toString()) ?? [];
-    return outcomes.map((o) => {
-      const line = Math.max(0, o.hsStart - 1);
-      const range = new vscode.Range(line, 0, line, 0);
-      const title = o.ok
-        ? '✓ Valid'
-        : (o.detail ? `✗ Falsified — ${o.detail}` : '✗ Falsified');
-      return new vscode.CodeLens(range, { title, command: '' });
+    savedInputs = snapshots;
+    const run = gate.begin(); generation = run.generation;
+    const report = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
+      title: `GHC Core → Lean: verifying (${config.semantics})…`, cancellable: true },
+    async (progress, token) => {
+      const started = Date.now();
+      let phase = 'Starting verifier';
+      const update = () => {
+        if (gate.current(run.generation)) progress.report({ message: `${phase} · ${Math.floor((Date.now() - started) / 1000)}s elapsed` });
+      };
+      update();
+      const heartbeat = setInterval(update, 1000);
+      const outputHeartbeat = setInterval(() => {
+        if (gate.current(run.generation) && !shuttingDown) {
+          channel.appendLine(`${phase} — still running (${Math.floor((Date.now() - started) / 1000)}s elapsed).`);
+        }
+      }, 15000);
+      const sub = token.onCancellationRequested(() => {
+        if (gate.current(run.generation)) {
+          invalidate('Verification cancelled.');
+          void vscode.window.showInformationMessage('GHC Core → Lean: verification cancelled.');
+        }
+      });
+      try {
+        if (token.isCancellationRequested) throw new RunError('cancelled', 'Verification cancelled.');
+        return await runVerifier({ ...config, source, signal: run.signal,
+          log: message => { if (!shuttingDown) channel.appendLine(message); },
+          onProgress: message => {
+            if (!gate.current(run.generation) || shuttingDown) return;
+            phase = message; channel.appendLine(message + '…'); update();
+          } });
+      } finally { clearInterval(heartbeat); clearInterval(outputHeartbeat); sub.dispose(); }
     });
-  }
-}
-
-function clearDiagnostics(): void {
-  diagCol.clear();
-  richMessages.clear();
-  outcomesByUri.clear();
-  codeLensEmitter.fire();
-  // Clear all editor decorations too.
-  for (const [uriStr] of decorationsByUri) {
-    const uri = vscode.Uri.parse(uriStr);
-    for (const editor of vscode.window.visibleTextEditors) {
-      if (editor.document.uri.toString() === uriStr) {
-        editor.setDecorations(successDecoration, []);
-        editor.setDecorations(failureDecoration, []);
-      }
+    if (!gate.current(run.generation)) return;
+    if (report.status === 'stale' || report.status === 'cancelled' || report.status === 'timeout') {
+      throw new RunError(report.status, report.detail ?? presentation(report.status, report).label);
     }
-    decorationsByUri.delete(uriStr);
-    void uri;
-  }
-  channel.appendLine('Cleared all GHC Core → Lean diagnostics and decorations.');
+    // Watch imported sources too, including imports outside workspace folders.
+    for (const dir of new Set(report.modules.map(m => path.dirname(m.source)))) {
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(dir, '*.hs'));
+      resultWatchers.push(watcher, watcher.onDidChange(diskChanged),
+        watcher.onDidCreate(diskChanged), watcher.onDidDelete(diskChanged));
+    }
+    const docs = new Map<string, vscode.TextDocument>();
+    const openByPath = new Map<string, vscode.TextDocument>();
+    for (const open of vscode.workspace.textDocuments.filter(d => isHaskell(d.uri))) {
+      try { openByPath.set(await fs.promises.realpath(open.uri.fsPath), open); }
+      catch { /* A deleted unrelated document is not a verified input. */ }
+    }
+    // The CLI resolves symlinks; editor URIs need not. Keep the original entry
+    // URI (e.g. macOS /var versus /private/var) for decorations and diagnostics.
+    openByPath.set(source, doc);
+    for (const module of report.modules) {
+      const loaded = openByPath.get(module.source) ?? await vscode.workspace.openTextDocument(vscode.Uri.file(module.source));
+      const hash = createHash('sha256').update(await fs.promises.readFile(module.source)).digest('hex');
+      if (loaded.isDirty || hash !== module.sha256) throw new RunError('stale', 'A Haskell source changed; verify again.');
+      savedInputs.set(module.source, hash);
+      // Validate ranges before publishing any part of a result.
+      module.sourceMap.blocks.forEach(b => blockRange(loaded, b.hs));
+      docs.set(module.source, loaded);
+    }
+    if (!gate.current(run.generation)) return;
+    if (vscode.workspace.textDocuments.some(d => isHaskell(d.uri) && d.isDirty)) {
+      throw new RunError('stale', 'A Haskell document changed; verify again.');
+    }
+    publish(report, docs, doc);
+  } catch (error) {
+    if (ticket !== request || (generation !== undefined && !gate.current(generation))) return;
+    clearResults();
+    const failure = error instanceof RunError ? error : new RunError('error', (error as Error).message);
+    channel.appendLine(`${failure.status}: ${failure.message}`);
+    putSummary(doc, failure.status, failure.message, failure.status === 'error' ? 'failure' : 'warning');
+    void vscode.window.showWarningMessage(`GHC Core → Lean: ${failure.message}`);
+  } finally { if (generation !== undefined) gate.finish(generation); }
 }
 
-function tryExec(cmd: string): string | null {
-  try {
-    return cp.execSync(cmd, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-  } catch {
-    return null;
-  }
-}
-
-interface EnvCheck { name: string; ok: boolean; detail: string; fix: string }
-
-function gatherEnvChecks(ws: string): EnvCheck[] {
-  const checks: EnvCheck[] = [];
-
-  const lean = tryExec('lean --version');
-  checks.push({ name: 'Lean (elan)', ok: !!lean, detail: lean ?? 'not found',
-    fix: 'Install elan: curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh' });
-
-  const ghc = tryExec('ghc-9.2.7 --version')
-    ?? (tryExec('ghcup whereis ghc 9.2.7') ? 'ghc 9.2.7 (via ghcup)' : null);
-  checks.push({ name: 'GHC 9.2.7', ok: !!ghc, detail: ghc ?? 'not found',
-    fix: 'ghcup install ghc 9.2.7 --set' });
-
-  const cabal = tryExec('cabal --version');
-  checks.push({ name: 'cabal', ok: !!cabal, detail: cabal?.split('\n')[0] ?? 'not found',
-    fix: 'ghcup install cabal --set' });
-
-  const py = tryExec('python3 --version');
-  checks.push({ name: 'python3', ok: !!py, detail: py ?? 'not found',
-    fix: 'Install Python 3 (e.g. apt install python3 / brew install python3)' });
-
-  const shimDir = path.join(ws, 'shim', 'dist-newstyle');
-  const shim = tryExec(`find ${JSON.stringify(shimDir)} -type f -name ghc-core-shim -perm -u+x 2>/dev/null | head -1`);
-  checks.push({ name: 'shim binary (ghc-core-shim)', ok: !!(shim && shim.length), detail: shim && shim.length ? shim : 'not built',
-    fix: '( cd shim && cabal build )' });
-
-  const transp = path.join(ws, '.lake', 'build', 'bin', 'ghccoretolean');
-  const transpOk = fs.existsSync(transp);
-  checks.push({ name: 'transpiler binary (ghccoretolean)', ok: transpOk, detail: transpOk ? transp : 'not built',
-    fix: 'lake build' });
-
-  return checks;
-}
-
+const execFile = promisify(cp.execFile);
 async function checkEnvironment(): Promise<void> {
-  const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (!ws) {
-    vscode.window.showWarningMessage('Open the GhcCoreToLean workspace folder first.');
-    return;
-  }
+  const uri = vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+  if (!uri) { void vscode.window.showWarningMessage('Open the project workspace first.'); return; }
   channel.show(true);
-  channel.appendLine('--- GHC Core → Lean: environment check ---');
-  const checks = gatherEnvChecks(ws);
-  for (const c of checks) {
-    channel.appendLine(`${c.ok ? '✓' : '✗'} ${c.name}: ${c.detail}`);
-    if (!c.ok) channel.appendLine(`    fix: ${c.fix}`);
-  }
-
-  const toolsOk = checks.slice(0, 4).every((c) => c.ok);
-  const binsOk = checks.slice(4).every((c) => c.ok);
-  if (toolsOk && binsOk) {
-    vscode.window.showInformationMessage('GHC Core → Lean: environment looks good ✅');
-  } else if (toolsOk && !binsOk) {
-    const pick = await vscode.window.showWarningMessage(
-      'Toolchains present, but the project binaries are not built yet.', 'Build now');
-    if (pick === 'Build now') {
-      const term = vscode.window.createTerminal('GHC Core → Lean build');
-      term.show();
-      term.sendText('lake build && ( cd shim && cabal build ) && echo "✅ build complete — run Verify"');
+  try {
+    const config = settings(uri);
+    const repo = path.dirname(config.script);
+    const env = { ...process.env, PATH: [
+      '.ghcup/bin', '.cabal/bin', '.elan/bin', '.local/bin',
+    ].map(p => path.join(os.homedir(), p)).concat(['/opt/homebrew/bin', '/usr/local/bin', process.env.PATH ?? '']).join(path.delimiter) };
+    channel.appendLine(`Environment for ${config.script}`);
+    let ok = fs.existsSync(config.script);
+    channel.appendLine(`${ok ? '✓' : '✗'} verify script: ${config.script}`);
+    for (const [command, args, cwd] of [
+      ['python3', ['--version'], repo], ['lean', ['--version'], repo],
+      ['ghc-9.2.7', ['--version'], repo], ['cabal', ['--version'], repo],
+      ['cabal', ['list-bin', 'exe:ghc-core-shim'], path.join(repo, 'shim')],
+    ] as [string, string[], string][]) {
+      try {
+        const result = await execFile(command, args, { cwd, env, timeout: 10000 });
+        const value = result.stdout.trim();
+        if (args[0] === 'list-bin' && !fs.existsSync(value)) throw new Error('shim is not built');
+        channel.appendLine(`✓ ${command} ${args.join(' ')}: ${value}`);
+      } catch (error) { ok = false; channel.appendLine(`✗ ${command}: ${(error as Error).message}`); }
     }
-  } else {
-    vscode.window.showWarningMessage('Missing toolchains — see the "GHC Core → Lean" output channel for install commands.');
-  }
+    for (const relative of ['.lake/build/bin/ghccoretolean',
+      '.lake/build/lib/lean/GhcCoreToLean/Runtime.olean', '.lake/build/lib/lean/GhcCoreToLean/Audit.olean']) {
+      const exists = fs.existsSync(path.join(repo, relative)); ok = ok && exists;
+      channel.appendLine(`${exists ? '✓' : '✗'} ${relative}`);
+    }
+    channel.appendLine('Build in the repository: lake build GhcCoreToLean ghccoretolean && (cd shim && cabal build)');
+    channel.appendLine('Blaster proofs additionally require Z3 on the verifier PATH. Run Verify to check the complete toolchain.');
+    void vscode.window.showInformationMessage(ok ? 'GHC Core → Lean: prerequisites found.' : 'GHC Core → Lean: missing prerequisites; see output.');
+  } catch (error) { void vscode.window.showWarningMessage((error as Error).message); }
 }
 
 export function activate(ctx: vscode.ExtensionContext): void {
-  ctx.subscriptions.push(diagCol, channel, successDecoration, failureDecoration);
-  ctx.subscriptions.push(
+  shuttingDown = false;
+  const watcher = vscode.workspace.createFileSystemWatcher('**/*.hs');
+  ctx.subscriptions.push(channel, diagnostics, codeLensEmitter, ...decorations.values(), watcher,
+    { dispose: deactivate },
     vscode.commands.registerCommand('ghcCoreLean.verify', verify),
-    vscode.commands.registerCommand('ghcCoreLean.clearDiagnostics', clearDiagnostics),
+    vscode.commands.registerCommand('ghcCoreLean.clearDiagnostics', () => { request++; invalidate('Cleared verification results.'); }),
     vscode.commands.registerCommand('ghcCoreLean.checkEnvironment', checkEnvironment),
-    vscode.languages.registerHoverProvider('haskell', new AnnotationHoverProvider()),
-    vscode.languages.registerCodeLensProvider({ language: 'haskell', scheme: 'file' }, new SpecCodeLensProvider()),
-    // Decorations are editor-scoped, not document-scoped. Re-apply when the
-    // user switches back to a .hs editor that has cached decorations.
-    vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor) applyDecorations(editor.document.uri);
+    vscode.commands.registerCommand('ghcCoreLean.showOutput', () => channel.show(true)),
+    vscode.languages.registerHoverProvider({ language: 'haskell', scheme: 'file' }, {
+      provideHover(doc, pos) {
+        const entry = annotations.get(doc.uri.toString())?.find(a => a.range.contains(pos));
+        return entry ? new vscode.Hover(markdown(entry.detail), entry.range) : undefined;
+      },
     }),
-    vscode.window.onDidChangeVisibleTextEditors((editors) => {
-      for (const e of editors) applyDecorations(e.document.uri);
+    vscode.languages.registerCodeLensProvider({ language: 'haskell', scheme: 'file' }, {
+      onDidChangeCodeLenses: codeLensEmitter.event,
+      provideCodeLenses(doc) {
+        return (annotations.get(doc.uri.toString()) ?? []).map(a => new vscode.CodeLens(
+          new vscode.Range(a.range.start.line, 0, a.range.start.line, 0),
+          { title: `${a.tone === 'success' ? '✓' : a.tone === 'failure' ? '✗' : '⚠'} ${a.label}`,
+            command: 'ghcCoreLean.showOutput' }));
+      },
+    }),
+    vscode.window.onDidChangeVisibleTextEditors(editors => editors.forEach(applyDecorations)),
+    vscode.workspace.onDidChangeTextDocument(e => { if (e.contentChanges.length) sourceChanged(e.document.uri); }),
+    watcher.onDidChange(diskChanged), watcher.onDidCreate(diskChanged), watcher.onDidDelete(diskChanged),
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('ghcCoreLean')) { request++; invalidate('Verification settings changed; verify again.'); }
     }),
   );
 }
-
 export function deactivate(): void {
-  // Nothing to do — disposables are tracked via ctx.subscriptions.
+  shuttingDown = true;
+  request++; gate.invalidate(); resultWatchers.forEach(w => w.dispose()); resultWatchers = [];
 }
