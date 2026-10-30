@@ -166,7 +166,7 @@ ppClass cls = A.object
   [ "name"    A..= occNameString (nameOccName (Cls.className cls))
   , "tyVars"  A..= map (occNameString . nameOccName . tyVarName) (Cls.classTyVars cls)
   , "supers"  A..= map ppSuperPred (Cls.classSCTheta cls)
-  , "methods" A..= map ppClassOp (Cls.classOpItems cls)
+  , "methods" A..= map (ppClassOp (length (Cls.classTyVars cls))) (Cls.classOpItems cls)
   ]
 
 -- | A superclass constraint reduced to the parent class's NAME. Task 5 consumes
@@ -192,12 +192,25 @@ ppSuperPred p = A.toJSON $ case getClassPredTys_maybe p of
   Just (c, _) -> occNameString (nameOccName (Cls.className c))
   Nothing     -> "_UnknownSuper"
 
-ppClassOp :: Cls.ClassOpItem -> A.Value
-ppClassOp (selId, dmInfo) = A.object
+ppClassOp :: Int -> Cls.ClassOpItem -> A.Value
+ppClassOp classArity (selId, dmInfo) = A.object
   [ "name"       A..= occNameString (nameOccName (varName selId))
   , "type"       A..= ppMethodTy (methodBodyTy (varType selId))
   , "hasDefault" A..= isJust dmInfo
+  , "hasUnsupportedSignature" A..=
+      (length (fst (Type.splitForAllTyCoVars (varType selId))) > classArity
+       || methodPredCount (varType selId) > 1)
   ]
+
+-- | The selector's first predicate is its own class dictionary. Any later
+-- predicate belongs to the method signature and is currently removed by
+-- 'methodBodyTy'. Preserve that fact for conservative refusal.
+methodPredCount :: Type.Type -> Int
+methodPredCount = go . Type.dropForAlls
+  where
+    go ty = case Type.splitFunTy_maybe ty of
+      Just (_, arg, res) | isPredTy arg -> 1 + go res
+      _                                 -> 0
 
 -- | Strip a class-method SELECTOR type back to the signature as written in the
 -- class body: @size :: forall a. Sized a => a -> Int@ ⇒ @a -> Int@. The class's

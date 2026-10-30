@@ -16,6 +16,10 @@ def valueMap : String → Option String
   | "GHC.Real.rem"  | "rem"  => some "Int.tmod"
   | "GHC.Real.div"  | "div"  => some "Int.fdiv"
   | "GHC.Real.mod"  | "mod"  => some "Int.fmod"
+  | "$GhcCoreToLean.quotInt64" => some "Hs.quotInt64"
+  | "$GhcCoreToLean.remInt64" => some "Hs.remInt64"
+  | "$GhcCoreToLean.divInt64" => some "Hs.divInt64"
+  | "$GhcCoreToLean.modInt64" => some "Hs.modInt64"
   -- Haskell's comparison operators return `Bool`. Lean 4's `≤`/`<`/etc. return
   -- `Prop`, so we wrap them in `decide` to get Bool back. `==` is already Bool
   -- via the `BEq` instance, so it does not need wrapping.
@@ -57,19 +61,79 @@ def valueMap : String → Option String
   -- moves, NOT a live `++` path (observed: 0 occurrences at pass-0000).
   | "GHC.Base.build"   => some "(fun g => g List.cons List.nil)"
   | "GHC.Base.augment" => some "(fun g xs => g List.cons xs)"
+  -- String literals (M4 Task 2). Core spells `"hi" :: String` as
+  -- `GHC.CString.unpackCString# "hi"#`, so the literal's Lean image is a Lean
+  -- STRING literal (see `Emit.escapeStringLit`) and the unpacker's image is the
+  -- `String → List Char` that turns it into the `[Char]` Haskell means.
+  -- `String.toList` is LOAD-BEARING: a bare `"hi"` elaborates as `String`, which
+  -- is not `List Char`, so dropping the conversion would be an ill-typed term
+  -- wherever a Haskell `String` is used as a list.
+  --
+  -- BOTH unpackers are REQUIRED, not one plus a hedge. Measured on the pipeline's
+  -- GHC 9.2.7: the plain variant appears only for a PURE-ASCII literal, and
+  -- `unpackCStringUtf8#` for every non-ASCII one (`"caf\233"`, `"\255"`,
+  -- `"\128169"`, and — before the shim repaired it — `"a\0b"`). Mapping only the
+  -- plain one would fail loud on every accented string. Both take the same image:
+  -- the byte-level difference between them is the shim's business, and by the time
+  -- a payload reaches here it is already a decoded Lean `String` (or the module
+  -- was refused — see `Emit.unrepresentableStringLiterals`).
+  --
+  -- OBSERVED NAMES ONLY, with the negatives recorded: `GHC.CString.unpackCString#`
+  -- and `GHC.CString.unpackCStringUtf8#` are the two spellings in the dumps (the
+  -- bare `unpackCString#` was NOT observed). `unpackAppendCString#` and
+  -- `unpackFoldrCString#` — the RULE-introduced fusion forms — are 0-occurrence
+  -- across every dump measured, exactly like `GHC.Base.augment` above, so they are
+  -- deliberately absent rather than guessed at: a literal `++` still arrives as
+  -- `List.append (String.toList "…")` at pass-0000.
+  | "GHC.CString.unpackCString#"     => some "String.toList"
+  | "GHC.CString.unpackCStringUtf8#" => some "String.toList"
+  -- `Char` operations (M4 Task 4). ONLY TWO, and the smallness is the finding,
+  -- not an omission — see the loud-fail block below for the seven `Data.Char`
+  -- names that must stay unmapped and why.
+  --
+  -- OBSERVED NAMES, WITH THE NEGATIVES. The plan hedged `Data.Char.*` /
+  -- `GHC.Char.*`; measured on the pipeline's GHC 9.2.7 over `CharOps.hs`, BOTH
+  -- guesses are 0-occurrence and the real spellings are the DEFINING modules:
+  -- `GHC.Base.ord` (×1) and `GHC.Unicode.isDigit` (×1), with
+  -- `Data.Char.ord` ×0, `Data.Char.isDigit` ×0, `GHC.Char.ord` ×0,
+  -- `GHC.Char.isDigit` ×0. `Data.Char` is a re-export module and Core names come
+  -- from where a thing is DEFINED, so the `Data.Char.*` keys are not merely
+  -- unobserved — they are the wrong shape and are deliberately absent rather than
+  -- added "just in case", which would be a key that can never fire.
+  -- No bare alphabetic keys either (`| "ord"`), per this map's standing rule:
+  -- a user's own `ord` is a bare Core name and must keep resolving to their def.
+  --
+  -- `ord` IS SAFE, and the asymmetry is the whole reason. Every LEAN `Char` has a
+  -- faithful Haskell image, so the surrogate gap enters only through
+  -- CONSTRUCTION — i.e. through `chr`, which is why `ord` maps and `chr` cannot.
+  -- Haskell `ord` returns `Int`, so the result is coerced like `length`/`gcd`.
+  | "GHC.Base.ord" => some "(fun c => (c.toNat : Int))"
+  | "$GhcCoreToLean.ordInt64" => some "(fun c => Int64.ofNat c.toNat)"
+  -- `isDigit` is the ONE `Data.Char` predicate that AGREES on both sides: Haskell
+  -- `GHC.Unicode.isDigit` and Lean v4.24 `Char.isDigit` both test ASCII 48..57
+  -- only. Pinned in both languages by `CharOps.hs`, including the ARABIC-INDIC
+  -- DIGIT FIVE `'٥'` (U+0665) — a Unicode digit that is `False` in Haskell and
+  -- `false` in Lean, which is exactly the agreement being claimed.
+  | "GHC.Unicode.isDigit" => some "Char.isDigit"
   | "GHC.Base.map"                => some "List.map"
   | "GHC.List.filter"             => some "List.filter"
   | "GHC.List.reverse"            => some "List.reverse"
   -- Int ranges (Enum dict is erased by Lower). `enumFrom`/`enumFromThen`
   -- (infinite) are intentionally NOT mapped — loud fail.
   | "GHC.Enum.enumFromTo"     => some "Hs.enumFromTo"
+  | "$GhcCoreToLean.enumFromToInt64" => some "Hs.enumFromToInt64"
   | "GHC.Enum.enumFromThenTo" => some "Hs.enumFromThenTo"
   -- Int-indexed list ops. Haskell clamps negative counts to "empty/unchanged";
   -- `Int.toNat` clamps negatives to 0 — the semantics match exactly.
   | "GHC.List.take"      => some "(fun n xs => List.take n.toNat xs)"
   | "GHC.List.drop"      => some "(fun n xs => List.drop n.toNat xs)"
+  | "$GhcCoreToLean.takeInt64" => some "(fun n xs => List.take n.toNatClampNeg xs)"
+  | "$GhcCoreToLean.dropInt64" => some "(fun n xs => List.drop n.toNatClampNeg xs)"
   | "GHC.List.splitAt"   => some "Hs.splitAt"
+  | "$GhcCoreToLean.splitAtInt64" => some "Hs.splitAtInt64"
   | "GHC.List.replicate" => some "(fun n x => List.replicate n.toNat x)"
+  | "$GhcCoreToLean.replicateInt64" =>
+      some "(fun n x => List.replicate n.toNatClampNeg x)"
   -- Zip family. Eta-wrapped for arity legibility ONLY — these lambdas are
   -- definitionally equal to the bare names and pin nothing; arg order is
   -- pinned by the (· - ·) guards in Tests/Unit.lean, the only thing that
@@ -86,6 +150,7 @@ def valueMap : String → Option String
   -- Haskell `length` returns `Int`; Lean `List.length` returns `Nat`. Coerce
   -- to `Int` (like `gcd`/`lcm`) so it composes with Int arithmetic.
   | "Data.Foldable.length" | "GHC.List.length"  => some "(fun xs => (List.length xs : Int))"
+  | "$GhcCoreToLean.lengthInt64" => some "(fun xs => Int64.ofNat (List.length xs))"
   | "Data.Foldable.null"   | "GHC.List.null"    => some "List.isEmpty"
   -- `GHC.Base.foldr` is the third alternative because list COMPREHENSIONS
   -- desugar through it, not through the Foldable method: `[2*x | x <- xs]`
@@ -171,13 +236,21 @@ def valueMap : String → Option String
   | "GHC.Num.fromInteger"   => some "id"
   | "GHC.Real.toInteger"    => some "id"
   | "GHC.Real.fromIntegral" => some "id"
+  | "$GhcCoreToLean.fromIntegerInt64" => some "Int64.ofInt"
+  | "$GhcCoreToLean.toIntegerInt64" => some "Int64.toInt"
+  | "$GhcCoreToLean.int64ToInteger" => some "Int64.toInt"
+  | "$GhcCoreToLean.integerToInt64" => some "Int64.ofInt"
   | "GHC.Num.signum"        => some "(fun a => if a < 0 then -1 else if a > 0 then 1 else 0)"
   -- divMod floors (fdiv/fmod); quotRem truncates (tdiv/tmod). Returns a pair.
   | "GHC.Real.divMod"       => some "(fun a b => (Int.fdiv a b, Int.fmod a b))"
   | "GHC.Real.quotRem"      => some "(fun a b => (Int.tdiv a b, Int.tmod a b))"
+  | "$GhcCoreToLean.divModInt64" => some "Hs.divModInt64"
+  | "$GhcCoreToLean.quotRemInt64" => some "Hs.quotRemInt64"
   -- Lean `Int.gcd`/`Int.lcm` return `Nat`; Haskell returns the numeric type.
   | "GHC.Real.gcd"          => some "(fun a b => (Int.gcd a b : Int))"
   | "GHC.Real.lcm"          => some "(fun a b => (Int.lcm a b : Int))"
+  | "$GhcCoreToLean.gcdInt64" => some "Hs.gcdInt64"
+  | "$GhcCoreToLean.lcmInt64" => some "Hs.lcmInt64"
   | "GHC.Classes.compare"   => some "compare"
   -- Unboxed Int# primops. Arithmetic maps to boxed ops (I#/Int# both → Int);
   -- comparisons mirror the GHC.Classes.* `decide`-wrapped Bool forms.
@@ -244,12 +317,25 @@ def typeConMap : String → List String → Option String
   | "Int",     []     => some "Int"
   | "Int#",    []     => some "Int"
   | "GHC.Prim.Int#", [] => some "Int"
+  -- Internal marker introduced by `Lower.machineInts` in conservative mode.
+  -- It cannot collide with a Haskell source name because `$` is not legal in
+  -- an ordinary Haskell type constructor.
+  | "$GhcCoreToLean.Int64", [] => some "Int64"
   | "Integer", []     => some "Int"
   | "Word",    []     => some "Nat"
   | "Word#",   []     => some "Nat"
   | "GHC.Prim.Word#", [] => some "Nat"
   | "Bool",    []     => some "Bool"
   | "Char",    []     => some "Char"
+  -- Core keeps the SYNONYM in binder types (`{"tag":"TyCon","name":"String"}`),
+  -- so a `String`-typed def needs this arm as well as the `[] [Char]` one below:
+  -- without it a `String` binder emitted `(GHCCore.tyConOpaque "String")` while
+  -- its BODY emitted a `List Char`. Only the bare spelling is observed; a
+  -- qualified `GHC.Base.String` was NOT seen in any dump and is not guessed at.
+  -- Same exposure as the `Int`/`Bool` arms: a user type of that name would be
+  -- hijacked here, which is why the roadmap's builtin-name arms stay a fixed,
+  -- observed list.
+  | "String",  []     => some "List Char"
   | "Char#",   []     => some "Char"
   | "GHC.Prim.Char#", [] => some "Char"
   | "()",      []     => some "Unit"
@@ -354,4 +440,3 @@ def isUnwrappingDataCon : String → Bool
   | _                     => false
 
 end GHCCore.Maps
-

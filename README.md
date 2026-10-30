@@ -4,6 +4,11 @@ Transpile a Haskell module to **Lean 4** by way of its **GHC Core**, and verify
 properties you embed in the Haskell source with the [Blaster](https://github.com/input-output-hk/Lean-blaster)
 SMT tactic.
 
+Verification currently establishes properties of a **translated Lean model**;
+translation correctness is not certified. Use `./verify.sh` for completed checks
+with explicit proof assumptions. Its default conservative policy refuses known
+semantic approximations. `transpile.sh` remains available for model exploration.
+
 You write ordinary Haskell plus a few property annotations:
 
 ```haskell
@@ -82,11 +87,36 @@ automatically the first time you run `transpile.sh` (it stages them in a sandbox
 ## Usage
 
 ```bash
+# Check a mathematical-Integer example with an ordinary Lean proof.
+./verify.sh tests/fixtures/verification/PureInteger.hs
+
+# Check exact 64-bit Haskell Int overflow with an audited Lean proof.
+./verify.sh tests/fixtures/verification/Overflow.hs
+
+# Check strings and their exact machine-Int lengths.
+./verify.sh examples/haskell/StringBasics.hs
+
+# Opt into trusting Blaster's SMT results, which have no reconstructed proof.
+./verify.sh examples/haskell/Arithmetic.hs --trust-smt
+
+# Machine-readable result; exit 0 only when the selected policy accepts it.
+./verify.sh tests/fixtures/verification/PureInteger.hs --json
+```
+
+The CLI builds and checks each local module in private temporary directories,
+audits theorem dependencies, and checks that sources did not change during the
+run. `proved` and `smt_valid` refer to the Lean model; `admitted`, `assumed`,
+missing properties, errors, and timeouts never count as accepted verification.
+See [verification policies and result format](docs/verification.md).
+
+To export Lean files for manual work:
+
+```bash
 # Transpile one module (and its local imports, transitively) to Lean.
 ./transpile.sh examples/haskell/Ratio.hs
 # → writes GhcCoreToLean/Generated/Ratio.lean (+ a .map.json sidecar)
 
-# Verify it (Blaster discharges each property; look for ✅ Valid).
+# Elaborate the exported model (this alone does not audit proof assumptions).
 lake build GhcCoreToLean.Generated.Ratio
 ```
 
@@ -120,9 +150,17 @@ theorem bar : ∀ (x : Int), f (g x) = x := by blaster
 ```
 
 Notes:
-- The text inside is **Lean 4**, proved `by blaster`. Haskell `Integer`/`Int`
-  both map to Lean `Int`; user data constructors are referenced as `T.C`
-  (e.g. `CustomRatio.CustomRatio`).
+- The text inside is **Lean 4**. Under the default conservative policy, Haskell
+  `Int` maps to wrapping Lean `Int64`, while Haskell `Integer` maps to Lean
+  `Int`. In a module that uses only Haskell `Int`, bare `Int` in an annotation
+  is rewritten to `Int64` for compatibility. A module using both types must
+  spell machine integers as `Int64` and mathematical integers as `Int`.
+- `simp` can unfold generated definitions, and `Int64.add_assoc` /
+  `Int64.add_comm` provide audited algebraic proofs. `bv_decide` is available,
+  but Lean 4.24 reports compiler-trust axioms for it, so the verifier classifies
+  such a theorem as `assumed` rather than accepting it silently.
+- User data constructors are referenced as `T.C` (for example,
+  `CustomRatio.CustomRatio`).
 - A property may range over **several** functions, not just one.
 - For **imported** symbols, qualify with the module **by hand** — nothing in the
   pipeline qualifies hand-written spec text. A value is `M.f`
@@ -140,18 +178,31 @@ Notes:
   `instance : BEq CustomRatio where` would read `where` as an argument and
   rewrite a *type* to a constructor.
 
+Three Lean lexical forms are **refused** inside a spec block, by name and before
+anything is emitted: a **raw string** (`r"…"`), an **interpolated string**
+(`s!"…"`), and a **guillemet identifier** (`«…»`). The constructor
+auto-qualification above is a text rewrite guarded by a scanner that masks string
+literals and comments; those three forms desync that mask, and the desync is
+silent — a constructor name inside a *string literal* gets rewritten, so the
+theorem elaborates and proves a property of a string nobody wrote (all three
+measured). Ordinary literals and comments in spec text are fine and stay
+verbatim. Must-fail fixture: `examples/haskell/SpecInterp.hs`.
+
 ## VS Code extension (optional)
 
-`vscode-extension/` provides a "verify" command that runs the pipeline and shows
-the outcome inline on your `.hs`: a gutter ✓/✗ on each property, a CodeLens
-(`✓ Valid` / `✗ Falsified — <counterexample>`) above it, and the full Lean
-diagnostic on hover.
+`vscode-extension/` runs the audited `verify.sh --json` command and shows results
+on each Haskell annotation with gutter icons, CodeLens, and hovers containing
+theorem axioms and Lean diagnostics. Green denotes a proved property in an
+accepted **Lean-model** run; SMT results remain amber and require explicit trust
+for acceptance. Edits and newer runs invalidate older results. The defaults
+are conservative semantics and no SMT trust; the Lean4 extension is optional.
+See the [extension guide](vscode-extension/README.md) for settings and examples.
 
 ```bash
 cd vscode-extension
 npm install
 npm run compile
-npx @vscode/vsce package --no-dependencies     # → ghccoretolean-vscode-<ver>.vsix
+npx @vscode/vsce package --no-dependencies --skip-license # → ghccoretolean-vscode-<ver>.vsix
 code --install-extension ghccoretolean-vscode-*.vsix --force
 # then reload the VS Code window
 ```
@@ -177,7 +228,10 @@ Development Host.)
 - Pinned to GHC 9.2.7 (the Core dump format and plugin API are version-specific)
   and Lean `v4.24.0`.
 - The pipeline consumes the `pass-0000` (desugarer) Core. Common unboxed
-  `Int#` primops are mapped; exotic primops (string/array/IO) are not.
+  `Int#` primops are mapped. Conservative verification gives ordinary `Int`
+  arithmetic, ranges, integral conversions, `gcd`/`lcm`, and statically safe
+  division exact 64-bit semantics. Dynamic or exceptional divisors are refused.
+  Exotic primops (string/array/IO) are not mapped.
 - Mapped `base` surface: arithmetic (`+ - * negate abs signum`),
   integral (`quot rem div mod divMod quotRem gcd lcm fromIntegral fromInteger`),
   comparison/`Ord` (`== /= < <= > >= min max compare`/`Ordering`), booleans
@@ -186,13 +240,80 @@ Development Host.)
   replicate zip zipWith unzip sum product all any and or elem notElem lookup
   concat concatMap`), list literals (`[a, b, c]`), list comprehensions
   (single- and multi-generator), `Int` ranges (`[a..b]`, `[a,b..c]` — the
-  zero-stride `[a,a..c]` with `c ≥ a` is infinite in Haskell and lowers to
-  `default`), 2-/3-/4-tuples (`fst snd`, construction, patterns), and
+  zero-stride `[a,a..c]` with `c ≥ a` is infinite in Haskell and the approximate
+  model lowers it to `[]`, which changes finite observations such as `take 1`;
+  conservative verification refuses stepped enumeration), 2-/3-/4-tuples
+  (`fst snd`, construction, patterns), and
   `Maybe`/`Either` eliminators
   (`maybe fromMaybe isJust isNothing either`). Local recursive `where`/`let`
   helpers emit as Lean `let rec` (structural recursion only).
+- **Strings and `Char`.** Haskell `String` and `[Char]` both transpile to Lean
+  `List Char` — including the bare `String` *synonym*, which Core keeps in
+  binder types. **String literals work.** Core spells a literal
+  `GHC.CString.unpackCString# "lit"#` for a pure-ASCII literal and
+  `GHC.CString.unpackCStringUtf8#` for one containing any non-ASCII character;
+  both map to `String.toList`, so a literal's Lean image is a genuine
+  `List Char` and the whole mapped list library composes with it. Quotes,
+  backslashes and C0 control characters are escaped on emission (`\n`/`\t`/`\r`
+  by name, the rest `\xNN`); non-ASCII is written raw into the UTF-8 output.
+  NUL is faithful: GHC encodes it as modified UTF-8's overlong `C0 80`, which
+  the shim repairs, so `"a\0b"` is 3 characters. `Char` literals work in both
+  value and pattern position (`classify 'a' = 1`). The mapped `Char` surface is
+  equality, ordering and `compare` (the ordinary `Ord` path), `ord`
+  (→ `(fun c => (c.toNat : Int))`) and `isDigit` (→ `Char.isDigit`). Fixtures:
+  `examples/haskell/StringBasics.hs`, `examples/haskell/CharOps.hs`. The gaps,
+  all of them loud:
+  - **`Data.Char` is not the name to look for.** Core records names from where
+    a thing is *defined*, and `Data.Char` is a re-export module, so the
+    mappable surface arrives as `GHC.Base.ord`, `GHC.Unicode.isDigit`,
+    `GHC.Unicode.isAlpha`, `GHC.Char.chr` and so on. `Data.Char.*` is a
+    0-occurrence spelling — worth knowing when reading a dump or a build error.
+  - **Six Unicode functions are deliberately unmapped**: `isAlpha`, `isUpper`,
+    `isLower`, `toUpper`, `toLower`, `isSpace`. Lean v4.24 is ASCII-only for
+    *all* of them while Haskell is Unicode-aware (`isAlpha 'é'` is `True` in
+    Haskell, `false` in Lean; `isSpace` differs on `\v`, `\f` and NBSP), so
+    mapping any of them would compile and answer differently — the
+    silent-wrong category. A faithful version needs `base`'s general-category
+    tables. `isDigit` is mapped precisely because it is the one that agrees
+    (both sides test ASCII 48–57, so the Unicode digit `'٥'` U+0665 is `False`
+    on both).
+  - **`chr` is unmapped.** A Haskell `Char` spans `[0, 0x10FFFF]` *including*
+    the 2048 surrogate code points; a Lean `Char` excludes them. So `chr 0xD800`
+    is a defined Haskell value with no Lean image, and no total Lean function is
+    faithful — this is silent-wrongness, not the project's usual ⊥-refinement
+    tradeoff. `ord` maps and `chr` does not, which is not an inconsistency:
+    every *Lean* `Char` has a faithful Haskell image, so the gap enters only
+    through construction.
+  - **A literal containing a lone surrogate is refused by name**, rather than
+    silently becoming U+FFFD. `String` and `Char` get separate messages
+    carrying separate evidence, because the string case is a byte-encoding fact
+    and the char case is not:
+
+    ```
+    string literal not representable: bytes `78 ed a0 80 79` in bind `lone`
+    char literal not representable: code point `U+D800` in bind `lone`
+    ```
+
+    Transpilation exits nonzero and writes no `.lean`. Must-fail fixtures:
+    `examples/haskell/StringSurrogate.hs`, `examples/haskell/CharSurrogate.hs`.
+    NUL is *not* this case.
+  - **`min`/`max` at `Char` fail loud** with `failed to synthesize Min Char` /
+    `Max Char`: v4.24 has no such instance. The mapping itself is right at every
+    type that does have one, so this is a `lake build` failure rather than a
+    transpiler bug, and no instance is added. Every other binder the `Ord`
+    recipe asks for does synthesize at `Char`, which is why equality and
+    ordering work.
+  - **`Char` ranges are safe only by accident.** `['a'..'e']` transpiles (rc=0)
+    to `Hs.enumFromTo 'a' 'e'` and then fails loud at `lake build` only because
+    that helper is monomorphic on `Int` (`GhcCoreToLean/Runtime.lean:20`):
+    `'a' has type Char but is expected to have type Int`. Anyone generalising
+    `Hs.enumFromTo` over an `Enum`-like class would silently route a `Char`
+    range through Haskell's `chr`-based `Enum Char` — exactly the unfaithful
+    direction above. Pin this before generalising.
 - `error`/`undefined` are ⊥ on their whole domain, so they lower to Lean
-  `default` (a total, sound bottom). The partial list/`Maybe` functions are ⊥
+  `default` in the approximate model. This does not establish preservation of
+  Haskell behavior; conservative verification refuses these operations until
+  their domains can be checked. The partial list/`Maybe` functions are ⊥
   on only *part* of their domain, so each lowers to a total Lean form that is
   faithful wherever Haskell is defined:
   - `head`, `last`, `maximum`, `minimum`, `fromJust` are ⊥ exactly on `[]` /
@@ -214,14 +335,18 @@ Development Host.)
   non-structural equality like Ratio's cross-multiply is preserved); derived
   `Eq`/`Ord` are reconstructed via Lean `deriving DecidableEq, Ord` plus
   `LE`/`LT`/`Min`/`Max`, so user types with `deriving (Eq, Ord)` support
-  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` is now
-  **preserved** — the old limitation ("would be modeled structurally") is
-  closed. The route is chosen per instance by whether the `$ccompare` body
-  contains a constructor-tag primop (`dataToTag#`/`tagToEnum#`): GHC emits one
-  only in a *derived* `compare`, and only for a type with ≥3 nullary
+  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` is usually
+  preserved in approximate mode. The route is chosen per instance by whether
+  the `$ccompare` body contains a constructor-tag primop (`dataToTag#`/
+  `tagToEnum#`): GHC normally emits
+  one in a *derived* `compare` for a type with ≥3 nullary
   constructors, so those take Lean's `deriving Ord` while every other shape —
   hand-written, and derived on a type with ≤2 nullary constructors — is emitted
-  from its own body, with `<`/`<=`/`min`/`max` derived from that `compare`. An
+  from its own body, with `<`/`<=`/`min`/`max` derived from that `compare` in
+  **approximate mode**. Conservative mode refuses locally declared `Eq` and `Ord`
+  instances because GHC permits their methods to disagree and the current
+  translation can drop those overrides. Instance origin and method preservation
+  are required before admitting them as a verified source model. An
   instance defining both `compare` and a *disagreeing* `<` keeps the `compare`
   one: Lean resolves `Decidable (a < b)` only through `ltOfOrd`, so there is
   nowhere to wire a separate `<`. `Show`/`Read` are skipped (derived `Repr`
@@ -431,3 +556,50 @@ Development Host.)
   quantified over element variables (`sumList [a] = a`) or over a list whose
   shape the statement fixes (`pairUp xs [] = []`). Concrete-value properties
   also close with `by decide`.
+- **A property about a *recursive* definition is verified modulo an unproved
+  termination argument.** Any def whose body references itself is emitted with
+  `decreasing_by all_goals sorry` (`GhcCoreToLean/Emit.lean:769`): the
+  transpiler supplies no termination argument at all, and does not attempt
+  Lean's structural check. That `sorry` sits *inside the definition*, so it
+  taints every theorem about it — the theorem depends on `sorryAx`, which
+  yields `False`, and a `✅ Valid` on it therefore carries no logical guarantee
+  on its own. `#print axioms` is how to check, and it is worth doing on any
+  property you intend to rely on:
+
+    ```
+    #print axioms FibComplex.correct_fib
+    -- 'FibComplex.correct_fib' depends on axioms: [sorryAx, Blaster.Tactic.blasterProven]
+    #print axioms Ratio.falty_addRatio_commutative
+    -- 'Ratio.falty_addRatio_commutative' depends on axioms: [Blaster.Tactic.blasterProven]
+    ```
+
+  A **non-recursive** def is unaffected: the second pair above is the clean case
+  (`falty_addRatio_commutative` is about a non-recursive `addRatio`), and
+  `Blaster.Tactic.blasterProven` is the solver's own axiom, not this one. To see
+  which of your modules are affected, `grep decreasing_by` in the generated
+  output; the recursive *def* itself reports `[sorryAx]` too
+  (`#print axioms Ratio.gcdInt`). Note that the hazard is already handled in the
+  one place it would be worst: the `Ord`/`Eq` bodies spliced into the data block
+  are emitted with `recOverride := some false`, i.e. **no** `decreasing_by`, so
+  no `sorry` can land under an instance and taint every `decide` proof about the
+  order — those bodies must pass Lean's structural check instead, and fail loud
+  if they cannot. Extending that to user defs — structural recursion where it
+  holds, a measure where it does not, a loud failure otherwise — is a separate
+  work item, not something this milestone claims.
+- **Verification caveat at `Char` and `List Char`** (a solver limit, not a
+  transpiler one — the milestone's deliverable is transpile fidelity). `Char`
+  *scalars* verify well: equality, ordering, `compare` and a `Nat → Char → Nat`
+  round-trip under a `n < 128` precondition are all `✅ Valid`
+  (`examples/haskell/CharOps.hs`, five `blaster` theorems). Concrete `List Char`
+  goals verify too (`['h','i'].length = 2`). But a goal quantified over a
+  **symbolic** `List Char` fails under bare `by blaster` with
+  `Inductive datatype with instance parameters not supported: 'BitVec`
+  (measured on four goal shapes), and so does anything forcing `Char`'s
+  `val : UInt32` representation (`c.toNat < 0x110000`). Wrapping the goal in
+  `induction` rescues *some* of these but not all: it closes
+  `(cs ++ ['!']).length = cs.length + 1` in both branches, yet on
+  `StringBasics`'s own `shout_len` it closes `nil` and hits the same `BitVec`
+  error in `cons` — which is why that fixture proves it by `simp`. So string
+  properties should prefer `rfl`/`simp`. `by decide` is not an alternative at
+  `Char`: it cannot quantify over it at all (`failed to synthesize Decidable
+  (∀ (c : Char), …)`), though concrete `Char` data decides fine.

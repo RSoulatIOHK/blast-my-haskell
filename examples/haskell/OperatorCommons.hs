@@ -31,5 +31,10 @@ module OperatorCommons where
     [lean|
     theorem list_concatenation_length :
         ∀ (l1 l2 : List Int),
-        List.length (listConcat l1 l2) = List.length l1 + List.length l2 := by blaster
+        List.length (listConcat l1 l2) = List.length l1 + List.length l2 := by
+            intro l1 l2
+            induction l1 with
+            | nil => blaster
+            | cons hd tl ih => blaster
+
     |]
