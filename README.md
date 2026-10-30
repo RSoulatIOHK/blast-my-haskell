@@ -99,6 +99,9 @@ automatically the first time you run `transpile.sh` (it stages them in a sandbox
 # Opt into trusting Blaster's SMT results, which have no reconstructed proof.
 ./verify.sh examples/haskell/Arithmetic.hs --trust-smt
 
+# Verify the data-ordlist pilot with Blaster trusted for generic list laws.
+./verify.sh tests/pilot/data-ordlist/OrderedPilot.hs --semantics conservative --trust-smt
+
 # Machine-readable result; exit 0 only when the selected policy accepts it.
 ./verify.sh tests/fixtures/verification/PureInteger.hs --json
 ```
