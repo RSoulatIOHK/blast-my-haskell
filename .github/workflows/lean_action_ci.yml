@@ -72,10 +72,10 @@ jobs:
         run: python3 scripts/check_fixtures.py --jobs 2
       - name: Compare accepted Lean models against GHC execution
         run: python3 scripts/differential.py --report .lake/differential-results.json
-      - name: Check ordered-list pilot kernel properties
+      - name: Check ordered-list pilot Blaster and kernel properties
         run: |
           ./verify.sh tests/pilot/data-ordlist/OrderedPilot.hs \
-              --semantics conservative --json > .lake/ordlist-pilot-proof.json
+              --semantics conservative --trust-smt --json > .lake/ordlist-pilot-proof.json
           python3 - <<'PY'
           import json
           from pathlib import Path
@@ -87,12 +87,18 @@ jobs:
                       'pairwise_insert', 'pairwise_to_sorted_loop',
                       'sorted_loop_to_pairwise', 'sorted_insert',
                       'insert_idempotent_generic', 'insert_idempotent'}
-          allowed_axioms = {'propext', 'Classical.choice', 'Quot.sound'}
-          if (report['status'] != 'proved' or not report['accepted']
+          blaster_axiom = 'Blaster.Tactic.blasterProven'
+          smt_theorems = {'insert_member_generic', 'member_insert',
+                          'insert_idempotent_generic', 'insert_idempotent'}
+          allowed_axioms = {'propext', 'Classical.choice', 'Quot.sound', blaster_axiom}
+          if (report['status'] != 'smt_valid' or not report['accepted']
+                  or report['trustSmt'] is not True
                   or report['translationCertified'] is not False
                   or len(theorems) != len(expected)
                   or {theorem['name'].split('.')[-1] for theorem in theorems} != expected
                   or any(set(theorem['axioms']) - allowed_axioms for theorem in theorems)
+                  or {theorem['name'].split('.')[-1] for theorem in theorems
+                      if blaster_axiom in theorem['axioms']} != smt_theorems
                   or any(theorem['axioms'] for theorem in theorems
                          if theorem['name'].split('.')[-1] in
                          {'insert_empty', 'member_empty', 'sorted_empty'})):

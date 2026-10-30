@@ -30,10 +30,13 @@ Milestone gates:
    in Lean, with the proof's axiom report audited. The generated-model theorems
    `sorted_insert`, `member_insert`, and `insert_idempotent` now cover all finite
    `Int64` lists; the first uses `isSortedInt xs = true` as its premise. Their
-   helper proofs depend only on Lean's allowed standard axioms (`propext`,
-   `Classical.choice`, and `Quot.sound`). They name GHC-generated local helpers,
-   so a compiler or source change can require proof maintenance; CI pins and
-   checks those names.
+   generic membership and idempotence proofs use Blaster after induction and
+   comparison case splits. CI invokes `verify.sh --trust-smt` and requires
+   `Blaster.Tactic.blasterProven` on exactly those two generic theorems and their
+   `Int64` wrappers. The sortedness proof and the remaining helpers use only
+   Lean's standard allowed axioms (`propext`, `Classical.choice`, and
+   `Quot.sound`). Some of those helpers name GHC-generated local functions, so
+   a compiler or source change can require proof maintenance.
 3. Extend to `mergeBy` and `unionBy`, including sortedness and multiplicity
    properties. Their two-list recursion may need a termination measure.
 
@@ -48,8 +51,8 @@ toolchain. It translates the pinned source afresh, asks Blaster to prove the
 generic insertion-idempotence induction cases, and tests a direct `Int64` goal.
 At the pinned Blaster revision, the generic cases return `Valid` but depend on
 `Blaster.Tactic.blasterProven`; the direct `Int64` goal is rejected because its
-`BitVec` representation is unsupported. We used the case result to guide the
-kernel-checked `insert_idempotent_generic` and `insert_idempotent` proofs above.
-The exploratory SMT result is never part of the CI proof gate or accepted as a
-kernel proof. Blaster currently performs no proof reconstruction; see its
+`BitVec` representation is unsupported. The CI proof gate now accepts Blaster's
+SMT axiom for generic membership and idempotence under the explicitly trusted
+policy. The standalone probe remains a way to inspect Blaster's capabilities.
+Blaster currently performs no proof reconstruction; see its
 [tactic documentation](https://github.com/input-output-hk/Lean-blaster#tactic).

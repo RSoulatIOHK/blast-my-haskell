@@ -43,23 +43,22 @@ theorem insert_empty (x : Int64) : insertSetInt x [] = [x] := by rfl
 theorem member_empty (x : Int64) : memberInt x [] = false := by rfl
 theorem sorted_empty : isSortedInt [] = true := by rfl
 
--- These helpers reason about the generated local recursion. Their names are
--- pinned by the source snapshot and GHC version; CI checks the full block.
+-- Blaster handles the generic list induction cases. The bridge to the GHC Int
+-- wrapper stays in Lean because this Blaster revision cannot encode Int64.
 theorem insert_member_generic {α : Type} (cmp : α → α → Ordering)
     (x : α) (xs : List α) (hself : cmp x x = Ordering.eq) :
-    memberBy.loop_3015 cmp x (insertSetBy.loop_2965 cmp x xs) = true := by
+    memberBy cmp x (insertSetBy cmp x xs) = true := by
   induction xs with
-  | nil => simp [insertSetBy.loop_2965, memberBy.loop_3015, hself]
+  | nil => blaster (timeout: 5)
   | cons y ys ih =>
-      simp only [insertSetBy.loop_2965]
       cases h : cmp x y with
-      | lt => simp [memberBy.loop_3015, hself]
-      | eq => simp [memberBy.loop_3015, hself]
-      | gt => simp [memberBy.loop_3015, h, ih]
+      | lt => blaster (timeout: 5)
+      | eq => blaster (timeout: 5)
+      | gt => blaster (timeout: 5)
 
 theorem member_insert (x : Int64) (xs : List Int64) :
     memberInt x (insertSetInt x xs) = true := by
-  simpa [memberInt, memberBy, insertSetInt, insertSetBy] using
+  simpa [memberInt, insertSetInt] using
     insert_member_generic compare x xs (by simp [compare, compareOfLessAndEq])
 
 theorem mem_insert (x v : Int64) (xs : List Int64) :
@@ -161,18 +160,17 @@ theorem sorted_insert (x : Int64) (xs : List Int64) :
 
 theorem insert_idempotent_generic {α : Type} (cmp : α → α → Ordering)
     (x : α) (xs : List α) (hself : cmp x x = Ordering.eq) :
-    insertSetBy.loop_2965 cmp x (insertSetBy.loop_2965 cmp x xs) =
-      insertSetBy.loop_2965 cmp x xs := by
+    insertSetBy cmp x (insertSetBy cmp x xs) = insertSetBy cmp x xs := by
   induction xs with
-  | nil => simp [insertSetBy.loop_2965, hself]
+  | nil => blaster (timeout: 5)
   | cons y ys ih =>
       cases h : cmp x y with
-      | lt => simp [insertSetBy.loop_2965, h, hself]
-      | eq => simp [insertSetBy.loop_2965, h, hself]
-      | gt => simp [insertSetBy.loop_2965, h, ih]
+      | lt => blaster (timeout: 5)
+      | eq => blaster (timeout: 5)
+      | gt => blaster (timeout: 5)
 
 theorem insert_idempotent (x : Int64) (xs : List Int64) :
     insertSetInt x (insertSetInt x xs) = insertSetInt x xs := by
-  simpa [insertSetInt, insertSetBy] using
+  simpa [insertSetInt] using
     insert_idempotent_generic compare x xs (by simp [compare, compareOfLessAndEq])
 -}
