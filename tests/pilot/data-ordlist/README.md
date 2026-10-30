@@ -27,7 +27,12 @@ Milestone gates:
 1. Translate this source slice under conservative semantics with no warnings or
    admissions; compare its `Int` wrappers against the same GHC source in CI.
 2. Prove sortedness preservation and membership for insertion into a sorted set
-   in Lean, with the proof's axiom report audited.
+   in Lean, with the proof's axiom report audited. The generated-model theorems
+   `sorted_insert` and `member_insert` now cover all finite `Int64` lists; the
+   first uses `isSortedInt xs = true` as its premise. Their helper proofs depend
+   only on Lean's allowed standard axioms (`propext`, `Classical.choice`, and
+   `Quot.sound`). They name GHC-generated local helpers, so a compiler or source
+   change can require proof maintenance; CI pins and checks those names.
 3. Extend to `mergeBy` and `unionBy`, including sortedness and multiplicity
    properties. Their two-list recursion may need a termination measure.
 

@@ -152,8 +152,8 @@ random seeds for machine `Int`, arbitrary precision `Integer`, Boolean
 comparisons, finite integer lists (including list inputs), and one imported module.
 The [data-ordlist pilot](../tests/pilot/data-ordlist/README.md) adds three
 source-exact ordered-list functions with monomorphic `Int` entry points. Its
-empty-list lemmas are kernel checked in CI; sortedness preservation and
-membership on general sorted inputs remain proof targets. A mismatch, missing
+empty-list lemmas, insertion membership, and sortedness preservation are kernel
+checked in CI for the generated Lean model. A mismatch, missing
 case, or translation error fails CI and saves the case-level report as an artifact.
 On a value mismatch, the runner also retains the generated Lean source under
 `.lake/differential-artifacts/<runId>/`; the report records its exact path.
