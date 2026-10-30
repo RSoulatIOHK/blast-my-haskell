@@ -1,8 +1,8 @@
 {
   "name": "ghccoretolean-vscode",
-  "displayName": "GHC Core \u2192 Lean Verifier",
-  "description": "Runs the GHC\u2192Lean spike pipeline on Haskell files and surfaces Blaster's verdicts as colour-coded wavy squiggles on the proven line (green = \u2705 Valid, red = \u274c Falsified) plus hover on the {- @lean ... -} annotation.",
-  "version": "0.5.0",
+  "displayName": "GHC Core → Lean Verifier",
+  "description": "Verifies Haskell annotations through the audited GHC Core → Lean CLI and shows proof assumptions and model results in the editor.",
+  "version": "0.5.3",
   "publisher": "iohk-spike",
   "private": true,
   "engines": {
@@ -19,48 +19,112 @@
     "commands": [
       {
         "command": "ghcCoreLean.verify",
-        "title": "Verify @lean annotations via Blaster",
-        "category": "GHC Core \u2192 Lean"
+        "title": "Verify @lean annotations",
+        "category": "GHC Core → Lean"
       },
       {
         "command": "ghcCoreLean.clearDiagnostics",
         "title": "Clear Lean diagnostics",
-        "category": "GHC Core \u2192 Lean"
+        "category": "GHC Core → Lean"
       },
       {
         "command": "ghcCoreLean.checkEnvironment",
         "title": "Check Environment",
-        "category": "GHC Core \u2192 Lean"
+        "category": "GHC Core → Lean"
+      },
+      {
+        "command": "ghcCoreLean.showOutput",
+        "title": "Show Verification Output",
+        "category": "GHC Core → Lean"
       }
     ],
     "configuration": {
-      "title": "GHC Core \u2192 Lean",
+      "title": "GHC Core → Lean",
       "properties": {
         "ghcCoreLean.scriptPath": {
           "type": "string",
           "default": "transpile.sh",
-          "description": "Path to transpile.sh, absolute or relative to the workspace root."
+          "description": "Path to transpile.sh, absolute or relative to the workspace root.",
+          "deprecationMessage": "Unused by the audited verifier. Configure ghcCoreLean.verifyScriptPath and ghcCoreLean.timeoutSeconds instead."
         },
         "ghcCoreLean.leanDiagnosticQuietMs": {
           "type": "number",
           "default": 2000,
-          "description": "Milliseconds of silence from the Lean LSP before considering the diagnostic stream stable."
+          "description": "Milliseconds of silence from the Lean LSP before considering the diagnostic stream stable.",
+          "deprecationMessage": "Unused by the audited verifier. Configure ghcCoreLean.verifyScriptPath and ghcCoreLean.timeoutSeconds instead."
         },
         "ghcCoreLean.leanDiagnosticTimeoutMs": {
           "type": "number",
           "default": 60000,
-          "description": "Maximum total wait time for Lean LSP diagnostics."
+          "description": "Maximum total wait time for Lean LSP diagnostics.",
+          "deprecationMessage": "Unused by the audited verifier. Configure ghcCoreLean.verifyScriptPath and ghcCoreLean.timeoutSeconds instead."
+        },
+        "ghcCoreLean.verifyScriptPath": {
+          "type": "string",
+          "default": "verify.sh",
+          "description": "Path to the audited verify.sh driver, absolute or relative to the Haskell file’s workspace folder. Must implement verifier JSON schema version 1.",
+          "scope": "resource"
+        },
+        "ghcCoreLean.semantics": {
+          "type": "string",
+          "enum": [
+            "conservative",
+            "approximate"
+          ],
+          "default": "conservative",
+          "description": "Conservative refuses known semantic approximations. Approximate enables existing mappings for exploration. Neither certifies the Haskell-to-Lean translation.",
+          "scope": "resource"
+        },
+        "ghcCoreLean.trustSmt": {
+          "type": "boolean",
+          "default": false,
+          "description": "Accept SMT results that depend on Blaster’s unreconstructed solver axiom. They remain amber and explicitly labelled SMT trusted. Does not accept sorry or arbitrary axioms.",
+          "scope": "resource"
+        },
+        "ghcCoreLean.timeoutSeconds": {
+          "type": "number",
+          "default": 600,
+          "exclusiveMinimum": 0,
+          "maximum": 86400,
+          "description": "Whole verification run time limit in seconds.",
+          "scope": "resource"
         }
       }
-    }
+    },
+    "languages": [
+      {
+        "id": "haskell",
+        "aliases": [
+          "Haskell",
+          "haskell"
+        ],
+        "extensions": [
+          ".hs"
+        ]
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test test/*.test.js",
+    "test:integration": "npm run compile && node --test test/integration/*.test.js",
+    "test:host": "npm run compile && node test/run-host.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.4.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Verification executes the workspace’s build scripts and Lean annotations."
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RSoulatIOHK/blast-my-haskell.git",
+    "directory": "vscode-extension"
   }
 }

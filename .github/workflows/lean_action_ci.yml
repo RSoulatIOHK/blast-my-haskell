@@ -27,6 +27,12 @@ jobs:
       - name: Check Z3 version
         run: z3 --version
       - uses: leanprover/lean-action@v1
+      - name: Build library, unit tests, and executable explicitly
+        run: lake build GhcCoreToLean ghccoretolean
+      - name: Require the pinned, clean Blaster checkout
+        run: python3 scripts/check_dependencies.py
+      - name: Test verification result policy and orchestration
+        run: python3 -m unittest discover -s tests -v
 
   examples:
     runs-on: ubuntu-latest
@@ -57,19 +63,92 @@ jobs:
           lake --version
           z3 --version
       - name: Build transpiler
-        run: lake build ghccoretolean
+        run: lake build GhcCoreToLean ghccoretolean
+      - name: Require the pinned, clean Blaster checkout
+        run: python3 scripts/check_dependencies.py
       - name: Build shim
         run: cd shim && cabal build
-      - name: Verify Haskell examples
+      - name: Check classified Haskell fixtures (including expected failures)
+        run: python3 scripts/check_fixtures.py --jobs 2
+      - name: Compare accepted Lean models against GHC execution
+        run: python3 scripts/differential.py --report .lake/differential-results.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - run: npm ci
+        working-directory: vscode-extension
+      - name: Verify CLI protocol through the editor runner
+        run: npm run test:integration
+        working-directory: vscode-extension
+      - name: Prove the fidelity gate rejects a wrong arithmetic mapping
         run: |
-          find examples/haskell -name '*.hs' -print | sort | while read -r src; do
-            mod="$(sed -nE 's/^[[:space:]]*module[[:space:]]+([A-Z][A-Za-z0-9_.]*).*/\1/p' "$src" | head -n 1)"
-            if [ -z "$mod" ]; then
-              echo "Could not determine module name for $src" >&2
-              exit 1
-            fi
-            echo "::group::${src}"
-            ./transpile.sh "$src"
-            lake build "GhcCoreToLean.Generated.${mod}"
-            echo "::endgroup::"
-          done
+          python3 scripts/differential.py \
+              --config tests/differential-canary.json \
+              --report .lake/differential-canary-baseline.json
+          trap 'git restore GhcCoreToLean/Maps.lean GhcCoreToLean.lean' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('GhcCoreToLean/Maps.lean')
+          original = '| "GHC.Num.+"     | "+"  => some "(· + ·)"'
+          mutated = '| "GHC.Num.+"     | "+"  => some "(· - ·)"'
+          text = path.read_text()
+          if text.count(original) != 1:
+              raise SystemExit('Addition mapping changed; update the fidelity canary')
+          path.write_text(text.replace(original, mutated, 1))
+          # Normal CI already built and checked Unit. The canary must recompile
+          # production code without the guards asserting the original mapping.
+          root = Path('GhcCoreToLean.lean')
+          text = root.read_text()
+          unit_import = 'import GhcCoreToLean.Tests.Unit\n'
+          if text.count(unit_import) != 1:
+              raise SystemExit('Library imports changed; update the fidelity canary')
+          root.write_text(text.replace(unit_import, '', 1))
+          PY
+          lake build ghccoretolean
+          if python3 scripts/differential.py \
+              --config tests/differential-canary.json \
+              --report .lake/differential-canary-results.json; then
+            echo 'Wrong addition mapping passed the differential gate' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('.lake/differential-canary-results.json').read_text())
+          suites = report.get('suites', [])
+          if (report.get('status') != 'failed' or report.get('phase') != 'complete'
+                  or report.get('sampleCount') != 1 or report.get('matchedCount') != 0
+                  or len(suites) != 1 or suites[0].get('status') != 'mismatch'
+                  or len(suites[0].get('cases', [])) != 1
+                  or suites[0]['cases'][0].get('status') != 'mismatch'
+                  or suites[0]['cases'][0].get('ghc') != '3'
+                  or suites[0]['cases'][0].get('lean') != '1'
+                  or not Path(suites[0].get('generatedLeanPath', '')).is_file()):
+              raise SystemExit('Canary failed for a reason other than GHC/Lean divergence')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-results
+          path: |
+            .lake/verification-results.json
+            .lake/differential-results.json
+            .lake/differential-canary-baseline.json
+            .lake/differential-canary-results.json
+            .lake/differential-artifacts/
+
+  extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - run: npm ci
+        working-directory: vscode-extension
+      - run: npm test
+        working-directory: vscode-extension
