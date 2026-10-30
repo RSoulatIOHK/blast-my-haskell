@@ -149,8 +149,12 @@ The differential gate runs Haskell functions with pinned GHC 9.2.7 and compares
 their outputs with the freshly translated Lean definitions under conservative
 semantics. `tests/differential.json` records boundary cases and deterministic
 random seeds for machine `Int`, arbitrary precision `Integer`, Boolean
-comparisons, finite integer lists, and one imported module. A mismatch, missing case, or
-translation error fails CI and saves the case-level report as an artifact.
+comparisons, finite integer lists (including list inputs), and one imported module.
+The [data-ordlist pilot](../tests/pilot/data-ordlist/README.md) adds three
+source-exact ordered-list functions with monomorphic `Int` entry points. Its
+empty-list lemmas are kernel checked in CI; sortedness preservation and
+membership on general sorted inputs remain proof targets. A mismatch, missing
+case, or translation error fails CI and saves the case-level report as an artifact.
 On a value mismatch, the runner also retains the generated Lean source under
 `.lake/differential-artifacts/<runId>/`; the report records its exact path.
 CI also replaces the `GHC.Num.+` mapping with subtraction in its disposable checkout,

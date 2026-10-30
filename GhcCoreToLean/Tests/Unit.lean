@@ -386,6 +386,7 @@ def totalBind : Bind :=
 -- case the dump point ever moves — see the Maps.lean comment.
 #guard valueMap "GHC.Base.build"   == some "(fun g => g List.cons List.nil)"
 #guard valueMap "GHC.Base.augment" == some "(fun g xs => g List.cons xs)"
+#guard dataConMap "GHC.Types.:" == some "List.cons"
 
 -- Semantic pins: the mapped lambdas applied to a real cons-builder must
 -- produce the literal list. Catches a wrong-but-intended mapping, which the

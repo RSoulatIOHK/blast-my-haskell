@@ -21,7 +21,7 @@ from pipeline import (REPO, PipelineError, atomic_write, cancel_on_termination,
 
 INT64_MIN = -(1 << 63)
 INT64_MAX = (1 << 63) - 1
-ARGUMENT_KINDS = {"int64", "integer"}
+ARGUMENT_KINDS = {"int64", "integer", "int64-list"}
 RESULT_KINDS = {"int64", "integer", "bool", "int64-list", "integer-list", "int64-pair"}
 NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_']*$")
 MODULE = re.compile(r"^[A-Z][A-Za-z0-9_]*(?:\.[A-Z][A-Za-z0-9_]*)*$")
@@ -42,7 +42,13 @@ def boundary_vectors(arity: int) -> list[list[int]]:
     raise ValueError("Boundary generation supports unary and binary operations")
 
 
-def _validate_value(value: object, kind: str, where: str) -> int:
+def _validate_value(value: object, kind: str, where: str) -> int | list[int]:
+    if kind == "int64-list":
+        if not isinstance(value, list):
+            raise ValueError(f"{where} must be a list")
+        for index, element in enumerate(value):
+            _validate_value(element, "int64", f"{where}[{index}]")
+        return value
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{where} must be an integer")
     if kind == "int64" and not INT64_MIN <= value <= INT64_MAX:
@@ -146,8 +152,16 @@ def expand_cases(config: dict, suite: dict) -> list[dict]:
     return cases
 
 
-def _literal(value: int) -> str:
+def _number_literal(value: int) -> str:
     return f"({value})" if value < 0 else str(value)
+
+
+def _literal(value: int | list[int], kind: str) -> str:
+    if kind == "int64-list":
+        assert isinstance(value, list)
+        return "[" + ", ".join(_number_literal(element) for element in value) + "]"
+    assert isinstance(value, int)
+    return _number_literal(value)
 
 
 def _string(value: str) -> str:
@@ -158,7 +172,7 @@ def haskell_runner(module: str, cases: list[dict]) -> str:
     lines = ["module Main where", "", f"import qualified {module} as Subject", "", "main :: IO ()", "main = do"]
     for case in cases:
         expression = "Subject." + case["function"] + " " + " ".join(
-            _literal(value) for value in case["inputs"])
+            _literal(value, kind) for value, kind in zip(case["inputs"], case["arguments"]))
         lines.append(f"  putStrLn ({_string(case['id'] + chr(9))} ++ show ({expression}))")
     return "\n".join(lines) + "\n"
 
@@ -192,7 +206,7 @@ def lean_runner(module: str, cases: list[dict]) -> str:
     ]
     for case in cases:
         expression = module + "." + case["function"] + " " + " ".join(
-            _literal(value) for value in case["inputs"])
+            _literal(value, kind) for value, kind in zip(case["inputs"], case["arguments"]))
         rendered = LEAN_RENDERERS[case["result"]]
         lines.append(f"  IO.println ({_string(case['id'] + chr(9))} ++ {rendered} ({expression}))")
     return "\n".join(lines) + "\n"
