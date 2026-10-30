@@ -82,12 +82,19 @@ jobs:
           report = json.loads(Path('.lake/ordlist-pilot-proof.json').read_text())
           theorems = [theorem for module in report['modules']
                       for block in module['properties'] for theorem in block['theorems']]
-          expected = {'insert_empty', 'member_empty', 'sorted_empty'}
+          expected = {'insert_empty', 'member_empty', 'sorted_empty',
+                      'insert_member_generic', 'member_insert', 'mem_insert',
+                      'pairwise_insert', 'pairwise_to_sorted_loop',
+                      'sorted_loop_to_pairwise', 'sorted_insert'}
+          allowed_axioms = {'propext', 'Classical.choice', 'Quot.sound'}
           if (report['status'] != 'proved' or not report['accepted']
                   or report['translationCertified'] is not False
                   or len(theorems) != len(expected)
                   or {theorem['name'].split('.')[-1] for theorem in theorems} != expected
-                  or any(theorem['axioms'] for theorem in theorems)):
+                  or any(set(theorem['axioms']) - allowed_axioms for theorem in theorems)
+                  or any(theorem['axioms'] for theorem in theorems
+                         if theorem['name'].split('.')[-1] in
+                         {'insert_empty', 'member_empty', 'sorted_empty'})):
               raise SystemExit('Ordered-list pilot proof gate failed')
           PY
       - uses: actions/setup-node@v4
