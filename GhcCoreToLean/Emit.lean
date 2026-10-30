@@ -2081,8 +2081,8 @@ six-shape probe recorded in the `M3 Task 6` block of `Tests/Unit.lean`:
 
 * **tag primops** (`usesTagPrim`, as `derivedEqTypes` uses for `Eq`) — GHC's
   DERIVED `compare` on a multi-constructor type is `case dataToTag# a of … `,
-  untranslatable, so it routes to `deriving Ord`. A hand-written body never
-  contains one (probed: even `compare a b = compare (fromEnum b) (fromEnum a)`
+  untranslatable, so it routes to `deriving Ord`. The ordinary hand-written
+  bodies probed did not contain one: even `compare a b = compare (fromEnum b) (fromEnum a)`
   keeps the primop inside `$cfromEnum`, since nothing inlines at `-O0`).
 * **a Rec group with the dictionary builder** — GHC emits a method body that
   depends on the instance's OWN dictionary inside `Rec [$fOrdT, …]`, the same
@@ -2124,13 +2124,13 @@ by a different key.
 
 THE TWO MISCLASSIFICATION DIRECTIONS, both pinned in `Tests/Unit.lean`:
 
-* **hand-written read as DERIVED** (the silent-wrong direction) is closed for every
-  body GHC generates from ordinary Haskell, because the only way a tag primop
-  reaches a `$ccompare` body at `-O0` is a LITERAL `dataToTag#` in user source.
+* **hand-written read as DERIVED** (the silent-wrong direction) is closed for the
+  ordinary bodies probed. A tag primop can reach a `$ccompare` body at `-O0`
+  through a LITERAL `dataToTag#` in user source.
   That residual is real and MEASURED (`{-# LANGUAGE MagicHash #-}` +
   `compare a b = compare (I# (dataToTag# b)) (I# (dataToTag# a))` ⇒ `tagprim=True`
-  in the dump), not hypothetical; it stays silent-wrong, no worse than the
-  pre-task state where every hand-written `Ord` was. Closing it needs instance
+  in the dump), not hypothetical; it stays silent-wrong in approximate mode,
+  while conservative mode refuses every local `Ord` instance. Closing it needs instance
   ORIGIN from the decl-plugin (the same extension M2 named for `deriving` on a
   newtype); a shape test on the derived body was rejected as fragile — a
   false negative there would make working derived enums loud.
@@ -2192,8 +2192,9 @@ Three reasons, in increasing strength:
   `decide (a < b)` is `error: failed to synthesize Decidable (a < b)`. So a
   hand-written `<` body cannot become the `LT` instance without breaking every
   `<` at that type; `ltOfOrd` off `compare` is the only shape that works.
-* Lean is then MORE lawful than a law-violating Haskell instance (Task 3's framing),
-  which is a defensible place to land rather than a compromise.
+* This is an approximation even when the Haskell instance violates the usual
+  `Ord` laws. Conservative verification refuses local `Ord` instances rather
+  than treating that change in behavior as a faithful translation.
 
 A user who defines BOTH `compare` and `<` gets the `compare` one. A user who defines
 `<` (or `<=`) ONLY has no `compare` of their own at all: the default lands in that

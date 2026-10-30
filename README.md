@@ -335,11 +335,11 @@ Development Host.)
   non-structural equality like Ratio's cross-multiply is preserved); derived
   `Eq`/`Ord` are reconstructed via Lean `deriving DecidableEq, Ord` plus
   `LE`/`LT`/`Min`/`Max`, so user types with `deriving (Eq, Ord)` support
-  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` is now
-  **preserved** — the old limitation ("would be modeled structurally") is
-  closed. The route is chosen per instance by whether the `$ccompare` body
-  contains a constructor-tag primop (`dataToTag#`/`tagToEnum#`): GHC emits one
-  only in a *derived* `compare`, and only for a type with ≥3 nullary
+  `==`/`<=`/`<`/`min`/`max`. A hand-written *non-structural* `Ord` is usually
+  preserved in approximate mode. The route is chosen per instance by whether
+  the `$ccompare` body contains a constructor-tag primop (`dataToTag#`/
+  `tagToEnum#`): GHC normally emits
+  one in a *derived* `compare` for a type with ≥3 nullary
   constructors, so those take Lean's `deriving Ord` while every other shape —
   hand-written, and derived on a type with ≤2 nullary constructors — is emitted
   from its own body, with `<`/`<=`/`min`/`max` derived from that `compare` in
