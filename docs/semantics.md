@@ -52,6 +52,15 @@ assumptions, not Lean proof axioms. Passing the gate cannot establish the
 implication above. Differential comparisons against GHC provide sampled
 evidence for individual mappings, not a proof for all inputs or programs.
 
+Local `Eq` and `Ord` instances are refused in conservative mode. GHC allows
+their methods to disagree (`==` with `/=`, or `compare` with `<`, `<=`, `min`,
+and `max`). The current Lean emitter derives companion operations from one
+method, and its constructor-tag heuristic cannot reliably distinguish a
+derived instance from user-written `dataToTag#`. Approximate mode retains those
+translations for experimentation; a Lean proof there is a proof of that model.
+Method types with type variables outside their class parameters are also refused:
+the declaration plugin currently erases method-local quantifiers and constraints.
+
 Imported Haskell definitions and instance dictionaries are in the source
 semantics and must be translated with the same identities and behavior as at
 the call site. Until typed identity and dictionary preservation exist, this is

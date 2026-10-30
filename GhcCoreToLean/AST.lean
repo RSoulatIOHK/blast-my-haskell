@@ -153,6 +153,9 @@ structure ClassMethod where
       indistinguishable from an ordinary top-level bind there. Consumed by M3
       Task 4. -/
   hasDefault : Bool := false
+  /-- The decl plugin discarded a method-local quantifier or constraint from
+      this signature. Conservative verification must refuse the class. -/
+  hasUnsupportedSignature : Bool := false
 deriving Repr, Inhabited
 
 /-- A user type class's *shape*.

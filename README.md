@@ -342,7 +342,11 @@ Development Host.)
   only in a *derived* `compare`, and only for a type with ≥3 nullary
   constructors, so those take Lean's `deriving Ord` while every other shape —
   hand-written, and derived on a type with ≤2 nullary constructors — is emitted
-  from its own body, with `<`/`<=`/`min`/`max` derived from that `compare`. An
+  from its own body, with `<`/`<=`/`min`/`max` derived from that `compare` in
+  **approximate mode**. Conservative mode refuses locally declared `Eq` and `Ord`
+  instances because GHC permits their methods to disagree and the current
+  translation can drop those overrides. Instance origin and method preservation
+  are required before admitting them as a verified source model. An
   instance defining both `compare` and a *disagreeing* `<` keeps the `compare`
   one: Lean resolves `Decidable (a < b)` only through `ltOfOrd`, so there is
   nowhere to wire a separate `<`. `Show`/`Read` are skipped (derived `Repr`
