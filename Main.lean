@@ -158,7 +158,7 @@ def loadSpecs (moduleName : Option String) : IO (List (Nat × Nat × String)) :=
 def runTranspile (input : System.FilePath) (output : System.FilePath)
     (moduleName : Option String) : IO UInt32 := do
   let src ← IO.FS.readFile input
-  match parseProgramFromString src with
+  match parseVersionedProgramFromString src moduleName with
   | .error msg =>
     IO.eprintln s!"parse error: {msg}"
     pure 1
@@ -213,19 +213,38 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for v in ntViolations do
         IO.eprintln s!"error: {Emit.newtypeInstanceError prog.typeDecls v extNts}"
       return 1
-    -- Publish this module's own erasable newtypes for its dependents. After the
-    -- guard: a refused module aborts the whole pipeline (`transpile.sh` runs under
-    -- `set -e`), so no dependent can read the file this run either way.
-    writeNewtypeExports prog.typeDecls
     let userBinds := prog.binds.filterMap (keepBinding prog.instances)
-    let lowered   := Lower.lowerProgram userBinds
+    let usesMachineInt := Safety.usesType "Int" { prog with binds := userBinds }
+    let usesInteger := Safety.usesType "Integer" { prog with binds := userBinds }
+    let semantics ← IO.getEnv "GHCCORE_SEMANTICS"
+    if semantics == some "conservative" then
+      if (← IO.getEnv "GHCCORE_INT_BITS") != some "64" then
+        IO.eprintln
+          "error: [target-int-width] conservative Int semantics require a measured 64-bit GHC target"
+        return 1
+      let issues := Safety.check { prog with binds := userBinds }
+      if !issues.isEmpty then
+        for issue in issues do
+          IO.eprintln s!"error: [{issue.code}] {issue.owner}: {issue.detail}"
+        return 1
+    else if semantics != none && semantics != some "approximate" then
+      IO.eprintln "error: GHCCORE_SEMANTICS must be conservative or approximate"
+      return 1
+    let exactMachineInts := semantics == some "conservative"
+    let selected := Lower.machineInts exactMachineInts
+      { prog with binds := userBinds, rawBinds := userBinds }
+    -- Publish newtype substitutions in the selected semantic model. In
+    -- particular, `newtype Age = Age Int` must export `Int64` to dependents in
+    -- conservative mode and `Int` in approximate mode.
+    writeNewtypeExports selected.typeDecls
+    let lowered   := Lower.lowerProgram selected.binds
     -- `rawBinds` is the SAME bind list pre-`Lower`, set explicitly rather than
     -- left to the field's default so the invariant is "same filtering, only the
     -- erasure differs". `Emit` needs it because `Lower` erases the type
     -- application (`== @T $fEqT a b` ⇒ `== a b`) that is the only exact record of
     -- the type a class op is instantiated at — see `Program.rawBinds` and
     -- `Emit.classOpHeadTy`. Emission still runs off `binds`.
-    let userProg  : Program := { prog with binds := lowered, rawBinds := userBinds }
+    let userProg  : Program := { selected with binds := lowered }
     -- Refuse a method name declared by two classes: Core references a class
     -- method by its BARE name, so every call site would be qualified with
     -- whichever class the instance dump listed first — typechecks, dispatches to
@@ -333,6 +352,11 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     -- Per BLOCK (each block is resolved separately below, so a desync cannot
     -- cross one), and every offending block is named before the return.
     let specs ← loadSpecs moduleName
+    if exactMachineInts && usesMachineInt && usesInteger &&
+        specs.any (fun (_, _, raw) => Emit.containsBareIdent "Int" raw.trim) then
+      IO.eprintln
+        "error: [ambiguous-int-spec] this module uses both Haskell Int and Integer; write Int64 for Haskell Int and Int for Haskell Integer in @lean blocks"
+      return 1
     let desyncBlocks := specs.filterMap fun (hsStart, hsEnd, raw) =>
       match Emit.desyncCapableSpecForms raw.trim with
       | []    => none
@@ -430,28 +454,33 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
     let crib      := emitNamesCrib ext.datas extNts userProg
     -- Wrap the emitted defs in a `namespace <module>` so user bindings that
     -- shadow Lean builtins (e.g. an Int-typed `min`/`max`) resolve to the
-    -- local def rather than colliding with `Min.min`/`Max.max`. The matching
-    -- `end <module>` is appended by transpile.sh; the specs are emitted by the
-    -- transpiler below, inside this namespace.
+    -- local def rather than colliding with `Min.min`/`Max.max`. This executable
+    -- also closes the namespace, so its output is independently elaboratable.
     let nsOpen := match moduleName with
       | some m => s!"namespace {m}\n\n"
       | none   => ""
     -- `import` lines for transpiled dependencies precede the namespace.
     let imports    ← loadLeanImports
     let depImports := String.join (imports.map (s!"import {·}\n"))
-    let header     := s!"import Lean\nimport Blaster\nimport GhcCoreToLean.Runtime\n{depImports}\n"
-    let pre := header ++ nsOpen ++ crib ++ body ++ "\n"
+    let audit := (← IO.getEnv "GHCCORE_AUDIT") == some "1"
+    let auditImport := if audit then "import GhcCoreToLean.Audit\n" else ""
+    let header     := s!"import Lean\nimport Blaster\nimport Std.Tactic.BVDecide\nimport Init.Data.SInt.Lemmas\nimport GhcCoreToLean.Runtime\n{auditImport}{depImports}\n"
+    let options := if audit then "set_option autoImplicit false\n\n" else ""
+    let pre := header ++ options ++ nsOpen ++ crib ++ body ++ "\n"
     let mut out := pre
     let mut leanCursor := (pre.splitOn "\n").length
     let mut blocks : List (Nat × Nat × Nat × Nat) := []   -- hsS hsE leanS leanE
     for (hsStart, hsEnd, raw) in specs do
       let resolved := Emit.resolveSpecText userProg.typeDecls ext.datas raw.trim extNts
+        (exactMachineInts && usesMachineInt)
       let nLines   := (resolved.splitOn "\n").length
       let leanS    := leanCursor + 1
       let leanE    := leanS + nLines - 1
       out := out ++ "\n" ++ resolved ++ "\n"
       blocks := (hsStart, hsEnd, leanS, leanE) :: blocks
       leanCursor := leanCursor + 1 + nLines
+    if audit then out := out ++ "\n#ghc_audit\n"
+    if let some m := moduleName then out := out ++ s!"\nend {m}\n"
     IO.FS.writeFile output out
     let blockJson := String.intercalate ",\n    " (blocks.reverse.map fun (hs, he, ls, le) =>
       s!"\{ \"hs\": [{hs}, {he}], \"lean\": [{ls}, {le}] }")

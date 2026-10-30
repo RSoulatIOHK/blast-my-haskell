@@ -4,6 +4,11 @@ Transpile a Haskell module to **Lean 4** by way of its **GHC Core**, and verify
 properties you embed in the Haskell source with the [Blaster](https://github.com/input-output-hk/Lean-blaster)
 SMT tactic.
 
+Verification currently establishes properties of a **translated Lean model**;
+translation correctness is not certified. Use `./verify.sh` for completed checks
+with explicit proof assumptions. Its default conservative policy refuses known
+semantic approximations. `transpile.sh` remains available for model exploration.
+
 You write ordinary Haskell plus a few property annotations:
 
 ```haskell
@@ -82,11 +87,36 @@ automatically the first time you run `transpile.sh` (it stages them in a sandbox
 ## Usage
 
 ```bash
+# Check a mathematical-Integer example with an ordinary Lean proof.
+./verify.sh tests/fixtures/verification/PureInteger.hs
+
+# Check exact 64-bit Haskell Int overflow with an audited Lean proof.
+./verify.sh tests/fixtures/verification/Overflow.hs
+
+# Check strings and their exact machine-Int lengths.
+./verify.sh examples/haskell/StringBasics.hs
+
+# Opt into trusting Blaster's SMT results, which have no reconstructed proof.
+./verify.sh examples/haskell/Arithmetic.hs --trust-smt
+
+# Machine-readable result; exit 0 only when the selected policy accepts it.
+./verify.sh tests/fixtures/verification/PureInteger.hs --json
+```
+
+The CLI builds and checks each local module in private temporary directories,
+audits theorem dependencies, and checks that sources did not change during the
+run. `proved` and `smt_valid` refer to the Lean model; `admitted`, `assumed`,
+missing properties, errors, and timeouts never count as accepted verification.
+See [verification policies and result format](docs/verification.md).
+
+To export Lean files for manual work:
+
+```bash
 # Transpile one module (and its local imports, transitively) to Lean.
 ./transpile.sh examples/haskell/Ratio.hs
 # → writes GhcCoreToLean/Generated/Ratio.lean (+ a .map.json sidecar)
 
-# Verify it (Blaster discharges each property; look for ✅ Valid).
+# Elaborate the exported model (this alone does not audit proof assumptions).
 lake build GhcCoreToLean.Generated.Ratio
 ```
 
@@ -120,9 +150,17 @@ theorem bar : ∀ (x : Int), f (g x) = x := by blaster
 ```
 
 Notes:
-- The text inside is **Lean 4**, proved `by blaster`. Haskell `Integer`/`Int`
-  both map to Lean `Int`; user data constructors are referenced as `T.C`
-  (e.g. `CustomRatio.CustomRatio`).
+- The text inside is **Lean 4**. Under the default conservative policy, Haskell
+  `Int` maps to wrapping Lean `Int64`, while Haskell `Integer` maps to Lean
+  `Int`. In a module that uses only Haskell `Int`, bare `Int` in an annotation
+  is rewritten to `Int64` for compatibility. A module using both types must
+  spell machine integers as `Int64` and mathematical integers as `Int`.
+- `simp` can unfold generated definitions, and `Int64.add_assoc` /
+  `Int64.add_comm` provide audited algebraic proofs. `bv_decide` is available,
+  but Lean 4.24 reports compiler-trust axioms for it, so the verifier classifies
+  such a theorem as `assumed` rather than accepting it silently.
+- User data constructors are referenced as `T.C` (for example,
+  `CustomRatio.CustomRatio`).
 - A property may range over **several** functions, not just one.
 - For **imported** symbols, qualify with the module **by hand** — nothing in the
   pipeline qualifies hand-written spec text. A value is `M.f`
@@ -152,16 +190,19 @@ verbatim. Must-fail fixture: `examples/haskell/SpecInterp.hs`.
 
 ## VS Code extension (optional)
 
-`vscode-extension/` provides a "verify" command that runs the pipeline and shows
-the outcome inline on your `.hs`: a gutter ✓/✗ on each property, a CodeLens
-(`✓ Valid` / `✗ Falsified — <counterexample>`) above it, and the full Lean
-diagnostic on hover.
+`vscode-extension/` runs the audited `verify.sh --json` command and shows results
+on each Haskell annotation with gutter icons, CodeLens, and hovers containing
+theorem axioms and Lean diagnostics. Green denotes a proved property in an
+accepted **Lean-model** run; SMT results remain amber and require explicit trust
+for acceptance. Edits and newer runs invalidate older results. The defaults
+are conservative semantics and no SMT trust; the Lean4 extension is optional.
+See the [extension guide](vscode-extension/README.md) for settings and examples.
 
 ```bash
 cd vscode-extension
 npm install
 npm run compile
-npx @vscode/vsce package --no-dependencies     # → ghccoretolean-vscode-<ver>.vsix
+npx @vscode/vsce package --no-dependencies --skip-license # → ghccoretolean-vscode-<ver>.vsix
 code --install-extension ghccoretolean-vscode-*.vsix --force
 # then reload the VS Code window
 ```
@@ -187,7 +228,10 @@ Development Host.)
 - Pinned to GHC 9.2.7 (the Core dump format and plugin API are version-specific)
   and Lean `v4.24.0`.
 - The pipeline consumes the `pass-0000` (desugarer) Core. Common unboxed
-  `Int#` primops are mapped; exotic primops (string/array/IO) are not.
+  `Int#` primops are mapped. Conservative verification gives ordinary `Int`
+  arithmetic, ranges, integral conversions, `gcd`/`lcm`, and statically safe
+  division exact 64-bit semantics. Dynamic or exceptional divisors are refused.
+  Exotic primops (string/array/IO) are not mapped.
 - Mapped `base` surface: arithmetic (`+ - * negate abs signum`),
   integral (`quot rem div mod divMod quotRem gcd lcm fromIntegral fromInteger`),
   comparison/`Ord` (`== /= < <= > >= min max compare`/`Ordering`), booleans
@@ -196,8 +240,10 @@ Development Host.)
   replicate zip zipWith unzip sum product all any and or elem notElem lookup
   concat concatMap`), list literals (`[a, b, c]`), list comprehensions
   (single- and multi-generator), `Int` ranges (`[a..b]`, `[a,b..c]` — the
-  zero-stride `[a,a..c]` with `c ≥ a` is infinite in Haskell and lowers to
-  `default`), 2-/3-/4-tuples (`fst snd`, construction, patterns), and
+  zero-stride `[a,a..c]` with `c ≥ a` is infinite in Haskell and the approximate
+  model lowers it to `[]`, which changes finite observations such as `take 1`;
+  conservative verification refuses stepped enumeration), 2-/3-/4-tuples
+  (`fst snd`, construction, patterns), and
   `Maybe`/`Either` eliminators
   (`maybe fromMaybe isJust isNothing either`). Local recursive `where`/`let`
   helpers emit as Lean `let rec` (structural recursion only).
@@ -265,7 +311,9 @@ Development Host.)
     range through Haskell's `chr`-based `Enum Char` — exactly the unfaithful
     direction above. Pin this before generalising.
 - `error`/`undefined` are ⊥ on their whole domain, so they lower to Lean
-  `default` (a total, sound bottom). The partial list/`Maybe` functions are ⊥
+  `default` in the approximate model. This does not establish preservation of
+  Haskell behavior; conservative verification refuses these operations until
+  their domains can be checked. The partial list/`Maybe` functions are ⊥
   on only *part* of their domain, so each lowers to a total Lean form that is
   faithful wherever Haskell is defined:
   - `head`, `last`, `maximum`, `minimum`, `fromJust` are ⊥ exactly on `[]` /

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "seed": 20261030,
+  "suites": [
+    {
+      "module": "Canary",
+      "source": "tests/differential/Canary.hs",
+      "operations": [
+        {"function": "inc", "arguments": ["int64"], "result": "int64", "vectors": [[2]]}
+      ]
+    }
+  ]
+}

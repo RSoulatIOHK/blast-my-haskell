@@ -11,12 +11,66 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 -- Sentinel: proves the harness builds and `#guard` failures break the build.
 #guard valueMap "GHC.Base.id" == some "id"
 
+-- Machine gcd must preserve the odd sign behavior caused by abs minBound
+-- wrapping; converting through mathematical Nat silently changes it.
+#guard Hs.gcdInt64 (-9223372036854775808) 9223372036854775807 == -1
+#guard Hs.gcdInt64 (-9223372036854775808) 0 == -9223372036854775808
+#guard Hs.lcmInt64 9223372036854775807 2 == 2
+
+-- Machine literals stay distinct from arbitrary-precision `LitInteger`, and
+-- the semantics selector changes both the binder type and literal together.
+def machineIntJson : Lean.Json :=
+  Lean.Json.mkObj [("tag", .str "LitMachineInt"), ("value", .num 7)]
+#guard match parseLiteral machineIntJson with
+  | .ok (.litMachineInt 7) => true
+  | _ => false
+
+def machineIntProgram : Program :=
+  { binds := [.nonRec
+      { name := "seven", unique := 1, ty := .tyCon "Int" [], role := .id }
+      (.lit (.litMachineInt 7))]
+    typeDecls := [], instances := [] }
+
+#guard match (GHCCore.Lower.machineInts true machineIntProgram).binds with
+  | [.nonRec v (.lit (.litMachineInt 7))] =>
+      match v.ty with
+      | .tyCon n [] => n == "$GhcCoreToLean.Int64"
+      | _ => false
+  | _ => false
+#guard match (GHCCore.Lower.machineInts false machineIntProgram).binds with
+  | [.nonRec v (.lit (.litInt 7))] => match v.ty with
+      | .tyCon n [] => n == "Int"
+      | _ => false
+  | _ => false
+#guard emitLiteral (.litMachineInt (-1)) == "(Int64.ofInt -1)"
+#guard replaceBareIdent "Int" "Int64"
+    "(x : Int) → Integer → MyInt → Foo.Int → \"Int\" -- Int\nInt" ==
+  "(x : Int64) → Integer → MyInt → Foo.Int → \"Int\" -- Int\nInt64"
+#guard containsBareIdent "Int" "∀ x : Int, x = x"
+#guard !containsBareIdent "Int" "Integer MyInt Foo.Int \"Int\" -- Int"
+
+def machineIntNewtype : DataDecl :=
+  { name := "Age", kind := "newtype", ctors := [
+      { name := "Age", fields := [{ name := "age", ty := .tyCon "Int" [] }] }] }
+#guard match (GHCCore.Lower.machineInts true
+    { binds := [], typeDecls := [machineIntNewtype], instances := [] }).typeDecls with
+  | [d] => newtypeSubsts [d] == [("Age", "Int64")]
+  | _ => false
+
 -- Task 1: total list/Prelude combinators
 #guard valueMap "GHC.Base.++"        == some "List.append"
 #guard valueMap "++"                 == some "List.append"
 #guard valueMap "GHC.Base.map"       == some "List.map"
 #guard valueMap "GHC.List.filter"    == some "List.filter"
 #guard valueMap "GHC.List.length"    == some "(fun xs => (List.length xs : Int))"
+#guard valueMap "$GhcCoreToLean.lengthInt64" ==
+  some "(fun xs => Int64.ofNat (List.length xs))"
+#guard valueMap "$GhcCoreToLean.ordInt64" == some "(fun c => Int64.ofNat c.toNat)"
+#guard valueMap "$GhcCoreToLean.splitAtInt64" == some "Hs.splitAtInt64"
+#guard valueMap "$GhcCoreToLean.takeInt64" ==
+  some "(fun n xs => List.take n.toNatClampNeg xs)"
+#guard valueMap "$GhcCoreToLean.dropInt64" ==
+  some "(fun n xs => List.drop n.toNatClampNeg xs)"
 #guard valueMap "GHC.List.reverse"   == some "List.reverse"
 #guard valueMap "GHC.List.null"      == some "List.isEmpty"
 #guard valueMap "GHC.List.foldr"     == some "(fun f z xs => List.foldr f z xs)"

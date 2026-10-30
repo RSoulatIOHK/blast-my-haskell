@@ -181,6 +181,7 @@ def escapeCharLit (c : Char) : String :=
   "'" ++ escapeLitChar c ++ "'"
 
 def emitLiteral : Literal → String
+  | .litMachineInt n => s!"(Int64.ofInt {n})"
   | .litInt n    => s!"({n} : Int)"
   | .litWord n   => s!"({n} : Nat)"
   | .litFloat f  => s!"({f} : Float)"
@@ -238,6 +239,7 @@ def emitLiteral : Literal → String
     the output. It is refused before emission (`unrepresentableCharLiterals` walks
     `LitAlt` as well as value position) and this arm is the backstop. -/
 def emitLiteralPattern : Literal → String
+  | .litMachineInt n => toString n
   | .litInt n    => toString n
   | .litWord n   => toString n
   | .litFloat f  => toString f
@@ -4191,6 +4193,31 @@ def specTextDesyncError (hsStart hsEnd : Nat) (forms : List String) : String :=
 def mapOutsideLiterals (f : String → String) (src : String) : String :=
   String.join ((litSegments src).map fun (isLit, s) => if isLit then s else f s)
 
+/-- Replace one complete Lean identifier in a CODE segment. This is used for
+    the source-spec image of Haskell's machine `Int`: it must not rewrite
+    `Integer`, `MyInt`, qualified names, strings, chars, or comments. -/
+def replaceBareIdentCode (bare replacement src : String) : String :=
+  match src.splitOn bare with
+  | [] => src
+  | first :: pieces =>
+    let rec go (pieces : List String) (acc : String) : String :=
+      match pieces with
+      | [] => acc
+      | next :: more =>
+        let leftOK := acc.isEmpty || !isIdentish acc.back
+        let rightOK := next.isEmpty || !isIdentish next.front
+        go more (acc ++ (if leftOK && rightOK then replacement else bare) ++ next)
+    go pieces first
+
+def replaceBareIdent (bare replacement src : String) : String :=
+  mapOutsideLiterals (replaceBareIdentCode bare replacement) src
+
+/-- Whether code (excluding literals and comments) contains a complete bare
+    identifier. Used to refuse ambiguous `Int` spelling in a module that also
+    contains Haskell `Integer`. -/
+def containsBareIdent (bare src : String) : Bool :=
+  replaceBareIdent bare "$GhcCoreToLean.found" src != src
+
 /-- THE RAW, LITERAL-UNAWARE rewrite. NOT for callers — use `replaceCtorApps`,
     which is this restricted to code segments. It stays public for one reason: the
     tests pin the silent-wrong behaviour it still has (the literal `"Point (1)"`
@@ -4695,8 +4722,9 @@ def sortInstances (classes : List ClassDecl) (is : List Instance) : List Instanc
     newtypes come FIRST in the substitution list, so a local decl shadows an
     imported entry of the same bare name. -/
 def resolveSpecText (typeDecls : List DataDecl) (extTypes : List (String × String))
-    (s : String) (extNts : List (Name × String) := []) : String :=
+    (s : String) (extNts : List (Name × String) := []) (machineInt : Bool := false) : String :=
   let kept := keptTypeDecls typeDecls
+  let s := if machineInt then replaceBareIdent "Int" "Int64" s else s
   resolveExternalTypes extTypes
     (resolveUserCtors kept
       (resolveNewtypes (newtypeSubsts typeDecls ++ extNts) (resolveUserTypes kept s)))

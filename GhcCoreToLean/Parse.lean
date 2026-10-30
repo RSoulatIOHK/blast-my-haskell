@@ -72,6 +72,9 @@ def parseVar (j : Lean.Json) : Except String Var := do
 def parseLiteral (j : Lean.Json) : Except String Literal := do
   let tag ← getTag j
   match tag with
+  | "LitMachineInt" => do
+    let n ← j.getObjValAs? Int "value"
+    .ok (.litMachineInt n)
   | "LitInt"    => do
     let n ← j.getObjValAs? Int "value"
     .ok (.litInt n)
@@ -323,6 +326,25 @@ def parseProgram (j : Lean.Json) : Except String Program := do
 
 def parseProgramFromString (s : String) : Except String Program := do
   let j ← Lean.Json.parse s
+  parseProgram j
+
+/-- The pipeline always passes a module name and therefore requires the shim's
+    versioned envelope. The two-argument manual CLI may still read old dumps
+    during migration, but any present version must be known. -/
+def parseVersionedProgramFromString (s : String) (expectedModule : Option String) :
+    Except String Program := do
+  let j ← Lean.Json.parse s
+  let version ← match j.getObjVal? "schemaVersion" with
+    | .ok value => value.getNat?
+    | .error _ => match expectedModule with
+      | some _ => .error "missing Core dump schemaVersion"
+      | none => .ok 1
+  if version != 1 then
+    .error s!"unsupported Core dump schemaVersion: {version}"
+  if let some expected := expectedModule then
+    let actual ← j.getObjValAs? String "module"
+    if actual != expected then
+      .error s!"Core dump module mismatch: expected {expected}, got {actual}"
   parseProgram j
 
 end GHCCore
