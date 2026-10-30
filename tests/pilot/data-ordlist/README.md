@@ -28,14 +28,28 @@ Milestone gates:
    admissions; compare its `Int` wrappers against the same GHC source in CI.
 2. Prove sortedness preservation and membership for insertion into a sorted set
    in Lean, with the proof's axiom report audited. The generated-model theorems
-   `sorted_insert` and `member_insert` now cover all finite `Int64` lists; the
-   first uses `isSortedInt xs = true` as its premise. Their helper proofs depend
-   only on Lean's allowed standard axioms (`propext`, `Classical.choice`, and
-   `Quot.sound`). They name GHC-generated local helpers, so a compiler or source
-   change can require proof maintenance; CI pins and checks those names.
+   `sorted_insert`, `member_insert`, and `insert_idempotent` now cover all finite
+   `Int64` lists; the first uses `isSortedInt xs = true` as its premise. Their
+   helper proofs depend only on Lean's allowed standard axioms (`propext`,
+   `Classical.choice`, and `Quot.sound`). They name GHC-generated local helpers,
+   so a compiler or source change can require proof maintenance; CI pins and
+   checks those names.
 3. Extend to `mergeBy` and `unionBy`, including sortedness and multiplicity
    properties. Their two-list recursion may need a termination measure.
 
 Passing finite differential samples or proving a property of generated Lean
 does not establish source-to-Lean correspondence. The global
 `translationCertified` flag remains `false`.
+
+## Blaster exploration
+
+Run `python3 tests/pilot/data-ordlist/probe_blaster.py` after building the
+toolchain. It translates the pinned source afresh, asks Blaster to prove the
+generic insertion-idempotence induction cases, and tests a direct `Int64` goal.
+At the pinned Blaster revision, the generic cases return `Valid` but depend on
+`Blaster.Tactic.blasterProven`; the direct `Int64` goal is rejected because its
+`BitVec` representation is unsupported. We used the case result to guide the
+kernel-checked `insert_idempotent_generic` and `insert_idempotent` proofs above.
+The exploratory SMT result is never part of the CI proof gate or accepted as a
+kernel proof. Blaster currently performs no proof reconstruction; see its
+[tactic documentation](https://github.com/input-output-hk/Lean-blaster#tactic).
