@@ -85,6 +85,7 @@ jobs:
           expected = {'insert_empty', 'member_empty', 'sorted_empty'}
           if (report['status'] != 'proved' or not report['accepted']
                   or report['translationCertified'] is not False
+                  or len(theorems) != len(expected)
                   or {theorem['name'].split('.')[-1] for theorem in theorems} != expected
                   or any(theorem['axioms'] for theorem in theorems)):
               raise SystemExit('Ordered-list pilot proof gate failed')
