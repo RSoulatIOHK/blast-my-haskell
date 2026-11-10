@@ -68,6 +68,35 @@ class ListInputTests(unittest.TestCase):
                 operation["orderedListPairs"] = invalid
                 self.load(config)
 
+    def test_all_list_pairs_cover_order_sensitive_inputs(self):
+        config = self.config([])
+        operation = config["suites"][0]["operations"][0]
+        operation["arguments"] = ["int64-list", "int64-list"]
+        operation["listPairs"] = {"values": [-1, 0, 1], "maxLength": 2}
+        loaded = self.load(config)
+        cases = expand_cases(loaded, loaded["suites"][0])
+        self.assertEqual(len(cases), 169)
+        inputs = [case["inputs"] for case in cases]
+        self.assertIn([[1, -1], [-1, 1]], inputs)
+        self.assertIn([[-1, 1], [1, -1]], inputs)
+
+    def test_plutus_list_slice_matches_pinned_upstream_source(self):
+        root = Path(__file__).resolve().parents[1] / "tests/pilot/plutus-tx"
+        upstream_bytes = (root / "vendor/PlutusTx/List.hs").read_bytes()
+        self.assertEqual(hashlib.sha256(upstream_bytes).hexdigest(),
+                         "91d0590e3ee1a47829a689600bf83a2cf22a561a142e74810062549c71095937")
+        upstream = upstream_bytes.decode()
+        pilot = (root / "PlutusListPilot.hs").read_text()
+        for name in ("revAppend", "reverse"):
+            with self.subTest(function=name):
+                pattern = re.compile(r"^" + name + r" ::.*?^\{-# INLINEABLE " + name +
+                                     r" #-\}", re.MULTILINE | re.DOTALL)
+                original = pattern.search(upstream)
+                copied = pattern.search(pilot)
+                self.assertIsNotNone(original)
+                self.assertIsNotNone(copied)
+                self.assertEqual(copied.group(), original.group())
+
     def test_ordlist_function_bodies_match_pinned_upstream_slice(self):
         source = (Path(__file__).resolve().parents[1] / "tests/pilot/data-ordlist/OrderedPilot.hs").read_text()
         expected = {

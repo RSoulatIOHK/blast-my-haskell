@@ -50,6 +50,13 @@ def ordered_list_pairs(values: list[int], max_length: int) -> list[list[list[int
     return [[left, right] for left, right in itertools.product(lists, repeat=2)]
 
 
+def list_pairs(values: list[int], max_length: int) -> list[list[list[int]]]:
+    """Exhaust pairs of short lists, retaining every element order."""
+    lists = [list(items) for length in range(max_length + 1)
+             for items in itertools.product(values, repeat=length)]
+    return [[left, right] for left, right in itertools.product(lists, repeat=2)]
+
+
 def _validate_value(value: object, kind: str, where: str) -> int | list[int]:
     if kind == "int64-list":
         if not isinstance(value, list):
@@ -113,19 +120,21 @@ def load_config(path: Path) -> dict:
                 raise ValueError(f"{op_where} requests random values for a non-Int argument")
             if operation.get("boundaries", False) and any(kind != "int64" for kind in arguments):
                 raise ValueError(f"{op_where} requests Int boundaries for a non-Int argument")
-            ordered_pairs = operation.get("orderedListPairs")
-            if ordered_pairs is not None:
-                if arguments != ["int64-list", "int64-list"] or not isinstance(ordered_pairs, dict):
-                    raise ValueError(f"{op_where}.orderedListPairs requires two Int lists")
-                values = ordered_pairs.get("values")
-                length = ordered_pairs.get("maxLength")
+            for generator in ("orderedListPairs", "listPairs"):
+                pair_config = operation.get(generator)
+                if pair_config is None:
+                    continue
+                if arguments != ["int64-list", "int64-list"] or not isinstance(pair_config, dict):
+                    raise ValueError(f"{op_where}.{generator} requires two Int lists")
+                values = pair_config.get("values")
+                length = pair_config.get("maxLength")
                 if (not isinstance(values, list) or not 1 <= len(values) <= 4
                         or any(isinstance(v, bool) or not isinstance(v, int)
                                or not INT64_MIN <= v <= INT64_MAX for v in values)
                         or values != sorted(set(values))
                         or isinstance(length, bool) or not isinstance(length, int)
                         or not 0 <= length <= 3):
-                    raise ValueError(f"{op_where}.orderedListPairs has invalid values or maxLength")
+                    raise ValueError(f"{op_where}.{generator} has invalid values or maxLength")
             vectors = operation.get("vectors", [])
             if not isinstance(vectors, list):
                 raise ValueError(f"{op_where}.vectors must be a list")
@@ -153,6 +162,10 @@ def expand_cases(config: dict, suite: dict) -> list[dict]:
         if ordered_pairs is not None:
             groups.append(("ordered", ordered_list_pairs(
                 ordered_pairs["values"], ordered_pairs["maxLength"])))
+        all_pairs = operation.get("listPairs")
+        if all_pairs is not None:
+            groups.append(("all-list-pairs", list_pairs(
+                all_pairs["values"], all_pairs["maxLength"])))
         random_count = operation.get("randomCases", 0)
         if random_count:
             material = f"{seed}\0{module}\0{operation['function']}".encode()

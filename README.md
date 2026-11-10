@@ -105,6 +105,9 @@ automatically the first time you run `transpile.sh` (it stages them in a sandbox
 # Check selected merge/union Core from the pinned data-ordlist Cabal build.
 python3 scripts/ordlist_core_import.py
 
+# Verify a source-exact PlutusTx.List slice, including a Blaster-backed law.
+./verify.sh tests/pilot/plutus-tx/PlutusListPilot.hs --semantics conservative --trust-smt
+
 # Machine-readable result; exit 0 only when the selected policy accepts it.
 ./verify.sh tests/fixtures/verification/PureInteger.hs --json
 ```
@@ -116,6 +119,8 @@ missing properties, errors, and timeouts never count as accepted verification.
 See [verification policies and result format](docs/verification.md).
 For a repeatable library function work packet, see the
 [agent verification workflow](docs/agent-verification-workflow.md).
+The [Plutus list pilot](tests/pilot/plutus-tx/README.md) records its upstream
+source pin, proof assumptions, fidelity cases, and direct-package limitation.
 
 To export Lean files for manual work:
 
