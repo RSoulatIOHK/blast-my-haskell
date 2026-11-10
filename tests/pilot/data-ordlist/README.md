@@ -6,6 +6,9 @@ The published source archive has SHA-256
 its `Data/List/Ordered.hs` has SHA-256
 `73c11909892d3ce36dcab3688f5429b4db20ed752137a5d130f7ce3f00870aee`.
 The BSD-3-Clause license is copied in [LICENSE](LICENSE).
+The published archive is vendored at
+[`vendor/data-ordlist-0.4.7.0.tar.gz`](vendor/data-ordlist-0.4.7.0.tar.gz)
+so CI can build the original Cabal package without relying on a live download.
 
 [`OrderedPilot.hs`](OrderedPilot.hs) copies the complete definitions of
 `isSortedBy` (upstream lines 82–87), `memberBy` (95–102), and `insertSetBy`
@@ -59,6 +62,15 @@ Milestone gates:
    `union'`, whose error path requires a checked domain condition. Package
    import will need to select the target exports and their Core dependencies
    while recording the original Cabal package and module identity.
+
+The package fidelity gate builds that pinned Cabal archive with GHC 9.2.7,
+checks that all five copied function bodies equal the archive source, and runs
+the same 252 ordered-list cases against both the package and pilot. CI also
+changes `unionInt` to call `mergeBy` and requires the gate to detect a union
+result mismatch. This verifies the pilot's Haskell behavior against the real
+package; the Lean model still comes from the copied slice.
+Run `python3 scripts/ordlist_package_fidelity.py` locally to write the package
+comparison report under `.lake/`.
 
 Passing finite differential samples or proving a property of generated Lean
 does not establish source-to-Lean correspondence. The global
