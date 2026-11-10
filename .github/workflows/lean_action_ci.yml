@@ -86,10 +86,13 @@ jobs:
                       'insert_member_generic', 'member_insert', 'mem_insert',
                       'pairwise_insert', 'pairwise_to_sorted_loop',
                       'sorted_loop_to_pairwise', 'sorted_insert',
-                      'insert_idempotent_generic', 'insert_idempotent'}
+                      'insert_idempotent_generic', 'insert_idempotent',
+                      'merge_length_generic', 'merge_length',
+                      'union_membership_generic', 'union_membership'}
           blaster_axiom = 'Blaster.Tactic.blasterProven'
           smt_theorems = {'insert_member_generic', 'member_insert',
-                          'insert_idempotent_generic', 'insert_idempotent'}
+                          'insert_idempotent_generic', 'insert_idempotent',
+                          'merge_length_generic', 'merge_length'}
           allowed_axioms = {'propext', 'Classical.choice', 'Quot.sound', blaster_axiom}
           if (report['status'] != 'smt_valid' or not report['accepted']
                   or report['trustSmt'] is not True

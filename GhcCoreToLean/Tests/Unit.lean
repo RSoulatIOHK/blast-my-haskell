@@ -42,6 +42,54 @@ def machineIntProgram : Program :=
       | .tyCon n [] => n == "Int"
       | _ => false
   | _ => false
+
+-- The two-list Core shape has a redundant match on the same list in its
+-- DEFAULT arm. Refinement removes its unreachable patError without changing
+-- the reachable nil/cons results.
+def listCaseVar (name : String) (unique : Nat) : Var :=
+  { name, unique, ty := .tyCon "List" [], role := .id }
+
+def listCaseXs := listCaseVar "xs" 8101
+def listCaseYs := listCaseVar "ys" 8102
+def listCaseX := listCaseVar "x" 8103
+def listCaseTail := listCaseVar "tail" 8104
+def listCaseCb := listCaseVar "cb" 8105
+def listCaseFail := listCaseVar "fail" 8106
+def listCasePatError := listCaseVar "Control.Exception.Base.patError" 8107
+
+def repeatedListCase : Expr :=
+  .let_ (.nonRec listCaseFail (.var listCasePatError))
+    (.case_ (.var listCaseXs) listCaseCb (.tyCon "List" []) [
+      .mk (.dataCon "[]") [] (.lit (.litInt 0)),
+      .mk .default []
+        (.case_ (.var listCaseXs) listCaseCb (.tyCon "List" []) [
+          .mk (.dataCon "GHC.Types.:") [listCaseX, listCaseTail] (.var listCaseX),
+          .mk .default [] (.var listCaseFail)])])
+
+#guard match Lower.lowerProgram [.nonRec listCaseYs repeatedListCase] with
+  | [.nonRec _ (.case_ _ _ _ [
+      .mk (.dataCon "[]") [] (.lit (.litInt 0)),
+      .mk (.dataCon "GHC.Types.:") [_, _] (.var v)])] => v.name == "x"
+  | _ => false
+
+-- A different inner scrutinee gives no evidence that the outer default is cons.
+#guard match Lower.lowerProgram [.nonRec listCaseYs
+    (.case_ (.var listCaseXs) listCaseCb (.tyCon "List" []) [
+      .mk (.dataCon "[]") [] (.lit (.litInt 0)),
+      .mk .default [] (.case_ (.var listCaseYs) listCaseCb (.tyCon "List" []) [
+        .mk (.dataCon "GHC.Types.:") [listCaseX, listCaseTail] (.var listCaseX)])])] with
+  | [.nonRec _ (.case_ _ _ _ [_, .mk .default _ _])] => true
+  | _ => false
+
+-- Textually identical names with different GHC uniques are different binders.
+#guard match Lower.lowerProgram [.nonRec listCaseYs
+    (.case_ (.var listCaseXs) listCaseCb (.tyCon "List" []) [
+      .mk (.dataCon "[]") [] (.lit (.litInt 0)),
+      .mk .default [] (.case_ (.var (listCaseVar "xs" 8201)) listCaseCb
+        (.tyCon "List" []) [
+        .mk (.dataCon "GHC.Types.:") [listCaseX, listCaseTail] (.var listCaseX)])])] with
+  | [.nonRec _ (.case_ _ _ _ [_, .mk .default _ _])] => true
+  | _ => false
 #guard emitLiteral (.litMachineInt (-1)) == "(Int64.ofInt -1)"
 #guard replaceBareIdent "Int" "Int64"
     "(x : Int) → Integer → MyInt → Foo.Int → \"Int\" -- Int\nInt" ==

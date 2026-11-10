@@ -150,12 +150,14 @@ their outputs with the freshly translated Lean definitions under conservative
 semantics. `tests/differential.json` records boundary cases and deterministic
 random seeds for machine `Int`, arbitrary precision `Integer`, Boolean
 comparisons, finite integer lists (including list inputs), and one imported module.
-The [data-ordlist pilot](../tests/pilot/data-ordlist/README.md) adds three
+The [data-ordlist pilot](../tests/pilot/data-ordlist/README.md) adds five
 source-exact ordered-list functions with monomorphic `Int` entry points. Its
-empty-list lemmas and sortedness preservation are kernel checked in CI; insertion
-membership and idempotence use Blaster with explicit SMT trust. All twelve
-theorem dependencies are audited, and the four Blaster-backed theorems must
-contain exactly the permitted SMT axiom plus any standard Lean axioms. A mismatch,
+empty-list lemmas, insertion sortedness, and union membership are kernel checked
+in CI; insertion membership, idempotence, and merge length use Blaster with
+explicit SMT trust. All sixteen theorem dependencies are audited, and the six
+Blaster-backed theorems must contain the permitted SMT axiom and no unlisted
+axioms. The merge and union differential cases also exhaust every pair of
+sorted lists of length at most two over `{-1, 0, 1}`. A mismatch,
 missing case, or translation error fails CI and saves the case-level report as an artifact.
 On a value mismatch, the runner also retains the generated Lean source under
 `.lake/differential-artifacts/<runId>/`; the report records its exact path.
