@@ -107,6 +107,32 @@ jobs:
                          {'insert_empty', 'member_empty', 'sorted_empty'})):
               raise SystemExit('Ordered-list pilot proof gate failed')
           PY
+      - name: Check source-exact Plutus list pilot proofs
+        run: |
+          ./verify.sh tests/pilot/plutus-tx/PlutusListPilot.hs \
+              --semantics conservative --trust-smt --json > .lake/plutus-list-proof.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('.lake/plutus-list-proof.json').read_text())
+          theorems = [theorem for module in report['modules']
+                      for block in module['properties'] for theorem in block['theorems']]
+          expected = {'rev_append_spec', 'reverse_model',
+                      'reverse_involutive', 'reverse_length', 'rev_append_length'}
+          blaster_axiom = 'Blaster.Tactic.blasterProven'
+          expected_axioms = {
+              name: {'propext'} | ({blaster_axiom} if name == 'rev_append_length' else set())
+              for name in expected
+          }
+          if (report['status'] != 'smt_valid' or not report['accepted']
+                  or report['trustSmt'] is not True
+                  or report['translationCertified'] is not False
+                  or len(theorems) != len(expected)
+                  or {theorem['name'].split('.')[-1] for theorem in theorems} != expected
+                  or any(set(theorem['axioms']) != expected_axioms[theorem['name'].split('.')[-1]]
+                         for theorem in theorems)):
+              raise SystemExit('Plutus list pilot proof gate failed')
+          PY
       - name: Compare pilot with pinned data-ordlist Cabal package
         run: python3 scripts/ordlist_package_fidelity.py --report .lake/ordlist-package-fidelity.json
       - name: Translate selected Core from the pinned Cabal build
@@ -202,6 +228,7 @@ jobs:
             .lake/ordlist-pilot-proof.json
             .lake/ordlist-package-fidelity.json
             .lake/ordlist-core-import.json
+            .lake/plutus-list-proof.json
             .lake/ordlist-package-canary.json
             .lake/differential-canary-baseline.json
             .lake/differential-canary-results.json

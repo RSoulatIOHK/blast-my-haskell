@@ -171,6 +171,13 @@ top-level Core dependencies, and translates those bindings under the original
 and audits the package model's merge-length and union-membership proofs. The
 report pins archive, Cabal, Core, and Lean hashes. Unselected package functions
 are outside this verification claim.
+The [Plutus list pilot](../tests/pilot/plutus-tx/README.md) copies upstream
+`PlutusTx.List.revAppend` and `reverse` exactly from a pinned commit, proves
+five laws of the generated Lean model (one with explicitly trusted Blaster),
+and compares 179 GHC/Lean executions. It does not yet build the original
+`plutus-tx` package: the current Core dump dependency is tied to GHC 9.2,
+whereas this Plutus revision uses GHC 9.6 as its primary compiler. The pilot
+therefore makes a source-slice claim only.
 On a value mismatch, the runner also retains the generated Lean source under
 `.lake/differential-artifacts/<runId>/`; the report records its exact path.
 CI also replaces the `GHC.Num.+` mapping with subtraction in its disposable checkout,
