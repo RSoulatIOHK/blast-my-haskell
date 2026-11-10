@@ -185,7 +185,124 @@ mutual
     | .rec_ pairs => .rec_ (pairs.map fun (v, e) => (v, lowerExpr e))
 end
 
+/-- GHC's desugaring of a two-list pattern match can retain an impossible
+    `patError` arm: after testing `xs` against `[]`, it tests `xs` again against
+    `(:)` inside the default arm. Refine that default to the only remaining
+    list constructor and remove the redundant inner test. This transformation
+    is restricted to the exhaustive `[]`/`(:)` pair. -/
+private def isListNil : AltCon → Bool
+  | .dataCon n => dataConMap n == some "List.nil"
+  | _ => false
+
+private def isListCons : AltCon → Bool
+  | .dataCon n => dataConMap n == some "List.cons"
+  | _ => false
+
+private def consArm? : List Alt → Option (List Var × Expr)
+  | [] => none
+  | .mk c bs rhs :: rest =>
+      if isListCons c && bs.length == 2 then some (bs, rhs) else consArm? rest
+
+private partial def mentions (target : Unique) : Expr → Bool
+  | .var v => v.unique == target
+  | .app f a => mentions target f || mentions target a
+  | .lam _ e | .cast e | .tick e => mentions target e
+  | .let_ (.nonRec _ rhs) body => mentions target rhs || mentions target body
+  | .let_ (.rec_ pairs) body =>
+      pairs.any (fun (_, rhs) => mentions target rhs) || mentions target body
+  | .case_ scr _ _ alts =>
+      mentions target scr || alts.any (fun (.mk _ _ rhs) => mentions target rhs)
+  | _ => false
+
+private partial def findRepeatedCons (target : Unique) : Expr → Option (List Var × Expr)
+  | .case_ (.var v) cb _ alts =>
+      if v.unique == target then
+        (consArm? alts).filter (fun (_, rhs) => !mentions cb.unique rhs)
+      else alts.findSome? (fun (.mk _ _ rhs) => findRepeatedCons target rhs)
+  | .case_ _ _ _ alts =>
+      alts.findSome? (fun (.mk _ _ rhs) => findRepeatedCons target rhs)
+  | .let_ (.nonRec _ _) body => findRepeatedCons target body
+  | .let_ (.rec_ _) body => findRepeatedCons target body
+  | .app f a => (findRepeatedCons target f).orElse fun _ => findRepeatedCons target a
+  | .lam _ body => findRepeatedCons target body
+  | .cast e | .tick e => findRepeatedCons target e
+  | _ => none
+
+private partial def replaceRepeatedCons (target : Unique) : Expr → Expr
+  | .case_ (.var v) cb ty alts =>
+      if v.unique == target then
+        match consArm? alts with
+        | some (_, rhs) =>
+            if mentions cb.unique rhs then .case_ (.var v) cb ty alts
+            else replaceRepeatedCons target rhs
+        | none => .case_ (.var v) cb ty (alts.map fun (.mk c bs rhs) =>
+            .mk c bs (replaceRepeatedCons target rhs))
+      else .case_ (.var v) cb ty (alts.map fun (.mk c bs rhs) =>
+        .mk c bs (replaceRepeatedCons target rhs))
+  | .case_ scr cb ty alts => .case_ scr cb ty (alts.map fun (.mk c bs rhs) =>
+      .mk c bs (replaceRepeatedCons target rhs))
+  | .let_ b body => .let_ b (replaceRepeatedCons target body)
+  | .app f a => .app (replaceRepeatedCons target f) (replaceRepeatedCons target a)
+  | .lam v body => .lam v (replaceRepeatedCons target body)
+  | .cast e => .cast (replaceRepeatedCons target e)
+  | .tick e => .tick (replaceRepeatedCons target e)
+  | e => e
+
+private partial def refineListCases : Expr → Expr
+  | .case_ scr cb ty alts =>
+      let alts := alts.map fun (.mk c bs rhs) => .mk c bs (refineListCases rhs)
+      match scr with
+      | .var v =>
+          if alts.length == 2 && alts.any (fun (.mk c _ _) => isListNil c) then
+            let alts := alts.map fun
+              | .mk .default _ rhs =>
+                  match findRepeatedCons v.unique rhs with
+                  | some (bs, _) => .mk (.dataCon "GHC.Types.:") bs
+                      (replaceRepeatedCons v.unique rhs)
+                  | none => .mk .default [] rhs
+              | alt => alt
+            .case_ scr cb ty alts
+          else .case_ scr cb ty alts
+      | _ => .case_ (refineListCases scr) cb ty alts
+  | .let_ (.nonRec v rhs) body => .let_ (.nonRec v (refineListCases rhs)) (refineListCases body)
+  | .let_ (.rec_ pairs) body => .let_ (.rec_ (pairs.map fun (v, rhs) =>
+      (v, refineListCases rhs))) (refineListCases body)
+  | .lam v body => .lam v (refineListCases body)
+  | .app f a => .app (refineListCases f) (refineListCases a)
+  | .cast e => .cast (refineListCases e)
+  | .tick e => .tick (refineListCases e)
+  | e => e
+
+private partial def containsPatError : Expr → Bool
+  | .var v => v.name == "Control.Exception.Base.patError"
+  | .app f a => containsPatError f || containsPatError a
+  | .lam _ e | .cast e | .tick e => containsPatError e
+  | .let_ (.nonRec _ rhs) body => containsPatError rhs || containsPatError body
+  | .let_ (.rec_ pairs) body =>
+      pairs.any (fun (_, rhs) => containsPatError rhs) || containsPatError body
+  | .case_ scr _ _ alts =>
+      containsPatError scr || alts.any (fun (.mk _ _ rhs) => containsPatError rhs)
+  | _ => false
+
+private partial def dropDeadPatError : Expr → Expr
+  | .let_ (.nonRec v rhs) body =>
+      let body := dropDeadPatError body
+      if containsPatError rhs && !mentions v.unique body then body
+      else .let_ (.nonRec v (dropDeadPatError rhs)) body
+  | .let_ (.rec_ pairs) body => .let_ (.rec_ (pairs.map fun (v, rhs) =>
+      (v, dropDeadPatError rhs))) (dropDeadPatError body)
+  | .case_ scr cb ty alts => .case_ (dropDeadPatError scr) cb ty
+      (alts.map fun (.mk c bs rhs) => .mk c bs (dropDeadPatError rhs))
+  | .lam v body => .lam v (dropDeadPatError body)
+  | .app f a => .app (dropDeadPatError f) (dropDeadPatError a)
+  | .cast e => .cast (dropDeadPatError e)
+  | .tick e => .tick (dropDeadPatError e)
+  | e => e
+
 def lowerProgram (p : CoreProgram) : CoreProgram :=
-  p.map lowerBind
+  (p.map lowerBind).map fun
+    | .nonRec v rhs => .nonRec v (dropDeadPatError (refineListCases rhs))
+    | .rec_ pairs => .rec_ (pairs.map fun (v, rhs) =>
+        (v, dropDeadPatError (refineListCases rhs)))
 
 end GHCCore.Lower

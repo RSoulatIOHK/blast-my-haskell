@@ -9,13 +9,16 @@ The BSD-3-Clause license is copied in [LICENSE](LICENSE).
 
 [`OrderedPilot.hs`](OrderedPilot.hs) copies the complete definitions of
 `isSortedBy` (upstream lines 82–87), `memberBy` (95–102), and `insertSetBy`
-(136–143) verbatim. The `Int` wrappers are local entry points for the pinned
+(136–143), `unionBy` (234–243), and `mergeBy` (323–332) verbatim. The `Int`
+wrappers are local entry points for the pinned
 64-bit GHC target. This slice deliberately keeps the upstream algorithms
 unaltered; a later milestone should import the Cabal package itself and preserve
 module/package identity across the translation boundary.
 
 The source contract assumes finite ordered lists for `memberBy` and
-`insertSetBy`; `insertSetBy`'s set behavior also assumes no duplicate input
+`insertSetBy`, `unionBy`, and `mergeBy`; `insertSetBy`'s set behavior also assumes
+no duplicate input elements. `mergeBy` retains both inputs' multiplicities,
+while `unionBy` retains the maximum multiplicity and is left-biased on equal
 elements. `isSortedBy` accepts any finite list. The comparison functions must
 obey the intended total order; the initial execution checks instantiate them
 with GHC's `Ord Int` operations. The differential suite includes unsorted and
@@ -37,8 +40,25 @@ Milestone gates:
    Lean's standard allowed axioms (`propext`, `Classical.choice`, and
    `Quot.sound`). Some of those helpers name GHC-generated local functions, so
    a compiler or source change can require proof maintenance.
-3. Extend to `mergeBy` and `unionBy`, including sortedness and multiplicity
-   properties. Their two-list recursion may need a termination measure.
+3. The exact `mergeBy` and `unionBy` definitions now translate. GHC leaves
+   redundant pattern-failure branches for their two-list recursion; the Core
+   lowerer removes these only when the surrounding `[]` match proves that the
+   repeated match must be `(:)`. A regression test checks this rule. The
+   differential gate compares both new `Int` wrappers with GHC, including
+   every pair of nondecreasing lists of length at most two over `{-1, 0, 1}`
+   (100 pairs per function), plus boundary and unsorted probe inputs.
+   `merge_length` proves that bag merge preserves the sum of lengths, using
+   Blaster on the arithmetic induction cases. `union_membership` proves that
+   union contains exactly the elements of its inputs, assuming comparator EQ
+   implies equality. Blaster cannot encode Lean's `List.Mem` predicate at the
+   pinned revision, so that law is kernel checked. CI audits their axiom sets.
+4. Still to prove: sortedness preservation and the stronger multiplicity laws
+   for `mergeBy` and `unionBy`. The pilot still translates a copied source slice;
+   importing the pinned Cabal package is the next fidelity milestone. A first
+   conservative translation of the entire upstream module is blocked by
+   `union'`, whose error path requires a checked domain condition. Package
+   import will need to select the target exports and their Core dependencies
+   while recording the original Cabal package and module identity.
 
 Passing finite differential samples or proving a property of generated Lean
 does not establish source-to-Lean correspondence. The global
