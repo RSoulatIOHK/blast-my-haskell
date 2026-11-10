@@ -107,6 +107,33 @@ jobs:
                          {'insert_empty', 'member_empty', 'sorted_empty'})):
               raise SystemExit('Ordered-list pilot proof gate failed')
           PY
+      - name: Compare pilot with pinned data-ordlist Cabal package
+        run: python3 scripts/ordlist_package_fidelity.py --report .lake/ordlist-package-fidelity.json
+      - name: Prove package fidelity gate rejects a changed wrapper
+        run: |
+          trap 'git restore tests/pilot/data-ordlist/OrderedPilot.hs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('tests/pilot/data-ordlist/OrderedPilot.hs')
+          source = path.read_text()
+          original = 'unionInt = unionBy compare'
+          if source.count(original) != 1:
+              raise SystemExit('Union wrapper changed; update package fidelity canary')
+          path.write_text(source.replace(original, 'unionInt = mergeBy compare', 1))
+          PY
+          if python3 scripts/ordlist_package_fidelity.py \
+              --report .lake/ordlist-package-canary.json; then
+            echo 'Changed union wrapper passed package fidelity gate' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path('.lake/ordlist-package-canary.json').read_text())
+          if not any(case['id'].startswith('OrderedPilot.unionInt.')
+                     for case in report['mismatches']):
+              raise SystemExit('Package fidelity canary failed without a union mismatch')
+          PY
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -171,6 +198,8 @@ jobs:
             .lake/verification-results.json
             .lake/differential-results.json
             .lake/ordlist-pilot-proof.json
+            .lake/ordlist-package-fidelity.json
+            .lake/ordlist-package-canary.json
             .lake/differential-canary-baseline.json
             .lake/differential-canary-results.json
             .lake/differential-artifacts/

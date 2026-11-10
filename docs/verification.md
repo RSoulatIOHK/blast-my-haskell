@@ -159,6 +159,11 @@ Blaster-backed theorems must contain the permitted SMT axiom and no unlisted
 axioms. The merge and union differential cases also exhaust every pair of
 sorted lists of length at most two over `{-1, 0, 1}`. A mismatch,
 missing case, or translation error fails CI and saves the case-level report as an artifact.
+The package fidelity gate separately builds the pinned original `data-ordlist`
+Cabal archive, checks the five copied bodies against its source, and compares
+all 252 pilot executions with the package. A changed `unionInt` wrapper must
+produce a package mismatch in the CI canary. This adds package provenance and
+behavioral evidence while the generated Lean model still uses the copied slice.
 On a value mismatch, the runner also retains the generated Lean source under
 `.lake/differential-artifacts/<runId>/`; the report records its exact path.
 CI also replaces the `GHC.Num.+` mapping with subtraction in its disposable checkout,
