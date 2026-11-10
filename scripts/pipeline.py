@@ -32,7 +32,8 @@ def tool_env() -> dict[str, str]:
     # Never inherit another pipeline's sidecars, import graph, or package env.
     for key in ("LEAN_SPEC_DIR", "GHC_DECL_DUMP_DIR", "EXT_TYPES_MANIFEST",
                 "NEWTYPE_EXPORTS_OUT", "LEAN_IMPORTS", "GHCCORE_AUDIT",
-                "GHCCORE_SEMANTICS", "GHCCORE_INT_BITS", "GHC_ENVIRONMENT", "LEAN_PATH"):
+                "GHCCORE_SEMANTICS", "GHCCORE_INT_BITS", "GHCCORE_ROOTS",
+                "GHC_ENVIRONMENT", "LEAN_PATH"):
         env.pop(key, None)
     env["GHC_ENVIRONMENT"] = "-"
     return env
@@ -159,7 +160,8 @@ def discover(source: Path, env: dict[str, str], deadline: float) -> list[dict]:
 
 def transpile(source: Path, work: Path, env: dict[str, str], deadline: float,
               *, semantics: str = "approximate", audit: bool = False,
-              target: dict[str, object] | None = None) -> list[dict]:
+              target: dict[str, object] | None = None,
+              roots: list[str] | None = None) -> list[dict]:
     """Write the entire module graph under work/lean; publish nothing externally."""
     target = target or ghc_target(env, deadline)
     require_supported_target(target, semantics)
@@ -171,6 +173,7 @@ def transpile(source: Path, work: Path, env: dict[str, str], deadline: float,
     specs = stage / ".leanspecs"
     decls.mkdir()
     specs.mkdir()
+    entry_module = modules[-1]["module"]
     for module in modules:
         original = Path(module["source"])
         content = original.read_bytes()
@@ -223,6 +226,8 @@ def transpile(source: Path, work: Path, env: dict[str, str], deadline: float,
         module_env = {**env, "NEWTYPE_EXPORTS_OUT": str(exports),
                       "LEAN_IMPORTS": " ".join("GhcCoreToLean.Generated." + d
                                                for d in module["dependencies"])}
+        if roots is not None and name == entry_module:
+            module_env["GHCCORE_ROOTS"] = ",".join(roots)
         result = run([str(compiler), str(core), str(output), name], cwd=stage,
                      env=module_env, deadline=deadline, phase="transpile")
         if result.returncode:

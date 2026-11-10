@@ -55,22 +55,30 @@ Milestone gates:
    union contains exactly the elements of its inputs, assuming comparator EQ
    implies equality. Blaster cannot encode Lean's `List.Mem` predicate at the
    pinned revision, so that law is kernel checked. CI audits their axiom sets.
-4. Still to prove: sortedness preservation and the stronger multiplicity laws
-   for `mergeBy` and `unionBy`. The pilot still translates a copied source slice;
-   importing the pinned Cabal package is the next fidelity milestone. A first
-   conservative translation of the entire upstream module is blocked by
-   `union'`, whose error path requires a checked domain condition. Package
-   import will need to select the target exports and their Core dependencies
-   while recording the original Cabal package and module identity.
+4. A second gate now builds the original Cabal package with dump plugins,
+   selects the transitive Core dependencies of `unionBy` and `mergeBy`, and
+   translates those package bindings conservatively under the original
+   `Data.List.Ordered` module name. The package-generated Lean model matches
+   224 GHC executions and carries two audited laws: Blaster-backed merge
+   length and kernel-checked union membership. The build instruments only a
+   temporary copy of the Cabal metadata; the Haskell source stays byte exact.
+   The unselected `union'` error path and `People` type are outside this claim.
+5. Still to prove: sortedness preservation and stronger multiplicity laws for
+   `mergeBy` and `unionBy`, and broader coverage of the package's exports.
 
 The package fidelity gate builds that pinned Cabal archive with GHC 9.2.7,
 checks that all five copied function bodies equal the archive source, and runs
 the same 252 ordered-list cases against both the package and pilot. CI also
 changes `unionInt` to call `mergeBy` and requires the gate to detect a union
 result mismatch. This verifies the pilot's Haskell behavior against the real
-package; the Lean model still comes from the copied slice.
+package; the pilot's own Lean model still comes from the copied slice.
 Run `python3 scripts/ordlist_package_fidelity.py` locally to write the package
 comparison report under `.lake/`.
+
+Run `python3 scripts/ordlist_core_import.py` after building the Lean translator
+and Haskell shim to repeat the direct package-Core translation, differential
+comparison, and theorem axiom audit. Its JSON report records the archive,
+original and instrumented Cabal files, Core dump, and generated Lean hashes.
 
 Passing finite differential samples or proving a property of generated Lean
 does not establish source-to-Lean correspondence. The global

@@ -102,6 +102,9 @@ automatically the first time you run `transpile.sh` (it stages them in a sandbox
 # Verify the data-ordlist pilot with Blaster trusted for generic list laws.
 ./verify.sh tests/pilot/data-ordlist/OrderedPilot.hs --semantics conservative --trust-smt
 
+# Check selected merge/union Core from the pinned data-ordlist Cabal build.
+python3 scripts/ordlist_core_import.py
+
 # Machine-readable result; exit 0 only when the selected policy accepts it.
 ./verify.sh tests/fixtures/verification/PureInteger.hs --json
 ```
@@ -111,6 +114,8 @@ audits theorem dependencies, and checks that sources did not change during the
 run. `proved` and `smt_valid` refer to the Lean model; `admitted`, `assumed`,
 missing properties, errors, and timeouts never count as accepted verification.
 See [verification policies and result format](docs/verification.md).
+For a repeatable library function work packet, see the
+[agent verification workflow](docs/agent-verification-workflow.md).
 
 To export Lean files for manual work:
 
@@ -128,6 +133,10 @@ hierarchical layout: `module A.B.C` ⇒ `A/B/C.hs`), transpiles each dependency 
 `GhcCoreToLean/Generated/<path>.lean`, and emits `import` lines so Lean builds
 them in order. Library/`Prelude` imports are ignored. (Generated files are
 git-ignored — regenerate them with `transpile.sh`.)
+For exploratory translation of a large module, `--roots f,g` selects those
+top-level functions and their transitive Core bindings. This mode refuses
+modules with local classes or instances; it does not claim that unselected
+exports are verified.
 
 ## Writing properties
 

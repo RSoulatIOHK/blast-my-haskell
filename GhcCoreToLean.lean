@@ -4,6 +4,7 @@ import GhcCoreToLean.AST
 import GhcCoreToLean.Parse
 import GhcCoreToLean.Maps
 import GhcCoreToLean.Lower
+import GhcCoreToLean.Select
 import GhcCoreToLean.Emit
 import GhcCoreToLean.Runtime
 import GhcCoreToLean.Safety
