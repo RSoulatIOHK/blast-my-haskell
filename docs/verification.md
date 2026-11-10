@@ -164,6 +164,13 @@ Cabal archive, checks the five copied bodies against its source, and compares
 all 252 pilot executions with the package. A changed `unionInt` wrapper must
 produce a package mismatch in the CI canary. This adds package provenance and
 behavioral evidence while the generated Lean model still uses the copied slice.
+The direct package Core gate instruments a temporary copy of the original
+Cabal metadata with dump plugins, selects `unionBy` and `mergeBy` plus their
+top-level Core dependencies, and translates those bindings under the original
+`Data.List.Ordered` module name. It compares 224 package GHC/Lean executions
+and audits the package model's merge-length and union-membership proofs. The
+report pins archive, Cabal, Core, and Lean hashes. Unselected package functions
+are outside this verification claim.
 On a value mismatch, the runner also retains the generated Lean source under
 `.lake/differential-artifacts/<runId>/`; the report records its exact path.
 CI also replaces the `GHC.Num.+` mapping with subtraction in its disposable checkout,

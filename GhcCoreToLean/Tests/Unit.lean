@@ -3,6 +3,7 @@ import GhcCoreToLean.Emit
 import GhcCoreToLean.AST
 import GhcCoreToLean.Parse
 import GhcCoreToLean.Lower
+import GhcCoreToLean.Select
 import GhcCoreToLean.Runtime
 
 namespace GhcCoreToLean.Tests
@@ -10,6 +11,32 @@ open GHCCore GHCCore.Maps GHCCore.Emit
 
 -- Sentinel: proves the harness builds and `#guard` failures break the build.
 #guard valueMap "GHC.Base.id" == some "id"
+
+def selectedVar (name : String) (unique : Nat) : Var :=
+  { name, unique, ty := .tyCon "Int" [], role := .id }
+
+def selectedHelper := selectedVar "helper" 9001
+def selectedTarget := selectedVar "target" 9002
+def selectedUnused := selectedVar "unused" 9003
+def selectedBinds : CoreProgram := [
+  .nonRec selectedHelper (.lit (.litInt 1)),
+  .nonRec selectedUnused (.var (selectedVar "GHC.Err.error" 9004)),
+  .nonRec selectedTarget (.var selectedHelper)]
+
+#guard match Select.selectRoots selectedBinds ["target"] with
+  | .ok [.nonRec a _, .nonRec b _] => a.unique == 9001 && b.unique == 9002
+  | _ => false
+#guard match Select.selectRoots selectedBinds ["missing"] with
+  | .error _ => true
+  | _ => false
+#guard match Select.selectRoots selectedBinds [] with
+  | .error _ => true
+  | _ => false
+#guard match Select.selectRoots
+    (selectedBinds ++ [.nonRec (selectedVar "target" 9010) (.lit (.litInt 0))])
+    ["target"] with
+  | .error _ => true
+  | _ => false
 
 -- Machine gcd must preserve the odd sign behavior caused by abs minBound
 -- wrapping; converting through mathematical Nat silently changes it.

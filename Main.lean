@@ -1,4 +1,5 @@
 import GhcCoreToLean
+import GhcCoreToLean.Select
 
 open GHCCore
 
@@ -213,7 +214,28 @@ def runTranspile (input : System.FilePath) (output : System.FilePath)
       for v in ntViolations do
         IO.eprintln s!"error: {Emit.newtypeInstanceError prog.typeDecls v extNts}"
       return 1
-    let userBinds := prog.binds.filterMap (keepBinding prog.instances)
+    let filteredBinds := prog.binds.filterMap (keepBinding prog.instances)
+    let rootsEnv ← IO.getEnv "GHCCORE_ROOTS"
+    let rootsResult : Except String CoreProgram := match rootsEnv with
+      | none => .ok filteredBinds
+      | some requested =>
+          -- Class/instance emission has separate dependencies. Refuse rooted
+          -- slicing until those can be selected by a typed closure.
+          if !prog.instances.isEmpty || !prog.classDecls.isEmpty then
+            .error "Core root selection requires a module without local classes or instances"
+          else Select.selectRoots filteredBinds (requested.splitOn ",")
+    if let .error message := rootsResult then
+      IO.eprintln s!"error: {message}"
+      return 1
+    let .ok userBinds := rootsResult | return 1
+    -- Keep only data declarations whose type occurs in the selected Core.
+    -- Dropping a declaration used by a retained function would leave an
+    -- unresolved Lean type and fail elaboration, so this is conservative.
+    let prog := if rootsEnv.isSome then
+      let coreOnly := { prog with binds := userBinds, typeDecls := [] }
+      let retainedTypes := prog.typeDecls.filter (fun d => Safety.usesType d.name coreOnly)
+      { prog with typeDecls := retainedTypes }
+    else prog
     let usesMachineInt := Safety.usesType "Int" { prog with binds := userBinds }
     let usesInteger := Safety.usesType "Integer" { prog with binds := userBinds }
     let semantics ← IO.getEnv "GHCCORE_SEMANTICS"

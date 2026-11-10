@@ -109,6 +109,8 @@ jobs:
           PY
       - name: Compare pilot with pinned data-ordlist Cabal package
         run: python3 scripts/ordlist_package_fidelity.py --report .lake/ordlist-package-fidelity.json
+      - name: Translate selected Core from the pinned Cabal build
+        run: python3 scripts/ordlist_core_import.py --report .lake/ordlist-core-import.json
       - name: Prove package fidelity gate rejects a changed wrapper
         run: |
           trap 'git restore tests/pilot/data-ordlist/OrderedPilot.hs' EXIT
@@ -199,6 +201,7 @@ jobs:
             .lake/differential-results.json
             .lake/ordlist-pilot-proof.json
             .lake/ordlist-package-fidelity.json
+            .lake/ordlist-core-import.json
             .lake/ordlist-package-canary.json
             .lake/differential-canary-baseline.json
             .lake/differential-canary-results.json
