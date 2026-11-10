@@ -120,17 +120,19 @@ jobs:
           expected = {'rev_append_spec', 'reverse_model',
                       'reverse_involutive', 'reverse_length', 'rev_append_length'}
           blaster_axiom = 'Blaster.Tactic.blasterProven'
-          expected_axioms = {
-              name: {'propext'} | ({blaster_axiom} if name == 'rev_append_length' else set())
-              for name in expected
-          }
+          kernel_names = expected - {'rev_append_length'}
           if (report['status'] != 'smt_valid' or not report['accepted']
                   or report['trustSmt'] is not True
                   or report['translationCertified'] is not False
                   or len(theorems) != len(expected)
                   or {theorem['name'].split('.')[-1] for theorem in theorems} != expected
-                  or any(set(theorem['axioms']) != expected_axioms[theorem['name'].split('.')[-1]]
-                         for theorem in theorems)):
+                  or any(set(theorem['axioms']) != {'propext'}
+                         for theorem in theorems
+                         if theorem['name'].split('.')[-1] in kernel_names)
+                  or any(blaster_axiom not in theorem['axioms']
+                         or set(theorem['axioms']) - {'propext', blaster_axiom}
+                         for theorem in theorems
+                         if theorem['name'].split('.')[-1] == 'rev_append_length')):
               raise SystemExit('Plutus list pilot proof gate failed')
           PY
       - name: Compare pilot with pinned data-ordlist Cabal package
