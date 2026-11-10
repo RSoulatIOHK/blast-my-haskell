@@ -40,7 +40,8 @@ def instrument_package(package: Path) -> tuple[str, str]:
     plugin_packages = ("decl-plugin", "lean-spec", "spec-plugin")
     (package / "cabal.project").write_text(
         "with-compiler: ghc-9.2.7\npackages:\n  .\n" +
-        "".join(f'  "{REPO / "shim" / name}"\n' for name in plugin_packages))
+        "".join('  "' + str(REPO / "shim" / name) + '"\n'
+                for name in plugin_packages))
     (package / "cabal.project.freeze").write_bytes(
         (REPO / "shim/cabal.project.freeze").read_bytes())
     return sha256(original), sha256(cabal.read_bytes())
