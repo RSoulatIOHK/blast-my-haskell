@@ -114,6 +114,8 @@ audits theorem dependencies, and checks that sources did not change during the
 run. `proved` and `smt_valid` refer to the Lean model; `admitted`, `assumed`,
 missing properties, errors, and timeouts never count as accepted verification.
 See [verification policies and result format](docs/verification.md).
+For a repeatable library function work packet, see the
+[agent verification workflow](docs/agent-verification-workflow.md).
 
 To export Lean files for manual work:
 
