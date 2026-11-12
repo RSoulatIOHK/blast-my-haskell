@@ -93,7 +93,7 @@ def project_file(work: Path, upstream: Path) -> Path:
     project.write_text(header + "\nwith-compiler: " + COMPILER + "\npackages:\n"
                        + "".join(f'  "{path}"\n' for path in paths)
                        + "\ntests: False\nbenchmarks: False\n"
-                       + "package plutus-core\n  flags: -with-inline-r -with-cert\n"
+                       + "package plutus-core\n  flags: -with-inline-r -with-cert -with-crypto\n"
                        + "constraints: text == 2.0.2\n")
     return project
 
