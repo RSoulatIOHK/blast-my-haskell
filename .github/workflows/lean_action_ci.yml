@@ -249,3 +249,39 @@ jobs:
         working-directory: vscode-extension
       - run: npm test
         working-directory: vscode-extension
+
+  plutus-package-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.6.6"
+      - name: Setup Lean
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y
+          echo "/home/runner/.elan/bin" >> "$GITHUB_PATH"
+      - name: Fix Lean version
+        run: |
+          elan toolchain install "$(cat lean-toolchain)"
+          elan default "$(cat lean-toolchain)"
+      - name: Install Z3
+        run: |
+          cd /home/runner/
+          wget -q https://github.com/Z3Prover/z3/releases/download/z3-${{ env.Z3_VERSION }}/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          unzip -q z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}.zip
+          echo "/home/runner/z3-${{ env.Z3_VERSION }}-x64-glibc-${{ env.GLIBC_Z3 }}/bin" >> "$GITHUB_PATH"
+      - name: Build transpiler
+        run: lake build GhcCoreToLean ghccoretolean
+      - name: Require the pinned, clean Blaster checkout
+        run: python3 scripts/check_dependencies.py
+      - name: Check pinned Plutus package Core, proofs, and execution
+        run: |
+          python3 scripts/plutus_package_core.py --update-index \
+              --timeout 5400 --report .lake/plutus-package-core.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: plutus-package-core-results
+          path: .lake/plutus-package-core.json

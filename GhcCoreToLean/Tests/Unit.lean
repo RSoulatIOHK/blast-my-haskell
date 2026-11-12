@@ -253,6 +253,20 @@ def caseNoBinder : Expr :=
       .mk .default [] (.lit (.litInt 1)) ]   -- no reference to cb
 #guard ((emitExpr [] [] caseNoBinder).splitOn "let wild_8 :=").length == 1
 
+-- GHC 9.6 may print a case-binder occurrence with a different name while
+-- retaining its unique. The innermost binding with that unique must win.
+def ghc96CaseNameMismatch : Expr :=
+  let outer : Var := {name := "outer", unique := 1, ty := .tyCon "Int" [], role := .id}
+  let inner : Var := {name := "inner", unique := 1, ty := .tyCon "Int" [], role := .id}
+  let reference : Var := {name := "ds", unique := 1, ty := .tyCon "Int" [], role := .id}
+  .case_ (.lit (.litInt 3)) outer (.tyCon "Int" []) [
+    .mk .default [] (.case_ (.lit (.litInt 4)) inner (.tyCon "Int" []) [
+      .mk .default [] (.var reference)])]
+#guard match Lower.alignLocalRefs [] ghc96CaseNameMismatch with
+  | .case_ _ _ _ [.mk .default [] (.case_ _ _ _ [.mk .default [] (.var v)])] =>
+    v.name == "inner" && v.unique == 1
+  | _ => false
+
 -- Task 7: local recursive let emits `let rec`, not a TODO comment.
 def localRecLet : Bind :=
   .rec_ [ ( {name := "go", unique := 3, ty := .tyFun (.tyCon "Int" []) (.tyCon "Int" []), role := .id},

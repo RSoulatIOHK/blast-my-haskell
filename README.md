@@ -108,6 +108,10 @@ python3 scripts/ordlist_core_import.py
 # Verify a source-exact PlutusTx.List slice, including a Blaster-backed law.
 ./verify.sh tests/pilot/plutus-tx/PlutusListPilot.hs --semantics conservative --trust-smt
 
+# Build the pinned plutus-tx package with GHC 9.6.6, translate its Core,
+# audit five laws, and compare 179 package executions with the Lean model.
+python3 scripts/plutus_package_core.py --update-index
+
 # Machine-readable result; exit 0 only when the selected policy accepts it.
 ./verify.sh tests/fixtures/verification/PureInteger.hs --json
 ```
@@ -120,7 +124,8 @@ See [verification policies and result format](docs/verification.md).
 For a repeatable library function work packet, see the
 [agent verification workflow](docs/agent-verification-workflow.md).
 The [Plutus list pilot](tests/pilot/plutus-tx/README.md) records its upstream
-source pin, proof assumptions, fidelity cases, and direct-package limitation.
+source pin, package build profile, proof assumptions, fidelity cases, and
+translation-certification limitation.
 
 To export Lean files for manual work:
 
