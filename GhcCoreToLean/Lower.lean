@@ -135,6 +135,41 @@ private def isTypeOrDictBinder (v : Var) : Bool :=
   | .tyVar | .dict => true
   | .id            => false
 
+/- Core variable identity is its unique, not its printed occurrence name.
+    GHC 9.6 can print a reference to a case binder under a different name
+    (notably the synthetic uniques 0 and 1). Align locally bound references
+    before emission so the generated Lean identifier names its actual binder.
+    The nearest binder wins when a synthetic unique is reused in nested cases. -/
+mutual
+  partial def alignLocalRefs (scope : List Var) : Expr → Expr
+    | .var v =>
+      match scope.find? (fun binder => binder.unique == v.unique) with
+      | some binder => .var binder
+      | none => .var v
+    | .lit l => .lit l
+    | .app f a => .app (alignLocalRefs scope f) (alignLocalRefs scope a)
+    | .lam v body => .lam v (alignLocalRefs (v :: scope) body)
+    | .let_ (.nonRec v rhs) body =>
+      .let_ (.nonRec v (alignLocalRefs scope rhs)) (alignLocalRefs (v :: scope) body)
+    | .let_ (.rec_ pairs) body =>
+      let scope' := pairs.map Prod.fst ++ scope
+      .let_ (.rec_ (pairs.map fun (v, rhs) => (v, alignLocalRefs scope' rhs)))
+        (alignLocalRefs scope' body)
+    | .case_ scr cb ty alts =>
+      .case_ (alignLocalRefs scope scr) cb ty (alts.map fun (.mk c bs rhs) =>
+        .mk c bs (alignLocalRefs (bs ++ (cb :: scope)) rhs))
+    | .cast e => .cast (alignLocalRefs scope e)
+    | .tick e => .tick (alignLocalRefs scope e)
+    | .type_ t => .type_ t
+    | .coercion => .coercion
+
+  partial def alignLocalBind (scope : List Var) : Bind → Bind
+    | .nonRec v rhs => .nonRec v (alignLocalRefs scope rhs)
+    | .rec_ pairs =>
+      let scope' := pairs.map Prod.fst ++ scope
+      .rec_ (pairs.map fun (v, rhs) => (v, alignLocalRefs scope' rhs))
+end
+
 /-- True iff the expression is a reference to an unwrapping data constructor
     (I#, W#, C#, etc.) in applied position. -/
 private def isUnwrappingCtorRef : Expr → Bool
@@ -300,7 +335,7 @@ private partial def dropDeadPatError : Expr → Expr
   | e => e
 
 def lowerProgram (p : CoreProgram) : CoreProgram :=
-  (p.map lowerBind).map fun
+  ((p.map (alignLocalBind [])).map lowerBind).map fun
     | .nonRec v rhs => .nonRec v (dropDeadPatError (refineListCases rhs))
     | .rec_ pairs => .rec_ (pairs.map fun (v, rhs) =>
         (v, dropDeadPatError (refineListCases rhs)))
